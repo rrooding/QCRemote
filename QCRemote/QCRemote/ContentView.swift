@@ -8,12 +8,28 @@
 import SwiftUI
 
 struct ContentView: View {
-    var body: some View {
-        Text("QC Remote")
-            .font(.largeTitle)
-    }
-}
+    @Environment(AppState.self) var appState
+    @State private var showSettings = false
 
-#Preview {
-    ContentView()
+    var body: some View {
+        VStack(spacing: 0) {
+            PresetHeaderView()
+            Divider()
+            SceneGridView()
+            Spacer()
+            PresetNavigationView()
+        }
+        .toolbar {
+            ToolbarItem(placement: .automatic) {
+                Button {
+                    showSettings = true
+                } label: {
+                    Label("Settings", systemImage: "gear")
+                }
+            }
+        }
+        .sheet(isPresented: $showSettings) {
+            SettingsSheet()
+        }
+    }
 }

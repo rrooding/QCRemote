@@ -25,9 +25,25 @@ struct QCRemoteApp: App {
         }
     }()
 
+    @State private var appState: AppState?
+
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            if let appState {
+                ContentView()
+                    .environment(appState)
+                    .environment(appState.presetLibrary)
+                    .task {
+                        await appState.start()
+                    }
+            } else {
+                ProgressView("Starting...")
+                    .task {
+                        let library = PresetLibrary(modelContext: sharedModelContainer.mainContext)
+                        let engine = MIDIEngine(configuration: .load())
+                        appState = AppState(midiEngine: engine, presetLibrary: library)
+                    }
+            }
         }
         .modelContainer(sharedModelContainer)
     }
