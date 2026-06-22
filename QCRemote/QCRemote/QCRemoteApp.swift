@@ -11,7 +11,11 @@ import SwiftData
 @main
 struct QCRemoteApp: App {
     var sharedModelContainer: ModelContainer = {
-        let schema = Schema([])
+        let schema = Schema([
+            Preset.self,
+            PresetScene.self,
+            SyncMetadata.self,
+        ])
         let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 
         do {
