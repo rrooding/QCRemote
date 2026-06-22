@@ -1,0 +1,32 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+*.swiftpm/xcode.package/configuration.xcconfig
+
+# Xcode
+Build/
+DerivedData/
+*.pbxuser
+*.xccheckout
+*.moved-aside
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+xcuserdata/
+
+# Swift Package Manager
+.swiftpm/xcode/configuration.xcconfig
+.swiftpm/xcode/.build/
+
+# Secrets
+.env
+.env.local
+Credentials.json
+
+# IDE
+.vscode/
+.idea/
+
+# Temporary
+*.tmp
+*.bak
