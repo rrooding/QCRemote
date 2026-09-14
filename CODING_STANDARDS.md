@@ -166,11 +166,10 @@ conventions, so the two codebases don't drift into two different dialects for no
 
 ### Language & style
 
-- **C++23**, matching the app side, enabled via Zephyr's `CONFIG_CPP=y` plus the closest
-  available `CONFIG_STD_CPPxx` Kconfig option (or an explicit `-std=c++23` compiler flag if
-  the pinned Zephyr SDK/toolchain doesn't yet expose a named C++23 Kconfig symbol — verify
-  against the actual Zephyr version chosen in
-  [#1](https://github.com/rrooding/QCRemote/issues/1) rather than assuming it's there).
+- **C++23**, matching the app side, enabled via `CONFIG_CPP=y` + `CONFIG_STD_CPP23=y`.
+  Confirmed present in Zephyr v4.4.2 (`lib/cpp/Kconfig`), the release
+  [firmware/README.md](firmware/README.md) pins — see
+  [firmware/app/prj.conf](firmware/app/prj.conf) for the actual config.
 - `CONFIG_CPP_EXCEPTIONS=n` and `CONFIG_CPP_RTTI=n` — no exceptions, no RTTI, for the whole
   firmware image. This is the app's "no exceptions on a real-time path" rule applied
   everywhere here rather than to a subset, since there's no OS-level crash recovery on a
@@ -332,17 +331,12 @@ can eventually be generated rather than hand-written.
 
 ## Open questions to flag rather than assume
 
-- Whether the Zephyr version pinned in [#1](https://github.com/rrooding/QCRemote/issues/1)
-  actually exposes a C++23 Kconfig option (vs. C++20 with C++23 forced in via extra compiler
-  flags) — verify against the real SDK/toolchain once the devkit is chosen rather than
-  assuming the Kconfig symbol name above is exact.
-- Devkit/RTOS choice ([#1](https://github.com/rrooding/QCRemote/issues/1)) — if it lands on
-  ESP-IDF instead of Zephyr, the Firmware section above needs a parallel ESP-IDF pass for the
-  OS-specific parts (FreeRTOS primitives instead of `k_*`, `idf.py` instead of `west`,
-  ESP-IDF's own component/Kconfig conventions instead of devicetree+Kconfig). The C++23
-  language rules (naming, RAII, `std::expected`, no exceptions/RTTI, shared `.clang-format`)
-  would carry over unchanged either way, since ESP-IDF supports C++ directly too. Flagged
-  here rather than written speculatively before the decision is made.
+- Devkit/RTOS choice: **resolved** — [ADR 0002](docs/adr/0002-devkit-selection.md), NXP
+  FRDM-RW612 on Zephyr v4.4.2, `CONFIG_STD_CPP23` confirmed present. A later switch to a
+  smaller board (ESP32-C3) is expected; if that ever became ESP-IDF instead of Zephyr, the
+  Firmware section's OS-specific parts (`k_*`, `west`, devicetree+Kconfig) would need an
+  ESP-IDF pass, but the C++23 language rules (naming, RAII, `std::expected`, no
+  exceptions/RTTI, shared `.clang-format`) would carry over unchanged either way.
 - GATT-vs-BLE-MIDI transport choice ([#14](https://github.com/rrooding/QCRemote/issues/14))
   affects how much native platform-bridge code (Objective-C++/CoreBluetooth) the app side
   needs — revisit the "raw pointer" and testing guidance above once that's decided.
