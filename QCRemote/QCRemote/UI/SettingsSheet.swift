@@ -8,12 +8,34 @@ struct SettingsSheet: View {
 
     @State private var receiveChannel: Int = 1
     @State private var sceneChangeCC: Int = 34
+    @State private var selectedSource: String = ""
+    @State private var selectedDestination: String = ""
+    @State private var availableSources: [MIDIDeviceInfo] = []
+    @State private var availableDestinations: [MIDIDeviceInfo] = []
     @State private var showFileImporter = false
     @State private var importError: String?
+
+    private static let allDevicesValue = ""
 
     var body: some View {
         NavigationStack {
             Form {
+                Section("MIDI Device") {
+                    Picker("Input", selection: $selectedSource) {
+                        Text("All devices").tag(Self.allDevicesValue)
+                        ForEach(availableSources) { source in
+                            Text(source.name).tag(source.name)
+                        }
+                    }
+
+                    Picker("Output", selection: $selectedDestination) {
+                        Text("All devices").tag(Self.allDevicesValue)
+                        ForEach(availableDestinations) { dest in
+                            Text(dest.name).tag(dest.name)
+                        }
+                    }
+                }
+
                 Section("MIDI Configuration") {
                     Picker("Receive Channel", selection: $receiveChannel) {
                         ForEach(1...16, id: \.self) { channel in
@@ -53,7 +75,10 @@ struct SettingsSheet: View {
                         var config = MIDIConfiguration()
                         config.receiveChannel = receiveChannel
                         config.sceneChangeCC = sceneChangeCC
+                        config.selectedSourceName = selectedSource.isEmpty ? nil : selectedSource
+                        config.selectedDestinationName = selectedDestination.isEmpty ? nil : selectedDestination
                         config.save()
+                        Task { await appState.reloadMIDIConfiguration() }
                         dismiss()
                     }
                 }
@@ -82,6 +107,10 @@ struct SettingsSheet: View {
                 let config = MIDIConfiguration.load()
                 receiveChannel = config.receiveChannel
                 sceneChangeCC = config.sceneChangeCC
+                selectedSource = config.selectedSourceName ?? Self.allDevicesValue
+                selectedDestination = config.selectedDestinationName ?? Self.allDevicesValue
+                availableSources = MIDIDeviceDiscovery.availableSources()
+                availableDestinations = MIDIDeviceDiscovery.availableDestinations()
             }
         }
     }

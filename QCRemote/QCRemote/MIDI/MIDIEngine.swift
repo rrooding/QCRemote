@@ -5,7 +5,7 @@ actor MIDIEngine {
     private var midiClient: MIDIClientRef = 0
     private var inputPort: MIDIPortRef = 0
     private var outputPort: MIDIPortRef = 0
-    private let configuration: MIDIConfiguration
+    private var configuration: MIDIConfiguration
 
     private var eventContinuation: AsyncStream<MIDIEvent>.Continuation?
     private(set) var events: AsyncStream<MIDIEvent>!
@@ -43,7 +43,7 @@ actor MIDIEngine {
         status = MIDIOutputPortCreate(midiClient, "QCRemote Output" as CFString, &outputPort)
         guard status == noErr else { throw MIDIError.outputPortCreationFailed }
 
-        connectToAllSources()
+        connectSources()
     }
 
     func stop() {
@@ -81,25 +81,51 @@ actor MIDIEngine {
 
     // MARK: - Private
 
-    private func connectToAllSources() {
-        let sourceCount = MIDIGetNumberOfSources()
-        for i in 0..<sourceCount {
-            let source = MIDIGetSource(i)
-            MIDIPortConnectSource(inputPort, source, nil)
+    func updateConfiguration(_ newConfig: MIDIConfiguration) {
+        disconnectAllSources()
+        configuration = newConfig
+        connectSources()
+    }
+
+    private func connectSources() {
+        let sources = MIDIDeviceDiscovery.availableSources()
+        print("[MIDI] Found \(sources.count) MIDI source(s)")
+
+        let selectedName = configuration.selectedSourceName
+        let sourcesToConnect = selectedName != nil
+            ? sources.filter { $0.name == selectedName }
+            : sources
+
+        for source in sourcesToConnect {
+            print("[MIDI] Connecting to source: \(source.name)")
+            MIDIPortConnectSource(inputPort, source.endpointRef, nil)
         }
-        if sourceCount > 0 {
+
+        if !sourcesToConnect.isEmpty {
             eventContinuation?.yield(.connectionChanged(.connected))
+        }
+    }
+
+    private func disconnectAllSources() {
+        let sources = MIDIDeviceDiscovery.availableSources()
+        for source in sources {
+            MIDIPortDisconnectSource(inputPort, source.endpointRef)
         }
     }
 
     private func handleMIDINotification(_ notification: UnsafePointer<MIDINotification>) {
         switch notification.pointee.messageID {
         case .msgObjectAdded:
-            connectToAllSources()
-            eventContinuation?.yield(.connectionChanged(.connected))
+            print("[MIDI] Device added, reconnecting sources")
+            connectSources()
         case .msgObjectRemoved:
-            let sourceCount = MIDIGetNumberOfSources()
-            if sourceCount == 0 {
+            print("[MIDI] Device removed")
+            let sources = MIDIDeviceDiscovery.availableSources()
+            let selectedName = configuration.selectedSourceName
+            let relevant = selectedName != nil
+                ? sources.filter { $0.name == selectedName }
+                : sources
+            if relevant.isEmpty {
                 eventContinuation?.yield(.connectionChanged(.disconnected))
             }
         default:
@@ -159,8 +185,13 @@ actor MIDIEngine {
     }
 
     private func sendMessage(_ bytes: [UInt8]) throws {
-        let destinationCount = MIDIGetNumberOfDestinations()
-        guard destinationCount > 0 else { throw MIDIError.sendFailed }
+        let destinations = MIDIDeviceDiscovery.availableDestinations()
+        let selectedName = configuration.selectedDestinationName
+        let targets = selectedName != nil
+            ? destinations.filter { $0.name == selectedName }
+            : destinations
+
+        guard !targets.isEmpty else { throw MIDIError.sendFailed }
 
         var eventList = MIDIEventList()
         var packet = MIDIEventListInit(&eventList, ._1_0)
@@ -176,9 +207,8 @@ actor MIDIEngine {
 
         packet = MIDIEventListAdd(&eventList, MemoryLayout<MIDIEventList>.size, packet, 0, 1, [word])
 
-        for i in 0..<destinationCount {
-            let destination = MIDIGetDestination(i)
-            let status = MIDISendEventList(outputPort, destination, &eventList)
+        for target in targets {
+            let status = MIDISendEventList(outputPort, target.endpointRef, &eventList)
             if status != noErr { throw MIDIError.sendFailed }
         }
     }

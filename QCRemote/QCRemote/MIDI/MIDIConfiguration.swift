@@ -4,6 +4,8 @@ struct MIDIConfiguration: Codable {
     var receiveChannel: Int = 1
     var sceneChangeCC: Int = 34
     var allChannels: Bool = false
+    var selectedSourceName: String?
+    var selectedDestinationName: String?
 
     private static let userDefaultsKey = "MIDIConfiguration"
 

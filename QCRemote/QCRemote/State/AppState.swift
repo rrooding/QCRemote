@@ -50,20 +50,31 @@ class AppState {
         }
     }
 
+    func reloadMIDIConfiguration() async {
+        let config = MIDIConfiguration.load()
+        await midiEngine.updateConfiguration(config)
+    }
+
     // MARK: - Event Handling
 
     private func onMIDIEvent(_ event: MIDIEvent) {
         switch event {
-        case .presetChanged(let pc, _, _):
+        case .presetChanged(let pc, let bankMSB, let bankLSB):
+            print("[MIDI] Preset changed: PC=\(pc) bankMSB=\(bankMSB) bankLSB=\(bankLSB)")
             if let preset = presetLibrary.preset(for: pc) {
+                print("[MIDI] Matched preset: \(preset.name) (\(preset.bankAndSlot))")
                 currentPreset = preset
                 isLastKnownState = false
                 persistLastKnownState()
+            } else {
+                print("[MIDI] No preset found for program number \(pc)")
             }
         case .sceneChanged(let index):
+            print("[MIDI] Scene changed: index=\(index)")
             currentSceneIndex = index
             persistLastKnownState()
         case .connectionChanged(let status):
+            print("[MIDI] Connection: \(status == .connected ? "connected" : "disconnected")")
             midiConnectionStatus = status
         }
     }
