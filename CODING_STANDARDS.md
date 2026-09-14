@@ -155,24 +155,45 @@ prefer `std::span` over raw pointer + separate length.
 
 ## Firmware (devboard, Zephyr)
 
-The devboard side is C, not C++, and runs on a real-time OS with its own long-established
-conventions — don't import the app's C++/JUCE rules here wholesale. These follow
-[Zephyr's own coding guidelines](https://docs.zephyrproject.org/latest/contribute/coding_guidelines/index.html),
-which the wider Zephyr community already enforces via CI, so deviating from them costs more
-than it buys.
+The devboard side runs on Zephyr, a real-time OS with its own long-established conventions —
+but unlike a typical Zephyr module, this firmware is **C++23, the same standard as the app
+side**, not C. The RTOS-specific rules below (concurrency primitives, devicetree, Kconfig,
+ISR safety) still follow
+[Zephyr's own coding guidelines](https://docs.zephyrproject.org/latest/contribute/coding_guidelines/index.html)
+where they're genuinely about the OS rather than the language — but naming, formatting,
+ownership, and error-handling style follow the **App** section above, not Zephyr's C/kernel
+conventions, so the two codebases don't drift into two different dialects for no reason.
 
 ### Language & style
 
-- **C11**, matching Zephyr's own codebase. Only reach for C++ in firmware code if a specific
-  library genuinely requires it (`CONFIG_CPP`), and if so keep exceptions and RTTI disabled —
-  the same "no exceptions on a real-time path" principle from the app side applies here even
-  harder, since there's no OS-level crash recovery.
-- Style follows Zephyr's own (Linux-kernel-derived) conventions: tabs for indentation, K&R
-  brace placement, roughly 100-column soft limit. Don't apply the app's LLVM/4-space
-  `.clang-format` here — use Zephyr's own `.clang-format` (ships in the Zephyr tree) instead.
-- Enforce with `checkpatch.pl` (Zephyr ships this; run via `./scripts/checkpatch.pl` or
-  `west` CI integration) rather than the app's clang-tidy check set — checkpatch catches the
-  kernel-style issues clang-tidy's C++-oriented checks don't.
+- **C++23**, matching the app side, enabled via Zephyr's `CONFIG_CPP=y` plus the closest
+  available `CONFIG_STD_CPPxx` Kconfig option (or an explicit `-std=c++23` compiler flag if
+  the pinned Zephyr SDK/toolchain doesn't yet expose a named C++23 Kconfig symbol — verify
+  against the actual Zephyr version chosen in
+  [#1](https://github.com/rrooding/QCRemote/issues/1) rather than assuming it's there).
+- `CONFIG_CPP_EXCEPTIONS=n` and `CONFIG_CPP_RTTI=n` — no exceptions, no RTTI, for the whole
+  firmware image. This is the app's "no exceptions on a real-time path" rule applied
+  everywhere here rather than to a subset, since there's no OS-level crash recovery on a
+  microcontroller. Use `std::expected<T, E>` for fallible operations (protocol parsing,
+  session setup, device enumeration), same as the app.
+- Naming, ownership, and references/pointers follow the **App** section verbatim
+  (`PascalCase` types, `camelCase` functions/variables, trailing-underscore private members;
+  RAII and `std::unique_ptr` over raw owning pointers; reference > smart pointer > raw
+  pointer). Zephyr's own C APIs (`k_*` calls, driver structs) are the embedded equivalent of
+  JUCE's pointer-based interfaces — call them directly (Zephyr's headers already handle
+  `extern "C"` linkage), and wrap the ones you take/release around a scope in a small RAII
+  guard (e.g. a `ScopedKMutex` around `k_mutex_lock`/`k_mutex_unlock`) rather than pairing
+  lock/unlock calls by hand.
+- Formatting: the same `.clang-format` as the app (LLVM base style, 4-space indent,
+  ~110 columns), not Zephyr's own kernel-style config — this is C++23 application code
+  running on Zephyr, not a patch to Zephyr's own C kernel tree. If a contribution ever does
+  patch Zephyr's own upstream sources (rather than code in this repo), that patch follows
+  Zephyr's kernel style and `checkpatch.pl` instead, since it lives in a different codebase
+  with its own rules.
+- The header-only `.hpp` convention from the App section applies here too, for consistency.
+  Flag it in review if firmware build times on the target toolchain make this genuinely
+  painful — that's a build-performance tradeoff to revisit with real data, not a reason to
+  diverge upfront.
 
 ### Hardware description
 
@@ -228,10 +249,10 @@ than it buys.
 
 - Zephyr APIs return negative `errno` codes (or a subset per-API). Check every `k_*`/driver
   return value that can fail — don't discard them, even for calls that "shouldn't" fail on a
-  known-good devkit. Propagate failures up rather than asserting or silently continuing in a
-  half-initialized state.
-- No C++ exceptions in firmware code, matching the app side's "no exceptions on a real-time
-  path" rule — here it's the default for the whole binary, not just a subset of it.
+  known-good devkit. Wrap the boundary between Zephyr's `errno`-returning C APIs and the
+  firmware's own C++ logic with `std::expected<T, int>` (or a small project-specific error
+  enum), same as the app wraps its own fallible operations, rather than propagating raw
+  `int` return codes through call sites that aren't talking to Zephyr directly.
 
 ### Testing
 
@@ -239,6 +260,12 @@ than it buys.
   for anything that doesn't require real hardware — the HID framing/reassembly logic, the
   protobuf message decode, the session state machine. This mirrors the app side's principle
   of decoupling logic from hardware/OS glue so it's actually testable in CI.
+- Ztest's macros (`ZTEST()`, `ZTEST_SUITE()`) are plain C macros and do expand fine in a C++
+  translation unit, but the framework itself is written C-first — keep test bodies thin,
+  calling into ordinary C++ functions/classes for the actual logic under test, rather than
+  fighting the framework's assumptions with heavier C++ fixtures. Flag any real friction
+  found here once tests actually exist, rather than assuming it either works perfectly or
+  doesn't.
 - Hardware-dependent paths (actual USB enumeration against a real Quad Cortex Mini, actual
   BLE radio behavior) stay as manual/hardware-in-the-loop validation steps
   ([#10](https://github.com/rrooding/QCRemote/issues/10)) rather than forced into Twister.
@@ -279,11 +306,17 @@ can eventually be generated rather than hand-written.
 
 ## Open questions to flag rather than assume
 
+- Whether the Zephyr version pinned in [#1](https://github.com/rrooding/QCRemote/issues/1)
+  actually exposes a C++23 Kconfig option (vs. C++20 with C++23 forced in via extra compiler
+  flags) — verify against the real SDK/toolchain once the devkit is chosen rather than
+  assuming the Kconfig symbol name above is exact.
 - Devkit/RTOS choice ([#1](https://github.com/rrooding/QCRemote/issues/1)) — if it lands on
-  ESP-IDF instead of Zephyr, the Firmware section above needs a parallel ESP-IDF pass
-  (FreeRTOS primitives instead of `k_*`, `idf.py` instead of `west`, ESP-IDF's own
-  component/Kconfig conventions). Flagged here rather than written speculatively before the
-  decision is made.
+  ESP-IDF instead of Zephyr, the Firmware section above needs a parallel ESP-IDF pass for the
+  OS-specific parts (FreeRTOS primitives instead of `k_*`, `idf.py` instead of `west`,
+  ESP-IDF's own component/Kconfig conventions instead of devicetree+Kconfig). The C++23
+  language rules (naming, RAII, `std::expected`, no exceptions/RTTI, shared `.clang-format`)
+  would carry over unchanged either way, since ESP-IDF supports C++ directly too. Flagged
+  here rather than written speculatively before the decision is made.
 - GATT-vs-BLE-MIDI transport choice ([#14](https://github.com/rrooding/QCRemote/issues/14))
   affects how much native platform-bridge code (Objective-C++/CoreBluetooth) the app side
   needs — revisit the "raw pointer" and testing guidance above once that's decided.
