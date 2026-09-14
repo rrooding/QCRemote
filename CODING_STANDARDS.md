@@ -278,6 +278,15 @@ conventions, so the two codebases don't drift into two different dialects for no
 
 ---
 
+## Recording decisions
+
+Consequential architecture/tooling decisions (devkit/RTOS choice, BLE transport choice,
+language standard version, similar one-way-door calls) get recorded as an ADR under
+[`docs/adr/`](docs/adr/), using the template there — see
+[ADR 0001](docs/adr/0001-record-architecture-decisions.md) for the format and the reasoning
+behind using ADRs at all. Not every note belongs in an ADR: protocol findings, bring-up
+quirks, and other non-decision write-ups stay as regular docs.
+
 ## Commit messages (both sides)
 
 [Conventional Commits](https://www.conventionalcommits.org/), enforced in CI so a changelog
