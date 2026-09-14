@@ -224,7 +224,7 @@ conventions, so the two codebases don't drift into two different dialects for no
   starved by, say, a lower-priority BLE notification thread) rather than relying on Zephyr's
   defaults.
 
-### Memory
+### Memory & containers
 
 - Prefer static allocation: `k_mem_slab`, fixed-size `k_heap` regions, or plain
   static/const buffers sized for the known worst case (a single HID-framed message, one
@@ -233,6 +233,23 @@ conventions, so the two codebases don't drift into two different dialects for no
 - Size the nanopb and inflate (miniz or similar) buffers statically per the message types
   actually needed for MVP1/MVP2 rather than allocating generously "to be safe" —
   the protocol's own 128-byte report cap gives a hard upper bound to design against.
+- **Use [ETL](https://github.com/ETLCPP/etl) instead of the standard library for any
+  container whose own storage would otherwise heap-allocate.** `etl::vector<T, N>` instead of
+  `std::vector<T>`, `etl::string<N>` instead of `std::string`, `etl::map`/`etl::flat_map`
+  instead of `std::map`/`std::unordered_map`, `etl::deque`/`etl::queue`/`etl::stack`/
+  `etl::circular_buffer` for their std:: equivalents. ETL's containers take their capacity as
+  a compile-time template parameter and hold their storage inline (static or on the stack),
+  so they never call the heap — this is the concrete mechanism behind the static-allocation
+  rule above, not a separate concern from it.
+- `std::optional`, `std::expected`, `std::span`, `std::string_view`, and `std::variant` stay
+  as `std::`, not ETL — they don't own heap-allocating storage themselves (a `std::span` over
+  an `etl::vector`'s buffer is normal and expected), so there's nothing for ETL to improve
+  there. The swap is specifically for the container types that would otherwise grow via the
+  heap.
+- No `new`/`delete`, `std::make_unique` over a dynamically-sized buffer, or STL container
+  growth (`push_back` past a reserved capacity, etc.) in firmware code, mirroring the app
+  side's ownership rules but enforced harder here since there's no heap fragmentation
+  budget to spend.
 
 ### Logging
 
