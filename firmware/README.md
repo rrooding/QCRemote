@@ -10,7 +10,7 @@ firmware/
 └── app/            # the actual Zephyr application (out-of-tree, "freestanding")
     ├── CMakeLists.txt
     ├── prj.conf
-    └── src/main.cpp
+    └── src/Main.cpp
 ```
 
 This repo does **not** vendor its own `west.yml`/manifest. `firmware/app` is a standard
@@ -55,13 +55,26 @@ Drop `--pristine` on subsequent builds once the build directory exists.
 
 ## Flash
 
-The FRDM-RW612's onboard debug probe supports both runners Zephyr knows about for this board:
+The FRDM-RW612's onboard debug probe is an **MCU-Link**, which ships from the factory running
+**CMSIS-DAP firmware**, not J-Link. `west flash` with no arguments tries the `jlink` runner
+first (it's just listed first in the board's `board.cmake`, not because it's the right
+default for this board) and fails with `JLinkExe not found` — that's expected on a stock
+board, not a real error to chase.
+
+Use the `linkserver` runner, which is what actually talks to the stock CMSIS-DAP firmware:
 
 ```bash
-west flash                    # tries the board's default runner
-west flash --runner jlink     # explicit J-Link
-west flash --runner linkserver  # explicit NXP LinkServer (install LinkServer separately)
+west flash --runner linkserver
 ```
+
+This needs NXP's **LinkServer** utility installed and on `PATH` (via the
+[MCUXpresso Installer](https://www.nxp.com/mcuxpresso/installer) or the standalone
+[LinkServer installer](https://www.nxp.com/design/design-center/software/development-software/mcuxpresso-software-and-tools-/linkserver-for-microcontrollers:LINKERSERVER)
+— on Linux that's a `.deb.bin` you install and add to `PATH` manually).
+
+`west flash --runner jlink` only works if the onboard MCU-Link has been reflashed with
+J-Link OB firmware via NXP's MCU-Link firmware-update utility — not needed unless you
+specifically want SEGGER's tools instead of LinkServer.
 
 ## Verify
 
