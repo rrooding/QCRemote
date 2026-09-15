@@ -9,6 +9,7 @@
 #include <zephyr/usb/usb_ch9.h>
 #include <zephyr/usb/usbh.h>
 
+#include <usbh_ch9.h>
 #include <usbh_class.h>
 #include <usbh_desc.h>
 #include <usbh_device.h>
@@ -34,6 +35,14 @@ LOG_MODULE_REGISTER(usbh_shim, LOG_LEVEL_INF);
  * subsys/usb/host/class/usbh_uvc.c's initiate_transfer/continue_transfer
  * pattern - the only in-tree, merged host class driver that actually moves
  * data, and the closest thing to a proven reference for this API.
+ *
+ * Sending (issue #7) uses usbh_req_setup() (subsys/usb/host/usbh_ch9.h) -
+ * the same synchronous control-transfer helper Zephyr's own host stack
+ * uses internally for standard requests (usbh_req_desc_dev() etc. in
+ * usbh_ch9.c). That header isn't part of Zephyr's public API either, but
+ * it's already reachable: firmware/app/CMakeLists.txt adds
+ * ${ZEPHYR_BASE}/subsys/usb/host to the include path for this file's other
+ * usbh_*.h includes above, and usbh_ch9.h lives in that same directory.
  */
 
 static const struct qc_usbh_ops *registered_ops;
@@ -41,7 +50,6 @@ static struct qc_usbh_filter registered_filter;
 
 static struct usb_device *claimed_udev;
 static uint8_t ep_in;
-static uint8_t ep_out;
 static struct uhc_transfer *in_xfer;
 static bool receiving;
 
@@ -63,8 +71,10 @@ static int shim_completion_cb(struct usbh_class_data *const c_data,
 
 	/*
 	 * Not used: every transfer we submit gets its own per-transfer
-	 * callback via usbh_xfer_alloc() (see in_xfer_cb/out_xfer_cb below),
-	 * so this class-level fallback should never actually be hit.
+	 * callback via usbh_xfer_alloc() (see in_xfer_cb below; the send path
+	 * in qc_usbh_send_report() goes through usbh_req_setup(), which
+	 * manages its own internal callback), so this class-level fallback
+	 * should never actually be hit.
 	 */
 	return -ENOTSUP;
 }
@@ -143,15 +153,16 @@ static int start_receiving(void)
 	return ret;
 }
 
-/* Walks the descriptors following `if_desc`, recording the first IN and
- * first OUT endpoint found before the next interface descriptor. */
+/* Walks the descriptors following `if_desc`, recording the first IN
+ * endpoint found before the next interface descriptor. Sending (issue #7)
+ * doesn't need an OUT endpoint discovered here - it goes over a control
+ * transfer on endpoint 0 instead (see qc_usbh_send_report()). */
 static void discover_endpoints(const struct usb_if_descriptor *const if_desc)
 {
 	const struct usb_desc_header *desc = (const struct usb_desc_header *)if_desc;
 	int found = 0;
 
 	ep_in = 0;
-	ep_out = 0;
 
 	while ((desc = usbh_desc_get_next(desc)) != NULL && found < if_desc->bNumEndpoints) {
 		if (desc->bDescriptorType == USB_DESC_INTERFACE) {
@@ -167,8 +178,6 @@ static void discover_endpoints(const struct usb_if_descriptor *const if_desc)
 
 			if (USB_EP_DIR_IS_IN(ep_desc->bEndpointAddress)) {
 				ep_in = ep_desc->bEndpointAddress;
-			} else {
-				ep_out = ep_desc->bEndpointAddress;
 			}
 			found++;
 		}
@@ -212,8 +221,7 @@ static int shim_probe(struct usbh_class_data *const c_data, struct usb_device *c
 	claimed_udev = udev;
 	discover_endpoints(desc);
 
-	LOG_INF("Interface %u endpoints: IN=0x%02x OUT=0x%02x", registered_filter.iface, ep_in,
-		ep_out);
+	LOG_INF("Interface %u endpoints: IN=0x%02x", registered_filter.iface, ep_in);
 
 	if (ep_in == 0) {
 		LOG_ERR("No IN endpoint found on interface %u (bNumEndpoints=%u)",
@@ -237,7 +245,6 @@ static int shim_removed(struct usbh_class_data *const c_data)
 	receiving = false;
 	claimed_udev = NULL;
 	ep_in = 0;
-	ep_out = 0;
 	in_xfer = NULL;
 
 	if (registered_ops != NULL && registered_ops->on_removed != NULL) {
@@ -275,42 +282,34 @@ int qc_usbh_bridge_start(const struct qc_usbh_filter *filter, const struct qc_us
 	return usbh_enable(&qc_usbh_ctx);
 }
 
-static int out_xfer_cb(struct usb_device *const dev, struct uhc_transfer *const xfer)
-{
-	(void)dev;
-
-	net_buf_unref(xfer->buf);
-	usbh_xfer_free(claimed_udev, xfer);
-	return 0;
-}
-
 int qc_usbh_send_report(const uint8_t *report, size_t len)
 {
-	if (claimed_udev == NULL || ep_out == 0) {
+	if (claimed_udev == NULL) {
 		return -ENODEV;
-	}
-
-	struct uhc_transfer *xfer = usbh_xfer_alloc(claimed_udev, ep_out, out_xfer_cb, NULL);
-
-	if (xfer == NULL) {
-		return -ENOMEM;
 	}
 
 	struct net_buf *buf = usbh_xfer_buf_alloc(claimed_udev, len);
 
 	if (buf == NULL) {
-		usbh_xfer_free(claimed_udev, xfer);
 		return -ENOMEM;
 	}
-
 	net_buf_add_mem(buf, report, len);
-	xfer->buf = buf;
 
-	int ret = usbh_xfer_enqueue(claimed_udev, xfer);
+	/* Host->device | Class | Interface - the standard bmRequestType for a
+	 * HID class-specific request targeting an interface. */
+	const uint8_t bm_request_type = (USB_REQTYPE_DIR_TO_DEVICE << 7) |
+					 (USB_REQTYPE_TYPE_CLASS << 5) | USB_REQTYPE_RECIPIENT_INTERFACE;
+	const uint8_t b_request = 0x09; /* HID SET_REPORT */
+	/* Report type 2 = Output. Report ID matches the byte HidChunker
+	 * already wrote as report[0] - HID's numbered-report convention
+	 * duplicates it here in wValue's low byte too. */
+	const uint8_t report_id = len > 0 ? report[0] : 0;
+	const uint16_t w_value = (0x02 << 8) | report_id;
+	const uint16_t w_index = registered_filter.iface;
 
-	if (ret != 0) {
-		net_buf_unref(buf);
-		usbh_xfer_free(claimed_udev, xfer);
-	}
+	int ret = usbh_req_setup(claimed_udev, bm_request_type, b_request, w_value, w_index,
+				 (uint16_t)len, buf);
+
+	usbh_xfer_buf_free(claimed_udev, buf);
 	return ret;
 }

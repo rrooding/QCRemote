@@ -7,6 +7,7 @@
 #include <zephyr/logging/log.h>
 
 #include "HidReassembler.hpp"
+#include "QcSession.hpp"
 #include "UsbHostClass.hpp"
 
 namespace qcbridge {
@@ -47,6 +48,7 @@ protected:
             return false;
         }
         LOG_INF("Claimed Quad Cortex Mini HID interface %u", iface);
+        session_.deviceConnected();
         return true;
     }
 
@@ -59,6 +61,7 @@ protected:
         case Status::Complete: {
             const auto message = reassembler_.message();
             LOG_INF("Reassembled message: %zu bytes", message.size());
+            session_.handleMessage(message);
             break;
         }
         case Status::Overflow:
@@ -74,6 +77,7 @@ protected:
 
 private:
     HidReassembler<kReassemblyCapacity> reassembler_;
+    QcSession session_;
 };
 
 }  // namespace qcbridge
