@@ -85,19 +85,23 @@ assuming either way), use `west flash --runner linkserver` instead, which needs 
 
 ## Verify
 
-Console output (`zephyr,console` is UART, `flexcomm3`) should show:
+Open a serial monitor on the probe's USB-CDC port (`zephyr,console` is UART, `flexcomm3`,
+bridged over USB by the J-Link probe) — either `screen /dev/tty.usbmodemNNNN 115200` or
+[`tio`](https://github.com/tio/tio) (`tio /dev/tty.usbmodemNNNN`), whichever's installed.
+There are two `usbmodem` devices from the probe; the console is the first one enumerated.
+
+**Verified 2026-09-15** on real hardware:
 
 ```
-QC Bridge firmware skeleton up (C++202302)
+*** Booting Zephyr OS build v4.4.2 ***
+[00:00:00.016,557] <inf> main: QC Bridge firmware skeleton up (C++202302)
 ```
 
-and the onboard green LED should blink at ~1Hz. This confirms the toolchain, board target,
-and C++23 configuration all work end-to-end before any real protocol code lands (issues
+and the onboard green LED blinks at ~1Hz. Confirms the toolchain, board target, and C++23
+configuration all work end-to-end before any real protocol code lands (issues
 [#3](https://github.com/rrooding/QCRemote/issues/3) onward).
 
 ## Not yet done
 
-- Hardware-in-the-loop verification of the above (needs the physical board) — this repo
-  content is unverified against real hardware; flag any discrepancy found when you run it.
 - ETL is wired in via CMake `FetchContent` (see `app/CMakeLists.txt`) but not yet used by
   any code.
