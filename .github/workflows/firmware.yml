@@ -1,0 +1,68 @@
+name: firmware
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    paths:
+      - "firmware/**"
+      - ".github/workflows/firmware.yml"
+
+# Pinned to the same Zephyr release firmware/README.md documents for local
+# setup - keep these in sync if that ever changes.
+env:
+  ZEPHYR_VERSION: v4.4.2
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out QCRemote
+        uses: actions/checkout@v4
+
+      # ~/.cmake/packages is where `west sdk install` registers a CMake
+      # package config so find_package(Zephyr) can locate the toolchain -
+      # caching the SDK directory alone, without this, would make a
+      # cache-hit run skip reinstalling the SDK but still fail to find it.
+      # (Assumption, not yet confirmed against a real run.)
+      #
+      # Keyed on the Zephyr version alone - the workspace/SDK don't depend
+      # on our own source, so hashing it here would invalidate this cache
+      # (re-clone zephyr, re-download the SDK) on every commit, defeating
+      # the point of caching it at all.
+      - name: Cache Zephyr workspace and SDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/zephyrproject
+            ~/zephyr-sdk-*
+            ~/.cmake/packages
+          key: zephyr-${{ env.ZEPHYR_VERSION }}-${{ runner.os }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install west
+        run: pip install west
+
+      - name: Initialize Zephyr workspace
+        run: |
+          if [ ! -d ~/zephyrproject/.west ]; then
+            west init -m https://github.com/zephyrproject-rtos/zephyr --mr "$ZEPHYR_VERSION" ~/zephyrproject
+          fi
+          cd ~/zephyrproject
+          west update
+          west packages pip --install --ignore-venv-check
+          if ! compgen -G "$HOME/zephyr-sdk-*" > /dev/null; then
+            west sdk install --install-base ~ --gnu-toolchains arm-zephyr-eabi
+          fi
+
+      - name: Build frdm_rw612
+        working-directory: ~/zephyrproject
+        run: west build -b frdm_rw612 "$GITHUB_WORKSPACE/firmware/app" --pristine
+
+      - name: Run HID framing tests (native_sim)
+        working-directory: ~/zephyrproject
+        run: west twister -p native_sim -T "$GITHUB_WORKSPACE/firmware/app/tests/hid_framing"
