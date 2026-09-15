@@ -11,11 +11,15 @@ firmware/
     ├── CMakeLists.txt
     ├── prj.conf
     ├── boards/frdm_rw612.overlay   # switches the RW612's USB peripheral to host mode
-    └── src/
-        ├── Main.cpp
-        ├── usbh_shim.c/.h          # plain-C boundary around Zephyr's non-C++-safe USB host API
-        ├── UsbHostClass.hpp        # generic C++ base built on the shim
-        └── QcHidBridge.hpp         # claims the QC Mini's HID interface, on top of UsbHostClass
+    ├── src/
+    │   ├── Main.cpp
+    │   ├── usbh_shim.c/.h          # plain-C boundary around Zephyr's non-C++-safe USB host API
+    │   ├── UsbHostClass.hpp        # generic C++ base built on the shim
+    │   ├── QcHidBridge.hpp         # claims the QC Mini's HID interface, on top of UsbHostClass
+    │   ├── HidReassembler.hpp      # qc-mcp framing: reports in, one logical message out
+    │   └── HidChunker.hpp          # qc-mcp framing: a message in, reports out
+    └── tests/
+        └── hid_framing/            # Ztest suite for HidReassembler/HidChunker - no hardware needed
 ```
 
 This repo does **not** vendor its own `west.yml`/manifest. `firmware/app` is a standard
@@ -160,7 +164,30 @@ number. `usbh_shim.c` looks up the target interface (5) itself via `usbh_desc_ge
 rather than trusting the `iface` argument `probe()` receives; `qc_usbh_filter` carries that
 target interface number alongside vid/pid.
 
+## HID report framing (issue #4, part 1 of 2)
+
+[`HidReassembler.hpp`](app/src/HidReassembler.hpp) (reports in, one logical message out) and
+[`HidChunker.hpp`](app/src/HidChunker.hpp) (a message in, reports out) implement qc-mcp's
+128-byte HID report framing. Both are plain C++23 with no Zephyr dependency at all — verified
+by compiling and running their test cases directly with the system's `clang++` (no Zephyr SDK
+needed) before porting the same cases into the Ztest suite below.
+
+Run the tests:
+
+```bash
+west twister -p native_sim -T firmware/app/tests/hid_framing
+```
+
+(Unverified against the actual Twister/native_sim toolchain — ported carefully from a real
+Zephyr Ztest example, but this project's Ztest infra (issue #31) didn't exist before this.)
+
+**Not done yet — the other half of #4**: nothing actually calls these classes. `usbh_shim.c`
+doesn't submit or receive any transfers (`shim_completion_cb` is still the `-ENOTSUP` stub
+from #3), and interface 5's actual endpoint addresses aren't known. That needs its own
+hardware-in-the-loop pass, same as #3 did — real devices tend to disagree with API docs in
+ways only a build-and-flash cycle catches.
+
 ## Not yet done
 
 - ETL is wired in via CMake `FetchContent` (see `app/CMakeLists.txt`) but not yet used by
-  any code.
+  the main app - only by the HID framing tests above.

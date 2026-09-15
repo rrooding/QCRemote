@@ -1,0 +1,4 @@
+tests:
+  firmware.hid_framing:
+    platform_allow: native_sim
+    tags: firmware
