@@ -1,7 +1,10 @@
 #pragma once
 
 #include <cstdint>
-#include <cerrno>
+
+// Zephyr's minimal C++ library (lib/cpp/minimal) doesn't provide <cerrno>;
+// the plain C header works fine from C++ since these are just macros.
+#include <errno.h>
 
 extern "C" {
 #include "usbh_shim.h"
