@@ -294,6 +294,16 @@ conventions, so the two codebases don't drift into two different dialects for no
 
 ---
 
+## Workflow
+
+`master` is a protected branch: no direct pushes, no force-pushes, no deletion, enforced even
+for admins. New functionality — firmware or app, any change beyond a trivial doc/typo fix —
+goes through a **pull request linked to the backlog issue it implements** (`Closes #N` or
+`Refs #N` in the PR description, same convention as the commit-message footer below). No
+required-approver count is set, so a solo PR can still be merged without waiting on a second
+reviewer — the point is the paper trail (what issue a change addresses, reviewable diff
+before it lands), not gatekeeping.
+
 ## Recording decisions
 
 Consequential architecture/tooling decisions (devkit/RTOS choice, BLE transport choice,
