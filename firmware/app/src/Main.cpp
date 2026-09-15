@@ -4,6 +4,8 @@
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
+#include "QcHidBridge.hpp"
+
 namespace qcbridge {
 
 // Bring-up sanity check for the frdm_rw612 toolchain/build (issue #2) - not
@@ -31,6 +33,7 @@ private:
 namespace {
 const gpio_dt_spec kLedSpec = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 const auto kBlinkInterval = K_MSEC(500);
+qcbridge::QcHidBridge g_qcHidBridge;
 }  // namespace
 
 int main() {
@@ -42,6 +45,12 @@ int main() {
     }
 
     LOG_INF("QC Bridge firmware skeleton up (C++%ld)", static_cast<long>(__cplusplus));
+
+    if (g_qcHidBridge.Start() != 0) {
+        LOG_ERR("USB host bridge failed to start");
+    } else {
+        LOG_INF("USB host enabled, waiting for Quad Cortex Mini");
+    }
 
     while (true) {
         led.toggle();

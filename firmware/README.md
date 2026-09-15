@@ -10,7 +10,12 @@ firmware/
 └── app/            # the actual Zephyr application (out-of-tree, "freestanding")
     ├── CMakeLists.txt
     ├── prj.conf
-    └── src/Main.cpp
+    ├── boards/frdm_rw612.overlay   # switches the RW612's USB peripheral to host mode
+    └── src/
+        ├── Main.cpp
+        ├── usbh_shim.c/.h          # plain-C boundary around Zephyr's non-C++-safe USB host API
+        ├── UsbHostClass.hpp        # generic C++ base built on the shim
+        └── QcHidBridge.hpp         # claims the QC Mini's HID interface, on top of UsbHostClass
 ```
 
 This repo does **not** vendor its own `west.yml`/manifest. `firmware/app` is a standard
@@ -100,6 +105,60 @@ There are two `usbmodem` devices from the probe; the console is the first one en
 and the onboard green LED blinks at ~1Hz. Confirms the toolchain, board target, and C++23
 configuration all work end-to-end before any real protocol code lands (issues
 [#3](https://github.com/rrooding/QCRemote/issues/3) onward).
+
+## USB host bring-up (issue #3)
+
+`boards/frdm_rw612.overlay` switches the RW612's single USB-OTG peripheral from device mode
+(the board default) to host mode. `prj.conf` enables `CONFIG_USB_HOST_STACK` (Zephyr's
+`[EXPERIMENTAL]` USB host stack — see [ADR 0002](../docs/adr/0002-devkit-selection.md) for
+the accepted risk); the NXP EHCI controller driver auto-selects itself once the devicetree
+node is enabled.
+
+**Zephyr's public USB host headers don't compile as C++** (confirmed against a real build,
+Zephyr v4.4.2): `zephyr/usb/usbh.h` has a struct field literally named `class`, and
+`zephyr/drivers/usb/uhc.h` relies on C's implicit `void*` conversions in several inline
+functions. Both are genuine bugs in Zephyr's public API, not something fixable from the C++
+side — worth reporting upstream.
+
+The fix is [`usbh_shim.c`](app/src/usbh_shim.c)/[`usbh_shim.h`](app/src/usbh_shim.h): a plain
+C file (compiled under C, where neither issue applies) exposing a minimal, C++-safe API —
+register a VID/PID filter and three callbacks, get the USB host controller started. It also
+depends on `subsys/usb/host`'s internal headers (`usbh_class.h`, `usbh_desc.h`), which aren't
+part of Zephyr's public API but which every USB host class driver needs, including Zephyr's
+own in-tree ones (MSC, UAC2, UVC) — `CMakeLists.txt` adds `${ZEPHYR_BASE}/subsys/usb/host` as
+an include path to reach them.
+
+[`UsbHostClass.hpp`](app/src/UsbHostClass.hpp) wraps that shim in a small, generic C++ base
+class (`OnInit()`/`OnProbe()`/`OnRemoved()` virtuals) so nothing outside `usbh_shim.c` ever
+includes a Zephyr USB header. `QcHidBridge` ([src/QcHidBridge.hpp](app/src/QcHidBridge.hpp))
+subclasses it: filters for the Quad Cortex Mini's VID/PID (`0x152A`/`0x892F`, per
+[qc-mcp](https://github.com/lexasoft123/qc-mcp)) and claims only interface 5 (the vendor HID
+control interface), rejecting every other interface the composite device exposes. `Main.cpp`
+just owns a `QcHidBridge` and calls `Start()` — no USB host plumbing visible there at all.
+
+No transfers are submitted yet — `shim_completion_cb` in `usbh_shim.c` is a stub returning
+`-ENOTSUP` — that lands with the HID framing and session-handshake work (issues #4-#8).
+
+**Verified 2026-09-15** against a real Quad Cortex Mini:
+
+```
+*** Booting Zephyr OS build v4.4.2 ***
+<inf> main: QC Bridge firmware skeleton up (C++202302)
+<inf> main: USB host enabled, waiting for Quad Cortex Mini
+<inf> usbh_dev: New device with address 1 state 2
+<inf> usbh_dev: Configuration 1 bNumInterfaces 6
+<inf> main: Claimed Quad Cortex Mini HID interface 5
+```
+
+The device enumerates as a composite audio+HID device (6 interfaces), consistent with
+qc-mcp's findings, and interface 5 is correctly claimed.
+
+One thing learned along the way, now baked into the design: with a `NULL`/VID-PID-only
+class filter, Zephyr's USB host stack calls `probe()` **once per device**, not once per
+interface — it hands back `USBH_CLASS_IFNUM_DEVICE` (255), a sentinel, not a real interface
+number. `usbh_shim.c` looks up the target interface (5) itself via `usbh_desc_get_iface()`
+rather than trusting the `iface` argument `probe()` receives; `qc_usbh_filter` carries that
+target interface number alongside vid/pid.
 
 ## Not yet done
 

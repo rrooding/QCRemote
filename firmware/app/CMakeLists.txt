@@ -13,5 +13,13 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(etl)
 
-target_sources(app PRIVATE src/Main.cpp)
+# subsys/usb/host's own headers (usbh_class.h, usbh_desc.h, ...) aren't part
+# of Zephyr's public API and aren't exported by its build - needed by
+# usbh_shim.c, which is the only file that includes them. See that file.
+zephyr_include_directories(${ZEPHYR_BASE}/subsys/usb/host)
+
+target_sources(app PRIVATE
+  src/Main.cpp
+  src/usbh_shim.c
+)
 target_link_libraries(app PRIVATE etl::etl)

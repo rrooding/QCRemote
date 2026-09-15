@@ -1,0 +1,16 @@
+/*
+ * frdm_rw612's own board devicetree enables the RW612's single USB-OTG
+ * peripheral in device mode (zephyr_udc0) by default. We need host mode to
+ * enumerate the Quad Cortex Mini, so flip it: disable the device-mode node
+ * and enable the host-mode one instead. Both compatibles map to the same
+ * physical register range (see nxp_rw6xx_common.dtsi) - they're mutually
+ * exclusive, not additive.
+ */
+
+&usb_otg {
+	status = "disabled";
+};
+
+zephyr_uhc0: &usbh {
+	status = "okay";
+};
