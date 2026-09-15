@@ -4,6 +4,7 @@
 
 #include <zephyr/device.h>
 #include <zephyr/drivers/usb/uhc.h>
+#include <zephyr/logging/log.h>
 #include <zephyr/net_buf.h>
 #include <zephyr/usb/usb_ch9.h>
 #include <zephyr/usb/usbh.h>
@@ -11,6 +12,8 @@
 #include <usbh_class.h>
 #include <usbh_desc.h>
 #include <usbh_device.h>
+
+LOG_MODULE_REGISTER(usbh_shim, LOG_LEVEL_INF);
 
 /*
  * Compiled as plain C, not C++ - this is what actually works around the two
@@ -72,6 +75,7 @@ static int arm_in_transfer(struct uhc_transfer *const xfer)
 	struct net_buf *buf = usbh_xfer_buf_alloc(claimed_udev, QC_USBH_REPORT_SIZE);
 
 	if (buf == NULL) {
+		LOG_ERR("arm_in_transfer: usbh_xfer_buf_alloc failed");
 		return -ENOMEM;
 	}
 
@@ -81,6 +85,7 @@ static int arm_in_transfer(struct uhc_transfer *const xfer)
 	int ret = usbh_xfer_enqueue(claimed_udev, xfer);
 
 	if (ret != 0) {
+		LOG_ERR("arm_in_transfer: usbh_xfer_enqueue failed: %d", ret);
 		net_buf_unref(buf);
 	}
 	return ret;
@@ -92,8 +97,13 @@ static int in_xfer_cb(struct usb_device *const dev, struct uhc_transfer *const x
 
 	struct net_buf *buf = xfer->buf;
 
-	if (xfer->err == 0 && registered_ops != NULL && registered_ops->on_report_in != NULL) {
-		registered_ops->on_report_in(buf->data, buf->len);
+	if (xfer->err != 0) {
+		LOG_WRN("IN transfer completed with error: %d", xfer->err);
+	} else {
+		LOG_DBG("IN transfer completed: %u bytes", buf->len);
+		if (registered_ops != NULL && registered_ops->on_report_in != NULL) {
+			registered_ops->on_report_in(buf->data, buf->len);
+		}
 	}
 
 	net_buf_unref(buf);
@@ -102,6 +112,7 @@ static int in_xfer_cb(struct usb_device *const dev, struct uhc_transfer *const x
 		int ret = arm_in_transfer(xfer);
 
 		if (ret != 0) {
+			LOG_ERR("Failed to re-arm IN transfer: %d - receive loop stopped", ret);
 			receiving = false;
 		}
 	}
@@ -111,8 +122,11 @@ static int in_xfer_cb(struct usb_device *const dev, struct uhc_transfer *const x
 
 static int start_receiving(void)
 {
+	LOG_INF("Starting receive loop on IN endpoint 0x%02x", ep_in);
+
 	in_xfer = usbh_xfer_alloc(claimed_udev, ep_in, in_xfer_cb, NULL);
 	if (in_xfer == NULL) {
+		LOG_ERR("start_receiving: usbh_xfer_alloc failed");
 		return -ENOMEM;
 	}
 
@@ -121,6 +135,7 @@ static int start_receiving(void)
 	int ret = arm_in_transfer(in_xfer);
 
 	if (ret != 0) {
+		LOG_ERR("start_receiving: initial arm failed: %d", ret);
 		usbh_xfer_free(claimed_udev, in_xfer);
 		in_xfer = NULL;
 		receiving = false;
@@ -145,6 +160,10 @@ static void discover_endpoints(const struct usb_if_descriptor *const if_desc)
 
 		if (desc->bDescriptorType == USB_DESC_ENDPOINT) {
 			const struct usb_ep_descriptor *ep_desc = (const void *)desc;
+
+			LOG_INF("Found endpoint 0x%02x, attributes 0x%02x, wMaxPacketSize %u",
+				ep_desc->bEndpointAddress, ep_desc->bmAttributes,
+				ep_desc->wMaxPacketSize);
 
 			if (USB_EP_DIR_IS_IN(ep_desc->bEndpointAddress)) {
 				ep_in = ep_desc->bEndpointAddress;
@@ -193,12 +212,22 @@ static int shim_probe(struct usbh_class_data *const c_data, struct usb_device *c
 	claimed_udev = udev;
 	discover_endpoints(desc);
 
+	LOG_INF("Interface %u endpoints: IN=0x%02x OUT=0x%02x", registered_filter.iface, ep_in,
+		ep_out);
+
 	if (ep_in == 0) {
+		LOG_ERR("No IN endpoint found on interface %u (bNumEndpoints=%u)",
+			registered_filter.iface, desc->bNumEndpoints);
 		claimed_udev = NULL;
 		return -ENODEV;
 	}
 
-	return start_receiving();
+	int ret = start_receiving();
+
+	if (ret != 0) {
+		LOG_ERR("start_receiving failed: %d", ret);
+	}
+	return ret;
 }
 
 static int shim_removed(struct usbh_class_data *const c_data)
