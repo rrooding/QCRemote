@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out QCRemote
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Package list straight from Zephyr's own Ubuntu install docs
       # (doc/develop/getting_started/installation_linux.rst) - gcc-multilib/
@@ -43,7 +43,7 @@ jobs:
       # (re-clone zephyr, re-download the SDK) on every commit, defeating
       # the point of caching it at all.
       - name: Cache Zephyr workspace and SDK
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/zephyrproject
@@ -52,7 +52,7 @@ jobs:
           key: zephyr-${{ env.ZEPHYR_VERSION }}-${{ runner.os }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
