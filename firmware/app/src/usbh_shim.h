@@ -70,6 +70,13 @@ int qc_usbh_bridge_start(const struct qc_usbh_filter *filter, const struct qc_us
  * has its own message-level acknowledgement for that once the session
  * handshake (issue #7) exists.
  *
+ * KNOWN BROKEN as written, confirmed on real hardware: the Quad Cortex
+ * Mini's interface 5 has exactly one endpoint (0x81, interrupt IN) - no
+ * interrupt OUT endpoint at all, so ep_out never gets set and this always
+ * fails with -ENODEV. Sending will need HID's SET_REPORT class-specific
+ * control transfer on endpoint 0 instead. Left as-is (not reimplemented)
+ * since nothing calls this yet - #7 is where it actually needs to work.
+ *
  * Returns 0 on successful submission, a negative errno otherwise (no
  * device claimed, no OUT endpoint found, out of memory).
  */

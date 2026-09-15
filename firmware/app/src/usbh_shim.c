@@ -100,7 +100,7 @@ static int in_xfer_cb(struct usb_device *const dev, struct uhc_transfer *const x
 	if (xfer->err != 0) {
 		LOG_WRN("IN transfer completed with error: %d", xfer->err);
 	} else {
-		LOG_DBG("IN transfer completed: %u bytes", buf->len);
+		LOG_INF("IN transfer completed: %u bytes", buf->len);
 		if (registered_ops != NULL && registered_ops->on_report_in != NULL) {
 			registered_ops->on_report_in(buf->data, buf->len);
 		}
