@@ -55,26 +55,33 @@ Drop `--pristine` on subsequent builds once the build directory exists.
 
 ## Flash
 
-The FRDM-RW612's onboard debug probe is an **MCU-Link**, which ships from the factory running
-**CMSIS-DAP firmware**, not J-Link. `west flash` with no arguments tries the `jlink` runner
-first (it's just listed first in the board's `board.cmake`, not because it's the right
-default for this board) and fails with `JLinkExe not found` — that's expected on a stock
-board, not a real error to chase.
+The FRDM-RW612's onboard **MCU-Link** probe, at least on the unit this was verified against,
+enumerates as **SEGGER J-Link** (`system_profiler`/`ioreg` show `USB Vendor Name: SEGGER`,
+`USB Product Name: J_Link`) — not CMSIS-DAP. So the `jlink` runner `west flash` tries by
+default is the correct one; you just need SEGGER's tools installed.
 
-Use the `linkserver` runner, which is what actually talks to the stock CMSIS-DAP firmware:
+Install the **J-Link Software and Documentation Pack** for your OS from
+[segger.com/downloads/jlink](https://www.segger.com/downloads/jlink/) (no account needed),
+then confirm `JLinkExe` is on `PATH` (SEGGER's installer typically symlinks it into
+`/usr/local/bin` automatically):
 
 ```bash
-west flash --runner linkserver
+which JLinkExe
 ```
 
-This needs NXP's **LinkServer** utility installed and on `PATH` (via the
-[MCUXpresso Installer](https://www.nxp.com/mcuxpresso/installer) or the standalone
-[LinkServer installer](https://www.nxp.com/design/design-center/software/development-software/mcuxpresso-software-and-tools-/linkserver-for-microcontrollers:LINKERSERVER)
-— on Linux that's a `.deb.bin` you install and add to `PATH` manually).
+Then just:
 
-`west flash --runner jlink` only works if the onboard MCU-Link has been reflashed with
-J-Link OB firmware via NXP's MCU-Link firmware-update utility — not needed unless you
-specifically want SEGGER's tools instead of LinkServer.
+```bash
+west flash
+```
+
+If your board's probe turns out to be running CMSIS-DAP firmware instead (NXP ships MCU-Link
+boards both ways depending on batch/board revision — verify with `system_profiler
+SPUSBDataTree` or `ioreg -p IOUSB -l | grep -i "USB Vendor Name\|USB Product Name"` before
+assuming either way), use `west flash --runner linkserver` instead, which needs NXP's
+**LinkServer** utility installed and on `PATH` (via the
+[MCUXpresso Installer](https://www.nxp.com/mcuxpresso/installer) or the standalone
+[LinkServer installer](https://www.nxp.com/design/design-center/software/development-software/mcuxpresso-software-and-tools-/linkserver-for-microcontrollers:LINKERSERVER)).
 
 ## Verify
 
