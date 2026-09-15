@@ -178,8 +178,20 @@ Run the tests:
 west twister -p native_sim -T firmware/app/tests/hid_framing
 ```
 
-(Unverified against the actual Twister/native_sim toolchain — ported carefully from a real
-Zephyr Ztest example, but this project's Ztest infra (issue #31) didn't exist before this.)
+**`native_sim` only runs on a Linux host** — it uses actual Linux syscalls, not a portable
+POSIX layer, so on macOS this will always report "FILTERED: Native platform requires Linux."
+That's expected, not a bug; it's what CI (presumably a Linux runner) will use. For local
+testing on macOS, use a QEMU-emulated target instead, overriding the testcase's
+`platform_allow` for this one run:
+
+```bash
+west twister -p qemu_cortex_m3 -K -T firmware/app/tests/hid_framing
+```
+
+**Verified 2026-09-15**: all 7 test cases pass on `qemu_cortex_m3`. Needed one additional fix
+along the way — `CONFIG_REQUIRES_FULL_LIBCPP=y` (now in both `prj.conf` files), since Zephyr's
+default `MINIMAL_LIBCPP` doesn't provide `<span>` (or `<cerrno>` — see `UsbHostClass.hpp`'s
+history) at all. Confirmed against the pinned v4.4.2 `lib/cpp/Kconfig` source, not assumed.
 
 **Not done yet — the other half of #4**: nothing actually calls these classes. `usbh_shim.c`
 doesn't submit or receive any transfers (`shim_completion_cb` is still the `-ENOTSUP` stub
