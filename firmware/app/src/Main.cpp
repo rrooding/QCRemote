@@ -46,7 +46,7 @@ int main() {
 
     LOG_INF("QC Bridge firmware skeleton up (C++%ld)", static_cast<long>(__cplusplus));
 
-    if (g_qcHidBridge.Start() != 0) {
+    if (g_qcHidBridge.start() != 0) {
         LOG_ERR("USB host bridge failed to start");
     } else {
         LOG_INF("USB host enabled, waiting for Quad Cortex Mini");
