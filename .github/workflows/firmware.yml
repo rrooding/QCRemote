@@ -60,9 +60,11 @@ jobs:
           fi
 
       - name: Build frdm_rw612
-        working-directory: ~/zephyrproject
-        run: west build -b frdm_rw612 "$GITHUB_WORKSPACE/firmware/app" --pristine
+        run: |
+          cd ~/zephyrproject
+          west build -b frdm_rw612 "$GITHUB_WORKSPACE/firmware/app" --pristine
 
       - name: Run HID framing tests (native_sim)
-        working-directory: ~/zephyrproject
-        run: west twister -p native_sim -T "$GITHUB_WORKSPACE/firmware/app/tests/hid_framing"
+        run: |
+          cd ~/zephyrproject
+          west twister -p native_sim -T "$GITHUB_WORKSPACE/firmware/app/tests/hid_framing"
