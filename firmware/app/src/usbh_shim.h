@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -13,6 +14,9 @@ extern "C" {
  * relying on C's implicit void* conversions). Nothing here should ever
  * require the rest of the firmware to include a Zephyr USB header directly.
  */
+
+/* Every qc-mcp HID report is exactly this many bytes (see PROTOCOL.md). */
+#define QC_USBH_REPORT_SIZE 128
 
 struct qc_usbh_filter {
 	uint16_t vid;
@@ -30,22 +34,46 @@ struct qc_usbh_filter {
 /*
  * iface_class/sub/proto come from the matched interface's descriptor, so
  * callers never need to touch a Zephyr USB descriptor type.
+ *
+ * on_report_in is called once per received HID report (exactly
+ * QC_USBH_REPORT_SIZE bytes, or fewer on a short packet - the caller
+ * decides whether that's an error). Called from the USB host stack's own
+ * thread, not an ISR, but treat it as time-sensitive: do the minimum
+ * necessary and return.
  */
 struct qc_usbh_ops {
 	void (*on_init)(void);
 	int (*on_probe)(uint8_t iface, uint8_t iface_class, uint8_t iface_sub,
 			uint8_t iface_proto);
 	void (*on_removed)(void);
+	void (*on_report_in)(const uint8_t *data, size_t len);
 };
 
 /*
  * Configures the (single) USB host class this bridge supports and starts
  * the USB host controller. Call once, before the app's main loop.
  *
+ * Once a device is claimed, this also starts a continuous receive loop on
+ * its IN endpoint (re-armed automatically after every report, including
+ * on_report_in callbacks) - there's no separate "start receiving" call.
+ *
  * Returns 0 on success, a negative errno from Zephyr's USB host stack on
  * failure.
  */
 int qc_usbh_bridge_start(const struct qc_usbh_filter *filter, const struct qc_usbh_ops *ops);
+
+/*
+ * Sends one HID report on the claimed device's OUT endpoint. Only valid
+ * after on_probe() has accepted a device. This only confirms the transfer
+ * was *submitted*; completion (success or failure) is asynchronous and,
+ * as of this writing, not reported back to the caller - qc-mcp's protocol
+ * has its own message-level acknowledgement for that once the session
+ * handshake (issue #7) exists.
+ *
+ * Returns 0 on successful submission, a negative errno otherwise (no
+ * device claimed, no OUT endpoint found, out of memory).
+ */
+int qc_usbh_send_report(const uint8_t *report, size_t len);
 
 #ifdef __cplusplus
 }

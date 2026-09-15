@@ -193,11 +193,30 @@ along the way — `CONFIG_REQUIRES_FULL_LIBCPP=y` (now in both `prj.conf` files)
 default `MINIMAL_LIBCPP` doesn't provide `<span>` (or `<cerrno>` — see `UsbHostClass.hpp`'s
 history) at all. Confirmed against the pinned v4.4.2 `lib/cpp/Kconfig` source, not assumed.
 
-**Not done yet — the other half of #4**: nothing actually calls these classes. `usbh_shim.c`
-doesn't submit or receive any transfers (`shim_completion_cb` is still the `-ENOTSUP` stub
-from #3), and interface 5's actual endpoint addresses aren't known. That needs its own
-hardware-in-the-loop pass, same as #3 did — real devices tend to disagree with API docs in
-ways only a build-and-flash cycle catches.
+## HID report transport (issue #4, part 2 of 2)
+
+`usbh_shim.c` now discovers interface 5's actual IN/OUT endpoint addresses (walking its
+descriptors via `usbh_desc_get_next()` until the next interface descriptor, right after
+`onProbe()` accepts the device) and starts a continuous receive loop on the IN endpoint:
+allocate a report-sized buffer, submit it, and on every completion hand the bytes to
+`on_report_in()` and immediately re-arm with a fresh buffer. `qc_usbh_send_report()` submits
+one report on the OUT endpoint the same way, for whenever there's something to send (that's
+issue #7 — nothing calls it yet).
+
+This is modeled directly on `subsys/usb/host/class/usbh_uvc.c`'s `initiate_transfer`/
+`continue_transfer` pattern — the only in-tree, merged USB host class driver that actually
+moves data, and the closest thing to a proven reference for this part of the API. Every
+field/function name (`xfer->buf`, `xfer->err`, `usbh_xfer_alloc`, `net_buf_add_mem`, ...) was
+checked against the pinned v4.4.2 source before use, not assumed from newer docs.
+
+`QcHidBridge` now owns a `HidReassembler` and feeds every received report into it, logging
+the byte count on each successfully reassembled message.
+
+**Not yet verified** — needs the physical Quad Cortex Mini. Per #4's acceptance criteria,
+success here means "bytes come back with no transfer error," not a meaningful reply — qc-mcp's
+protocol requires the session handshake (#7) before the device streams anything on its own,
+so expect the log to show `Reassembled message: N bytes` at most a few times (from whatever
+the device sends unprompted, if anything) rather than a steady stream.
 
 ## Not yet done
 
