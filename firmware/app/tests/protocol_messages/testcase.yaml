@@ -1,0 +1,4 @@
+tests:
+  firmware.protocol_messages:
+    platform_allow: native_sim
+    tags: firmware
