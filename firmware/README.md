@@ -10,7 +10,10 @@ firmware/
 └── app/            # the actual Zephyr application (out-of-tree, "freestanding")
     ├── CMakeLists.txt
     ├── prj.conf
-    └── src/Main.cpp
+    ├── boards/frdm_rw612.overlay   # switches the RW612's USB peripheral to host mode
+    └── src/
+        ├── Main.cpp
+        └── QcHidBridge.hpp         # USB host class that claims the QC Mini's HID interface
 ```
 
 This repo does **not** vendor its own `west.yml`/manifest. `firmware/app` is a standard
@@ -100,6 +103,33 @@ There are two `usbmodem` devices from the probe; the console is the first one en
 and the onboard green LED blinks at ~1Hz. Confirms the toolchain, board target, and C++23
 configuration all work end-to-end before any real protocol code lands (issues
 [#3](https://github.com/rrooding/QCRemote/issues/3) onward).
+
+## USB host bring-up (issue #3)
+
+`boards/frdm_rw612.overlay` switches the RW612's single USB-OTG peripheral from device mode
+(the board default) to host mode. `prj.conf` enables `CONFIG_USB_HOST_STACK` (Zephyr's
+`[EXPERIMENTAL]` USB host stack — see [ADR 0002](../docs/adr/0002-devkit-selection.md) for
+the accepted risk); the NXP EHCI controller driver auto-selects itself once the devicetree
+node is enabled.
+
+`QcHidBridge` ([src/QcHidBridge.hpp](app/src/QcHidBridge.hpp)) is a USB host class that
+filters for the Quad Cortex Mini's VID/PID (`0x152A`/`0x892F`, per
+[qc-mcp](https://github.com/lexasoft123/qc-mcp)) and claims only interface 5 (the vendor HID
+control interface), rejecting every other interface the composite device exposes. It doesn't
+submit any transfers yet — `completion_cb` is a stub returning `-ENOTSUP` — that lands with
+the HID framing and session-handshake work (issues #4-#8).
+
+This relies on `subsys/usb/host`'s internal headers (`usbh_class.h`, `usbh_desc.h`), not the
+public `zephyr/usb/usbh.h` API alone — every USB host class driver needs them, including
+Zephyr's own in-tree ones (MSC, UAC2, UVC), and there's currently no public alternative.
+`CMakeLists.txt` adds `${ZEPHYR_BASE}/subsys/usb/host` as an include path to reach them.
+Flag it if a future Zephyr version moves or restricts these headers.
+
+**Not yet verified — needs the physical Quad Cortex Mini connected via USB to the board's
+non-debug USB-C port.** This has not been build-tested (no Zephyr SDK in the environment this
+was written in) or exercised against real hardware. Expect the log to show `"Claimed Quad
+Cortex Mini HID interface 5"` on connect and `"Quad Cortex Mini disconnected"` on removal;
+report back whatever actually happens.
 
 ## Not yet done
 
