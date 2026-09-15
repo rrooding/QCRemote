@@ -1,15 +1,10 @@
-#include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/usb/usbh.h>
-
-#include "QcHidBridge.hpp"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
-USBH_CONTROLLER_DEFINE(qc_bridge_uhs, DEVICE_DT_GET(DT_NODELABEL(zephyr_uhc0)));
-USBH_DEFINE_CLASS(qc_hid_bridge, &qcbridge::QcHidBridge::api, nullptr, qcbridge::kQcHidFilter);
+#include "QcHidBridge.hpp"
 
 namespace qcbridge {
 
@@ -38,6 +33,7 @@ private:
 namespace {
 const gpio_dt_spec kLedSpec = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 const auto kBlinkInterval = K_MSEC(500);
+qcbridge::QcHidBridge g_qcHidBridge;
 }  // namespace
 
 int main() {
@@ -50,10 +46,8 @@ int main() {
 
     LOG_INF("QC Bridge firmware skeleton up (C++%ld)", static_cast<long>(__cplusplus));
 
-    if (usbh_init(&qc_bridge_uhs) != 0) {
-        LOG_ERR("USB host init failed");
-    } else if (usbh_enable(&qc_bridge_uhs) != 0) {
-        LOG_ERR("USB host enable failed");
+    if (g_qcHidBridge.Start() != 0) {
+        LOG_ERR("USB host bridge failed to start");
     } else {
         LOG_INF("USB host enabled, waiting for Quad Cortex Mini");
     }

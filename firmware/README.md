@@ -13,7 +13,9 @@ firmware/
     ├── boards/frdm_rw612.overlay   # switches the RW612's USB peripheral to host mode
     └── src/
         ├── Main.cpp
-        └── QcHidBridge.hpp         # USB host class that claims the QC Mini's HID interface
+        ├── usbh_shim.c/.h          # plain-C boundary around Zephyr's non-C++-safe USB host API
+        ├── UsbHostClass.hpp        # generic C++ base built on the shim
+        └── QcHidBridge.hpp         # claims the QC Mini's HID interface, on top of UsbHostClass
 ```
 
 This repo does **not** vendor its own `west.yml`/manifest. `firmware/app` is a standard
@@ -112,24 +114,37 @@ configuration all work end-to-end before any real protocol code lands (issues
 the accepted risk); the NXP EHCI controller driver auto-selects itself once the devicetree
 node is enabled.
 
-`QcHidBridge` ([src/QcHidBridge.hpp](app/src/QcHidBridge.hpp)) is a USB host class that
-filters for the Quad Cortex Mini's VID/PID (`0x152A`/`0x892F`, per
-[qc-mcp](https://github.com/lexasoft123/qc-mcp)) and claims only interface 5 (the vendor HID
-control interface), rejecting every other interface the composite device exposes. It doesn't
-submit any transfers yet — `completion_cb` is a stub returning `-ENOTSUP` — that lands with
-the HID framing and session-handshake work (issues #4-#8).
+**Zephyr's public USB host headers don't compile as C++** (confirmed against a real build,
+Zephyr v4.4.2): `zephyr/usb/usbh.h` has a struct field literally named `class`, and
+`zephyr/drivers/usb/uhc.h` relies on C's implicit `void*` conversions in several inline
+functions. Both are genuine bugs in Zephyr's public API, not something fixable from the C++
+side — worth reporting upstream.
 
-This relies on `subsys/usb/host`'s internal headers (`usbh_class.h`, `usbh_desc.h`), not the
-public `zephyr/usb/usbh.h` API alone — every USB host class driver needs them, including
-Zephyr's own in-tree ones (MSC, UAC2, UVC), and there's currently no public alternative.
-`CMakeLists.txt` adds `${ZEPHYR_BASE}/subsys/usb/host` as an include path to reach them.
-Flag it if a future Zephyr version moves or restricts these headers.
+The fix is [`usbh_shim.c`](app/src/usbh_shim.c)/[`usbh_shim.h`](app/src/usbh_shim.h): a plain
+C file (compiled under C, where neither issue applies) exposing a minimal, C++-safe API —
+register a VID/PID filter and three callbacks, get the USB host controller started. It also
+depends on `subsys/usb/host`'s internal headers (`usbh_class.h`, `usbh_desc.h`), which aren't
+part of Zephyr's public API but which every USB host class driver needs, including Zephyr's
+own in-tree ones (MSC, UAC2, UVC) — `CMakeLists.txt` adds `${ZEPHYR_BASE}/subsys/usb/host` as
+an include path to reach them.
+
+[`UsbHostClass.hpp`](app/src/UsbHostClass.hpp) wraps that shim in a small, generic C++ base
+class (`OnInit()`/`OnProbe()`/`OnRemoved()` virtuals) so nothing outside `usbh_shim.c` ever
+includes a Zephyr USB header. `QcHidBridge` ([src/QcHidBridge.hpp](app/src/QcHidBridge.hpp))
+subclasses it: filters for the Quad Cortex Mini's VID/PID (`0x152A`/`0x892F`, per
+[qc-mcp](https://github.com/lexasoft123/qc-mcp)) and claims only interface 5 (the vendor HID
+control interface), rejecting every other interface the composite device exposes. `Main.cpp`
+just owns a `QcHidBridge` and calls `Start()` — no USB host plumbing visible there at all.
+
+No transfers are submitted yet — `shim_completion_cb` in `usbh_shim.c` is a stub returning
+`-ENOTSUP` — that lands with the HID framing and session-handshake work (issues #4-#8).
 
 **Not yet verified — needs the physical Quad Cortex Mini connected via USB to the board's
-non-debug USB-C port.** This has not been build-tested (no Zephyr SDK in the environment this
-was written in) or exercised against real hardware. Expect the log to show `"Claimed Quad
-Cortex Mini HID interface 5"` on connect and `"Quad Cortex Mini disconnected"` on removal;
-report back whatever actually happens.
+non-debug USB-C port.** The previous version of this code failed to build (see PR #39's
+history for the actual compiler errors that led to this shim); this version hasn't been
+build-tested since either (still no Zephyr SDK in the environment this was written in).
+Expect the log to show `"Claimed Quad Cortex Mini HID interface 5"` on connect and `"Quad
+Cortex Mini disconnected"` on removal; report back whatever actually happens.
 
 ## Not yet done
 

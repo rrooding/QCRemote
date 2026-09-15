@@ -193,6 +193,19 @@ conventions, so the two codebases don't drift into two different dialects for no
   Flag it in review if firmware build times on the target toolchain make this genuinely
   painful — that's a build-performance tradeoff to revisit with real data, not a reason to
   diverge upfront.
+- **Narrow exception: a plain-C shim file is allowed where a Zephyr header genuinely isn't
+  C++-safe**, discovered bringing up issue #3 — `zephyr/usb/usbh.h` has a struct field
+  literally named `class` (a C++ reserved word), and `zephyr/drivers/usb/uhc.h` relies on
+  C's implicit `void*` conversions in several inline functions. Both are real bugs in
+  Zephyr's public API, not something our code can work around from the C++ side. See
+  [`usbh_shim.c`](firmware/app/src/usbh_shim.c)/[`usbh_shim.h`](firmware/app/src/usbh_shim.h)
+  for the pattern: a `.c` file (compiled under C, where both issues don't apply) exposing a
+  minimal, C++-safe API, with a small C++ base class
+  ([`UsbHostClass.hpp`](firmware/app/src/UsbHostClass.hpp)) on top so the rest of the
+  firmware never includes a Zephyr USB header directly. This is the same reasoning as the
+  App section's `.cpp`-file exceptions — a toolchain/interop necessity, not a style choice —
+  scoped to wherever a header actually forces it, not a general excuse for `.c` files.
+  Worth reporting upstream to Zephyr regardless of this workaround.
 
 ### Hardware description
 
