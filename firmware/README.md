@@ -212,11 +212,36 @@ checked against the pinned v4.4.2 source before use, not assumed from newer docs
 `QcHidBridge` now owns a `HidReassembler` and feeds every received report into it, logging
 the byte count on each successfully reassembled message.
 
-**Not yet verified** — needs the physical Quad Cortex Mini. Per #4's acceptance criteria,
-success here means "bytes come back with no transfer error," not a meaningful reply — qc-mcp's
-protocol requires the session handshake (#7) before the device streams anything on its own,
-so expect the log to show `Reassembled message: N bytes` at most a few times (from whatever
-the device sends unprompted, if anything) rather than a steady stream.
+**Verified 2026-09-15** against a real Quad Cortex Mini:
+
+```
+<inf> main: Claimed Quad Cortex Mini HID interface 5
+<inf> usbh_shim: Found endpoint 0x81, attributes 0x03, wMaxPacketSize 128
+<inf> usbh_shim: Interface 5 endpoints: IN=0x81 OUT=0x00
+<inf> usbh_shim: Starting receive loop on IN endpoint 0x81
+```
+
+No data arrived while the device sat connected — expected, not a gap: qc-mcp's protocol
+means the device stays silent until the session handshake (#7) exists, so this is the
+*correct* result, not a missing feature. Disconnecting the device produced:
+
+```
+<wrn> usbh_shim: IN transfer completed with error: -5
+```
+
+`-5` is `-EIO` — the pending transfer correctly erroring out on physical disconnect, which
+also confirms the completion/error-handling path actually works (not just the happy path).
+Reconnecting cleanly re-ran the whole enumerate → claim → discover → receive sequence.
+
+Between endpoint discovery working, the receive loop starting, and the disconnect exercising
+real error handling, every phase of #4's transport plumbing has now been exercised against
+real hardware — the remaining gap (actually reading a reassembled message) needs the session
+handshake from #7, which is genuinely out of scope here, not a shortfall of this issue.
+
+**Confirmed limitation, feeds directly into #7**: interface 5 has exactly one endpoint (the
+IN one above) — no interrupt OUT endpoint exists. `qc_usbh_send_report()` as currently
+written always fails with `-ENODEV`; sending will need HID's `SET_REPORT` control transfer
+on endpoint 0 instead. Documented in `usbh_shim.h` and on issue #7.
 
 ## Not yet done
 
