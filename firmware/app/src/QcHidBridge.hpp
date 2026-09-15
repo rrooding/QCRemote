@@ -1,9 +1,12 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <span>
 
 #include <zephyr/logging/log.h>
 
+#include "HidReassembler.hpp"
 #include "UsbHostClass.hpp"
 
 namespace qcbridge {
@@ -19,8 +22,14 @@ inline constexpr uint8_t kQuadCortexHidInterface = 5;
 // header dependency at all.
 inline constexpr uint8_t kUsbBaseClassHid = 0x03;
 
-// Claims the Quad Cortex Mini's vendor HID interface (interface 5) and
-// rejects every other interface the composite device exposes.
+// Placeholder pending issue #33's actual sizing exercise - generous enough
+// for any MVP1 message (Version, Connection, ResetCommsBuffers, KeepAlive,
+// ModelRepo, SetlistPosition) without having measured them yet.
+inline constexpr size_t kReassemblyCapacity = 4096;
+
+// Claims the Quad Cortex Mini's vendor HID interface (interface 5), rejects
+// every other interface the composite device exposes, and reassembles
+// incoming HID reports into logical messages.
 class QcHidBridge : public UsbHostClass {
 public:
     int start() {
@@ -42,6 +51,29 @@ protected:
     }
 
     void onRemoved() override { LOG_INF("Quad Cortex Mini disconnected"); }
+
+    void onReportIn(std::span<const uint8_t> report) override {
+        using Status = HidReassembler<kReassemblyCapacity>::Status;
+
+        switch (reassembler_.feed(report)) {
+        case Status::Complete: {
+            const auto message = reassembler_.message();
+            LOG_INF("Reassembled message: %zu bytes", message.size());
+            break;
+        }
+        case Status::Overflow:
+            LOG_WRN("Reassembly overflow (> %zu bytes) - message dropped", kReassemblyCapacity);
+            break;
+        case Status::Malformed:
+            LOG_WRN("Malformed HID report (%zu bytes)", report.size());
+            break;
+        case Status::InProgress:
+            break;
+        }
+    }
+
+private:
+    HidReassembler<kReassemblyCapacity> reassembler_;
 };
 
 }  // namespace qcbridge

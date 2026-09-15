@@ -1,11 +1,19 @@
 #include "usbh_shim.h"
 
+#include <stdbool.h>
+
 #include <zephyr/device.h>
 #include <zephyr/drivers/usb/uhc.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/net_buf.h>
+#include <zephyr/usb/usb_ch9.h>
 #include <zephyr/usb/usbh.h>
 
 #include <usbh_class.h>
 #include <usbh_desc.h>
+#include <usbh_device.h>
+
+LOG_MODULE_REGISTER(usbh_shim, LOG_LEVEL_INF);
 
 /*
  * Compiled as plain C, not C++ - this is what actually works around the two
@@ -18,13 +26,24 @@
  *     error in C++.
  *
  * Both are real problems in Zephyr's own public API, not anything specific
- * to this project - worth reporting upstream. usbh_shim.h is the line: the
- * rest of the firmware talks to that C-safe header and never includes a
- * Zephyr USB header itself.
+ * to this project - worth reporting upstream (tracked in issue #48).
+ * usbh_shim.h is the line: the rest of the firmware talks to that C-safe
+ * header and never includes a Zephyr USB header itself.
+ *
+ * Transfer submission (issue #4) is modeled directly on
+ * subsys/usb/host/class/usbh_uvc.c's initiate_transfer/continue_transfer
+ * pattern - the only in-tree, merged host class driver that actually moves
+ * data, and the closest thing to a proven reference for this API.
  */
 
 static const struct qc_usbh_ops *registered_ops;
 static struct qc_usbh_filter registered_filter;
+
+static struct usb_device *claimed_udev;
+static uint8_t ep_in;
+static uint8_t ep_out;
+static struct uhc_transfer *in_xfer;
+static bool receiving;
 
 static int shim_init(struct usbh_class_data *const c_data)
 {
@@ -42,8 +61,118 @@ static int shim_completion_cb(struct usbh_class_data *const c_data,
 	(void)c_data;
 	(void)xfer;
 
-	/* Transfer submission lands with the HID framing work (#4-#8). */
+	/*
+	 * Not used: every transfer we submit gets its own per-transfer
+	 * callback via usbh_xfer_alloc() (see in_xfer_cb/out_xfer_cb below),
+	 * so this class-level fallback should never actually be hit.
+	 */
 	return -ENOTSUP;
+}
+
+/* Re-arms `xfer` with a fresh, empty receive buffer and resubmits it. */
+static int arm_in_transfer(struct uhc_transfer *const xfer)
+{
+	struct net_buf *buf = usbh_xfer_buf_alloc(claimed_udev, QC_USBH_REPORT_SIZE);
+
+	if (buf == NULL) {
+		LOG_ERR("arm_in_transfer: usbh_xfer_buf_alloc failed");
+		return -ENOMEM;
+	}
+
+	buf->len = 0;
+	xfer->buf = buf;
+
+	int ret = usbh_xfer_enqueue(claimed_udev, xfer);
+
+	if (ret != 0) {
+		LOG_ERR("arm_in_transfer: usbh_xfer_enqueue failed: %d", ret);
+		net_buf_unref(buf);
+	}
+	return ret;
+}
+
+static int in_xfer_cb(struct usb_device *const dev, struct uhc_transfer *const xfer)
+{
+	(void)dev;
+
+	struct net_buf *buf = xfer->buf;
+
+	if (xfer->err != 0) {
+		LOG_WRN("IN transfer completed with error: %d", xfer->err);
+	} else {
+		LOG_INF("IN transfer completed: %u bytes", buf->len);
+		if (registered_ops != NULL && registered_ops->on_report_in != NULL) {
+			registered_ops->on_report_in(buf->data, buf->len);
+		}
+	}
+
+	net_buf_unref(buf);
+
+	if (receiving) {
+		int ret = arm_in_transfer(xfer);
+
+		if (ret != 0) {
+			LOG_ERR("Failed to re-arm IN transfer: %d - receive loop stopped", ret);
+			receiving = false;
+		}
+	}
+
+	return 0;
+}
+
+static int start_receiving(void)
+{
+	LOG_INF("Starting receive loop on IN endpoint 0x%02x", ep_in);
+
+	in_xfer = usbh_xfer_alloc(claimed_udev, ep_in, in_xfer_cb, NULL);
+	if (in_xfer == NULL) {
+		LOG_ERR("start_receiving: usbh_xfer_alloc failed");
+		return -ENOMEM;
+	}
+
+	receiving = true;
+
+	int ret = arm_in_transfer(in_xfer);
+
+	if (ret != 0) {
+		LOG_ERR("start_receiving: initial arm failed: %d", ret);
+		usbh_xfer_free(claimed_udev, in_xfer);
+		in_xfer = NULL;
+		receiving = false;
+	}
+	return ret;
+}
+
+/* Walks the descriptors following `if_desc`, recording the first IN and
+ * first OUT endpoint found before the next interface descriptor. */
+static void discover_endpoints(const struct usb_if_descriptor *const if_desc)
+{
+	const struct usb_desc_header *desc = (const struct usb_desc_header *)if_desc;
+	int found = 0;
+
+	ep_in = 0;
+	ep_out = 0;
+
+	while ((desc = usbh_desc_get_next(desc)) != NULL && found < if_desc->bNumEndpoints) {
+		if (desc->bDescriptorType == USB_DESC_INTERFACE) {
+			break;
+		}
+
+		if (desc->bDescriptorType == USB_DESC_ENDPOINT) {
+			const struct usb_ep_descriptor *ep_desc = (const void *)desc;
+
+			LOG_INF("Found endpoint 0x%02x, attributes 0x%02x, wMaxPacketSize %u",
+				ep_desc->bEndpointAddress, ep_desc->bmAttributes,
+				ep_desc->wMaxPacketSize);
+
+			if (USB_EP_DIR_IS_IN(ep_desc->bEndpointAddress)) {
+				ep_in = ep_desc->bEndpointAddress;
+			} else {
+				ep_out = ep_desc->bEndpointAddress;
+			}
+			found++;
+		}
+	}
 }
 
 static int shim_probe(struct usbh_class_data *const c_data, struct usb_device *const udev,
@@ -73,13 +202,43 @@ static int shim_probe(struct usbh_class_data *const c_data, struct usb_device *c
 		return -ENOTSUP;
 	}
 
-	return registered_ops->on_probe(registered_filter.iface, desc->bInterfaceClass,
-					 desc->bInterfaceSubClass, desc->bInterfaceProtocol);
+	int accepted = registered_ops->on_probe(registered_filter.iface, desc->bInterfaceClass,
+						desc->bInterfaceSubClass,
+						desc->bInterfaceProtocol);
+	if (accepted != 0) {
+		return accepted;
+	}
+
+	claimed_udev = udev;
+	discover_endpoints(desc);
+
+	LOG_INF("Interface %u endpoints: IN=0x%02x OUT=0x%02x", registered_filter.iface, ep_in,
+		ep_out);
+
+	if (ep_in == 0) {
+		LOG_ERR("No IN endpoint found on interface %u (bNumEndpoints=%u)",
+			registered_filter.iface, desc->bNumEndpoints);
+		claimed_udev = NULL;
+		return -ENODEV;
+	}
+
+	int ret = start_receiving();
+
+	if (ret != 0) {
+		LOG_ERR("start_receiving failed: %d", ret);
+	}
+	return ret;
 }
 
 static int shim_removed(struct usbh_class_data *const c_data)
 {
 	(void)c_data;
+
+	receiving = false;
+	claimed_udev = NULL;
+	ep_in = 0;
+	ep_out = 0;
+	in_xfer = NULL;
 
 	if (registered_ops != NULL && registered_ops->on_removed != NULL) {
 		registered_ops->on_removed();
@@ -114,4 +273,44 @@ int qc_usbh_bridge_start(const struct qc_usbh_filter *filter, const struct qc_us
 		return ret;
 	}
 	return usbh_enable(&qc_usbh_ctx);
+}
+
+static int out_xfer_cb(struct usb_device *const dev, struct uhc_transfer *const xfer)
+{
+	(void)dev;
+
+	net_buf_unref(xfer->buf);
+	usbh_xfer_free(claimed_udev, xfer);
+	return 0;
+}
+
+int qc_usbh_send_report(const uint8_t *report, size_t len)
+{
+	if (claimed_udev == NULL || ep_out == 0) {
+		return -ENODEV;
+	}
+
+	struct uhc_transfer *xfer = usbh_xfer_alloc(claimed_udev, ep_out, out_xfer_cb, NULL);
+
+	if (xfer == NULL) {
+		return -ENOMEM;
+	}
+
+	struct net_buf *buf = usbh_xfer_buf_alloc(claimed_udev, len);
+
+	if (buf == NULL) {
+		usbh_xfer_free(claimed_udev, xfer);
+		return -ENOMEM;
+	}
+
+	net_buf_add_mem(buf, report, len);
+	xfer->buf = buf;
+
+	int ret = usbh_xfer_enqueue(claimed_udev, xfer);
+
+	if (ret != 0) {
+		net_buf_unref(buf);
+		usbh_xfer_free(claimed_udev, xfer);
+	}
+	return ret;
 }
