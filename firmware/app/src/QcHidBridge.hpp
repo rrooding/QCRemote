@@ -23,12 +23,18 @@ inline constexpr uint8_t kUsbBaseClassHid = 0x03;
 // rejects every other interface the composite device exposes.
 class QcHidBridge : public UsbHostClass {
 public:
-    int Start() { return UsbHostClass::Start(kQuadCortexVid, kQuadCortexMiniPid); }
+    int Start() {
+        return UsbHostClass::Start(kQuadCortexVid, kQuadCortexMiniPid, kQuadCortexHidInterface);
+    }
 
 protected:
     bool OnProbe(uint8_t iface, uint8_t ifaceClass, uint8_t /*ifaceSub*/,
                 uint8_t /*ifaceProto*/) override {
-        if (iface != kQuadCortexHidInterface || ifaceClass != kUsbBaseClassHid) {
+        // iface is always kQuadCortexHidInterface here - the shim looks up
+        // that specific interface before calling OnProbe at all. Still
+        // worth checking the class code: a CorOS change moving what's at
+        // interface 5 should make us reject it, not silently misclaim it.
+        if (ifaceClass != kUsbBaseClassHid) {
             return false;
         }
         LOG_INF("Claimed Quad Cortex Mini HID interface %u", iface);

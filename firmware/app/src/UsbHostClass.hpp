@@ -26,11 +26,12 @@ public:
     virtual ~UsbHostClass() = default;
 
     // Starts the USB host controller and registers this instance as the
-    // class every connected device's interfaces get offered to. Returns 0
-    // on success, a negative errno from Zephyr's USB host stack on failure.
-    int Start(uint16_t vid, uint16_t pid) {
+    // class for devices matching vid/pid, offering interface `iface` to
+    // OnProbe(). Returns 0 on success, a negative errno from Zephyr's USB
+    // host stack on failure.
+    int Start(uint16_t vid, uint16_t pid, uint8_t iface) {
         instance = this;
-        const qc_usbh_filter filter{.vid = vid, .pid = pid};
+        const qc_usbh_filter filter{.vid = vid, .pid = pid, .iface = iface};
         const qc_usbh_ops ops{
             .on_init = &TrampolineInit,
             .on_probe = &TrampolineProbe,
@@ -43,8 +44,9 @@ protected:
     // Called once, before any device connects.
     virtual void OnInit() {}
 
-    // Called once per interface of a VID/PID-matched device. Return true
-    // to claim this interface, false to leave it unclaimed.
+    // Called once a VID/PID-matched device connects, with the descriptor of
+    // the `iface` passed to Start(). Return true to accept the device,
+    // false to reject it (e.g. the interface isn't the class you expected).
     virtual bool OnProbe(uint8_t iface, uint8_t ifaceClass, uint8_t ifaceSub,
                          uint8_t ifaceProto) = 0;
 

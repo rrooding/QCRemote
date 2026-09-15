@@ -139,12 +139,17 @@ just owns a `QcHidBridge` and calls `Start()` — no USB host plumbing visible t
 No transfers are submitted yet — `shim_completion_cb` in `usbh_shim.c` is a stub returning
 `-ENOTSUP` — that lands with the HID framing and session-handshake work (issues #4-#8).
 
-**Not yet verified — needs the physical Quad Cortex Mini connected via USB to the board's
-non-debug USB-C port.** The previous version of this code failed to build (see PR #39's
-history for the actual compiler errors that led to this shim); this version hasn't been
-build-tested since either (still no Zephyr SDK in the environment this was written in).
-Expect the log to show `"Claimed Quad Cortex Mini HID interface 5"` on connect and `"Quad
-Cortex Mini disconnected"` on removal; report back whatever actually happens.
+**Verified 2026-09-15** against a real Quad Cortex Mini: it enumerates (address 1, 6
+interfaces - a composite audio+HID device, consistent with qc-mcp's findings) and the class
+filter matches on VID/PID.
+
+One thing learned along the way, now baked into the design: with a `NULL`/VID-PID-only
+class filter, Zephyr's USB host stack calls `probe()` **once per device**, not once per
+interface — it hands back `USBH_CLASS_IFNUM_DEVICE` (255), a sentinel, not a real interface
+number. `usbh_shim.c` looks up the target interface (5) itself via `usbh_desc_get_iface()`
+rather than trusting the `iface` argument `probe()` receives; `qc_usbh_filter` now carries
+that target interface number alongside vid/pid. Full end-to-end confirmation (the "Claimed
+Quad Cortex Mini HID interface 5" log line) needs one more hardware pass with this fix.
 
 ## Not yet done
 

@@ -17,6 +17,14 @@ extern "C" {
 struct qc_usbh_filter {
 	uint16_t vid;
 	uint16_t pid;
+	/*
+	 * Target interface to inspect. Zephyr's USB host stack calls probe()
+	 * once per *device* (not per interface) when a class matches on
+	 * vid/pid alone - it hands back USBH_CLASS_IFNUM_DEVICE (255), not a
+	 * real interface number. This is the interface we look up ourselves
+	 * once that device-level match happens.
+	 */
+	uint8_t iface;
 };
 
 /*

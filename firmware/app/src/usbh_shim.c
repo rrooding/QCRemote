@@ -50,13 +50,20 @@ static int shim_probe(struct usbh_class_data *const c_data, struct usb_device *c
 		      const uint8_t iface)
 {
 	(void)c_data;
+	/*
+	 * iface is USBH_CLASS_IFNUM_DEVICE (255) here, not a real interface
+	 * number - our filter is NULL/vid-pid-only, so Zephyr calls probe()
+	 * once for the whole device rather than once per interface. Look up
+	 * the interface we actually care about ourselves.
+	 */
+	(void)iface;
 
 	if (udev->dev_desc.idVendor != registered_filter.vid ||
 	    udev->dev_desc.idProduct != registered_filter.pid) {
 		return -ENOTSUP;
 	}
 
-	const struct usb_if_descriptor *desc = usbh_desc_get_iface(udev, iface);
+	const struct usb_if_descriptor *desc = usbh_desc_get_iface(udev, registered_filter.iface);
 
 	if (desc == NULL) {
 		return -ENOENT;
@@ -66,8 +73,8 @@ static int shim_probe(struct usbh_class_data *const c_data, struct usb_device *c
 		return -ENOTSUP;
 	}
 
-	return registered_ops->on_probe(iface, desc->bInterfaceClass, desc->bInterfaceSubClass,
-					 desc->bInterfaceProtocol);
+	return registered_ops->on_probe(registered_filter.iface, desc->bInterfaceClass,
+					 desc->bInterfaceSubClass, desc->bInterfaceProtocol);
 }
 
 static int shim_removed(struct usbh_class_data *const c_data)
