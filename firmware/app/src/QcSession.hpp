@@ -86,6 +86,20 @@ public:
             return;
         }
 
+        // Unconditional, plain-array stash (no logging on this thread - see
+        // this function's header comment) of every decoded message's
+        // command/size, regardless of which branch below handles it. Issue
+        // #8's hardware report found a recurring 331/10(/14-once) byte
+        // pattern after every probe read and couldn't tell what those
+        // messages actually are beyond size; this gives the next report
+        // real command ids to check that against, and whether e.g. two
+        // separate command-10 messages genuinely arrive per cycle or
+        // something is double-counting.
+        {
+            const uint32_t idx = recentMessageCount_.fetch_add(1) % kRecentMessageLogSize;
+            recentMessages_[idx] = {decoded->command, static_cast<uint16_t>(message.size())};
+        }
+
         if (decoded->command == kCommandVersion && waitingForVersionReply_.load()) {
             pendingVersionReply_ = decodeVersionReply(decoded->protoBytes);
             k_sem_give(&versionReplySem_);
@@ -122,7 +136,19 @@ private:
     // Below the main LED-blink loop's priority; documented since nothing
     // else contends for the CPU yet.
     static constexpr int kThreadPriority = 7;
-    static constexpr k_timeout_t kVersionReplyTimeout = K_MSEC(500);
+
+    // Was 500ms; bumped after issue #8's hardware report showed the actual
+    // device latency for a Version reply is often close to or past that -
+    // the handshake's own wait and several periodic probe reads all came
+    // back gotReply=0, yet a response consistently showed up on the wire
+    // ~200-700ms later (recurring 331/10-byte messages right after each
+    // Version READ - see firmware/README.md's KeepAlive section). This is
+    // a real latency margin problem, not confirmed to be anything else;
+    // 1000ms gives headroom above the worst observed case rather than
+    // being derived from a spec value qc-mcp doesn't document either
+    // (transport.py's own per-step collect() windows are much shorter,
+    // but it isn't gating a single request/reply the way this wait is).
+    static constexpr k_timeout_t kVersionReplyTimeout = K_MSEC(1000);
 
     // Higher priority than the handshake thread: the handshake runs once
     // and tolerates being delayed, but a late KeepAlive risks the device
@@ -318,6 +344,16 @@ private:
                         "%u IN transfers, %u late Version replies, probe read replied=%d",
                         heartbeatSendCount_, lastSendReportRet_, UsbHostClass::inTransferCount(),
                         lateVersionReplyCount_.load(), probeReplied);
+                // Ring buffer slots in fixed index order, not strictly
+                // chronological (the next write wraps to slot 0 regardless
+                // of how many total messages have landed) - good enough to
+                // see which command ids/sizes are actually recurring.
+                LOG_INF("Recent messages (command:size) slots 0-3: "
+                        "%u:%u %u:%u %u:%u %u:%u",
+                        recentMessages_[0].command, recentMessages_[0].size,
+                        recentMessages_[1].command, recentMessages_[1].size,
+                        recentMessages_[2].command, recentMessages_[2].size,
+                        recentMessages_[3].command, recentMessages_[3].size);
             }
         }
     }
@@ -434,6 +470,18 @@ private:
     // Written from handleMessage() (usbh thread), read from runHeartbeat()
     // (heartbeat thread) - see handleMessage() for what this counts.
     std::atomic<uint32_t> lateVersionReplyCount_{0};
+
+    // Written from handleMessage() (usbh thread), read from runHeartbeat()
+    // (heartbeat thread) - plain array, not atomic per-element (same
+    // accepted-race reasoning as lastUnexpectedSnapshot_ above; this is
+    // diagnostic-only, a torn read just shows a stale/mixed slot once).
+    struct RecentMessage {
+        uint16_t command = 0;
+        uint16_t size = 0;
+    };
+    static constexpr size_t kRecentMessageLogSize = 4;
+    RecentMessage recentMessages_[kRecentMessageLogSize] = {};
+    std::atomic<uint32_t> recentMessageCount_{0};
 };
 
 }  // namespace qcbridge

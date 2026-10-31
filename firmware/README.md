@@ -615,20 +615,112 @@ quite enough to isolate this:
   (500ms) from the heartbeat thread's own cadence every ~5s, a deliberate, temporary
   trade-off for this diagnostic build, not something to carry forward unchanged.
 
-**Still open, not settled by this round**: whether the 41-byte/command-`52` message and the
-331/10/14-byte burst are real responses to our sends or unsolicited - nothing here decodes
-enough of their actual bytes to tell (the new raw-byte snapshot only covers the
-*unexpected-during-Version-wait* case, not the burst). The ordering fix above doesn't
-depend on resolving this; it's justified independently by matching the reference
-implementation's own behavior.
+### The ordering fix landed on hardware: reads work, but the Version wait was too short
 
-**Next hardware step**: flash this build (the unit needs to go back on the board - the
-control check above moved it to a Mac). Reproduce the preset-change test, and capture the
-full raw console output from "Session handshake complete" onward for 30-60s+, including:
-every `usbh_shim`-module line, each handshake send's new `ok=/last ret=` line, the periodic
-`probe read replied=` result, and **all** `THREAD_ANALYZER` reports (`usbh` and
-`qc_session` specifically, not just `qc_heartbeat`'s, to see their margins once the
-heartbeat starts concurrently with the handshake rather than after it).
+Build `ed82a28` ran on the board. Every handshake send logged `ok=1` (landed, modulo the
+still-unresolved `-EPIPE` question) and, crucially, **the periodic probe read's own
+`Version` READ was followed by a `331`-byte and a `10`-byte reassembled message roughly
+200-700ms later, every single cycle** - not just once, not just after the handshake. That
+directly answers last round's open question:
+
+1. **Sends reach the device, and the receive loop is alive.** Closed. A flat
+   `inTransferCount()` was never evidence of a stalled receive path - it just hadn't had
+   anything to receive yet, because nothing before this build ever sent a *repeated* read
+   to provoke one. Earlier builds went quiet because they only ever sent one `Version READ`
+   total (during the handshake) and then nothing but `KeepAlive`s, which (per `PROTOCOL.md`)
+   don't themselves provoke any reply.
+2. **The `Version`-reply wait was too short, not broken.** Handshake: `Version READ` sent,
+   `gotReply=0` at the 500ms mark, then a reply-shaped message arrived ~718ms after the
+   send. Every probe cycle: same pattern, `probe read replied=0` every time, immediately
+   followed by the same `331`+`10` messages a few hundred ms later. **Fixed**:
+   `kVersionReplyTimeout` is now 1000ms (was 500ms) - comfortably past the worst observed
+   case, not derived from any spec value (qc-mcp doesn't document one either; its own
+   per-step `collect()` windows are shorter but aren't gating a single request the way this
+   wait is). If this fix is confirmed, `probe read replied=` should start showing `1`, and
+   - testably - **`Session handshake complete` should report firmware `4.1.1`** (the real
+   value, confirmed by the control check above) instead of the `4.1.0` fallback it's shown
+   every run so far.
+3. **This latency bug predates #8.** `kVersionReplyTimeout` was 500ms since #7, unchanged
+   by this issue's work - #7's own hardware verification hit the identical `gotReply=0`
+   pattern and accepted it as a harmless fallback, since the handshake still completed
+   either way and #7 wasn't checking whether the *reply itself* ever arrived. **Question for
+   the repo owner, not decided here**: should this be tracked by reopening #7, or as a new
+   issue? Either way the fix above is already in this PR since #8's own diagnosis depends
+   on it (the probe-read test needed a window long enough to actually catch a reply).
+
+**Still not confirmed - needs the next hardware run**: whether `331`/`10` really are
+`Version`-command (`10`) messages (the existing `lateVersionReplyCount_` counter rising by
+exactly 2 per cycle is consistent with that, but also consistent with some other bug
+double-counting one real message) - added a small ring buffer (`recentMessages_`, 4 slots,
+plain command+size, no formatting on the risky thread) logged alongside the periodic
+status line specifically to settle this directly rather than infer it from a counter. Also
+still unconfirmed: what the one-time `14`-byte message right after the original handshake
+actually is (candidate: a small `Connection`(`49`) ack, consistent with the size, but not
+decoded) - it never recurs after a probe, which only re-sends `Version READ`, so it's
+unlikely to be Version-related.
+
+### Preset-change push still doesn't appear - likely a missing subscription step, not the heartbeat
+
+The owner changed the preset during this capture; nothing resembling `RecallPreset`,
+`Scene`, `SetlistPosition`, or similar showed up - every message in the log matches the
+~5s probe cadence exactly. Not fully conclusive (the capture only covers ~27s and it's not
+known exactly when in that window the change happened), but real negative evidence.
+
+Re-reading `transport.py::_handshake()` past the point this firmware's handshake already
+mirrors found a likely explanation that has nothing to do with the heartbeat question
+above:
+
+```python
+self.send("Connection", conn)
+# Subscribe to live state (the app READs these on connect, which
+# makes the QC start streaming and marks the session active).
+for st in ("ModelRepo", "ModuleStats", "UndoRedo", "IOSettings",
+           "GeneralSettings", "Mode", "GlobalEQ", "MasterVolume",
+           "GlobalTempo", "Scene", "PresetDirty", "SetlistPosition"):
+    ...
+    self.send(st, m)  # a READ for each
+```
+
+qc-mcp sends **twelve explicit READs**, including `SetlistPosition` and `PresetDirty` -
+the exact fields `PROTOCOL.md` says a preset recall autonomously pushes - right after
+`Connection` UPDATE, every connection. This firmware has never sent any of these; only ever
+`Version READ`. The comment is explicit about why: *"the app READs these on connect, which
+makes the QC start streaming."* This strongly suggests the device's autonomous-push
+behavior is gated **per message type, by having been read at least once**, not solely by
+the heartbeat being active - which would mean the missing preset-change push is explained
+by issue **#9** (and #5 Tier 2)'s scope not having landed yet, not by anything wrong with
+#8's heartbeat. Sending those subscription reads is explicitly out of scope here (#9/#5
+Tier 2), so this isn't something to fix in this PR - just documenting the likely
+explanation rather than leaving the "no push" result looking like an unexplained #8 defect.
+
+The wrong mirrored version (`4.1.0` vs `4.1.1`) remains a separate, independently plausible
+contributor worth checking once point 2 above is confirmed fixed - a device that gates
+behavior on recognizing `cortex_control_version` as compatible might behave differently
+once we announce the right one.
+
+### Exact next hardware step
+
+The unit needs to go back on the board (the control check moved it to a Mac). Flash this
+build and capture a **longer** console log than last time - several minutes, covering
+idle time *and* a preset change whose timing is noted (e.g. "changed preset right after
+the `75 sent` status line") so the capture can be read against it precisely. Check,
+specifically:
+
+- Whether `Session handshake complete` now reports `4.1.1` instead of `4.1.0`, and whether
+  `probe read replied=` ever shows `1` - confirms the timeout fix.
+- The new `Recent messages (command:size)` lines - confirms what `331`/`10`/`14` actually
+  are.
+- Whatever appears (or doesn't) in the few seconds right after the noted preset-change
+  timestamp - `RecallPreset`/`Scene`/`SetlistPosition`/`PresetDirty`/`RecentsFavorites`
+  would need #9's reads to ever show up per the reasoning above, so their absence here
+  wouldn't be a new finding, but worth checking anyway in case the gating theory is wrong.
+- `THREAD_ANALYZER` reports for `usbh` and `qc_session` specifically (only `qc_heartbeat`'s
+  has been seen so far).
+
+**Optional, separate experiment** (not shipped - a manual, one-line local change): comment
+out the `startHeartbeat();` call at the top of `runHandshake()`, reflash, and confirm the
+probe read then reliably fails/times out where it currently succeeds - this would show the
+heartbeat's causal role directly rather than inferring it from correlation.
 
 ## Zephyr 4.5 upgrade (issue #54)
 
