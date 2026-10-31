@@ -11,7 +11,7 @@ on:
 # Pinned to the same Zephyr release firmware/README.md documents for local
 # setup - keep these in sync if that ever changes.
 env:
-  ZEPHYR_VERSION: v4.4.2
+  ZEPHYR_VERSION: v4.5.0
 
 jobs:
   build-and-test:

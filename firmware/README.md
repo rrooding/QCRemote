@@ -33,7 +33,7 @@ If that becomes annoying, revisit — this is a convention, not an ADR-level dec
 
 Follow Zephyr's own [Getting Started Guide](https://docs.zephyrproject.org/latest/develop/getting_started/index.html)
 to install the toolchain and SDK, then create a workspace pinned to the release this project
-targets (v4.4.2, current stable as of writing — confirmed `frdm_rw612` and `CONFIG_STD_CPP23`
+targets (v4.5.0, current stable as of writing — confirmed `frdm_rw612` and `CONFIG_STD_CPP23`
 both exist in this release):
 
 ```bash
@@ -41,7 +41,7 @@ python3 -m venv ~/.venv/zephyr
 source ~/.venv/zephyr/bin/activate
 pip install west
 
-west init -m https://github.com/zephyrproject-rtos/zephyr --mr v4.4.2 ~/zephyrproject
+west init -m https://github.com/zephyrproject-rtos/zephyr --mr v4.5.0 ~/zephyrproject
 cd ~/zephyrproject
 west update
 west packages pip --install
@@ -309,6 +309,32 @@ endpoint's status stage self-clears on the next SETUP packet (unlike other endpo
 need an explicit `CLEAR_FEATURE`), consistent with the data having actually landed despite
 the reported error. `QcSession::sendMessage()` now treats `-EPIPE` specifically as
 non-fatal and continues, matching what every reference implementation already does.
+
+## Zephyr 4.5 upgrade (issue #54)
+
+Bumped the pinned release from v4.4.2 to v4.5.0 (released 2026-10-28). As scoped in #54,
+this surfaced exactly one break in code this project depends on, not the zero predicted by
+the header diff that scoped the issue: `usbh_device.h`'s `usbh_xfer_free()` wrapper was
+removed upstream ([`usb: host: replace usbh_xfer_free() with uhc_xfer_unref()`](https://github.com/zephyrproject-rtos/zephyr/commit/b7b06c6740c4425fd15dc3226f3688dee453669d),
+landed after the API diff #54 checked was done) — the underlying `uhc_xfer_free(dev, xfer)`
+is still there, but the convenience wrapper our shim called is gone in favor of a ref-counted
+`uhc_xfer_unref(xfer)` (no `dev` argument). `usbh_shim.c`'s `start_receiving()` error path
+was the one remaining call site after rebasing onto #7/#53's session-handshake work, which
+had already replaced the old async OUT-endpoint send path (and its own two call sites) with
+`qc_usbh_send_report()`'s `usbh_req_setup()` control transfer above; every other API this
+project touches (`usbh_xfer_alloc()`, `usbh_desc_get_next()`/`usbh_desc_get_iface()`, the
+`usbh_class_data`/`usbh_class_filter` structs) was unaffected, matching what #54 found.
+
+Rebuilt `frdm_rw612` clean against the v4.5.0 workspace (succeeds), and re-ran both Ztest
+suites (`hid_framing`, `protocol_messages`) on `qemu_cortex_m3` — all 24 cases still pass.
+`frdm_rw612` and `CONFIG_STD_CPP23` both still exist in v4.5.0, confirmed directly against
+the checked-out source, not assumed.
+
+**Not done here**: re-verification against a real Quad Cortex Mini (the "Verified" hardware
+logs elsewhere in this file) — no device was attached in this pass. The build and test
+results above give no reason to expect different behavior, since none of the USB host
+transfer/endpoint-discovery code paths changed, but that's still unconfirmed on real
+hardware until someone runs through it with the device connected.
 
 ## Not yet done
 

@@ -146,7 +146,7 @@ static int start_receiving(void)
 
 	if (ret != 0) {
 		LOG_ERR("start_receiving: initial arm failed: %d", ret);
-		usbh_xfer_free(claimed_udev, in_xfer);
+		(void)uhc_xfer_unref(in_xfer);
 		in_xfer = NULL;
 		receiving = false;
 	}

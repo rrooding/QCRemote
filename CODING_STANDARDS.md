@@ -167,7 +167,7 @@ conventions, so the two codebases don't drift into two different dialects for no
 ### Language & style
 
 - **C++23**, matching the app side, enabled via `CONFIG_CPP=y` + `CONFIG_STD_CPP23=y`.
-  Confirmed present in Zephyr v4.4.2 (`lib/cpp/Kconfig`), the release
+  Confirmed present in Zephyr v4.5.0 (`lib/cpp/Kconfig`), the release
   [firmware/README.md](firmware/README.md) pins — see
   [firmware/app/prj.conf](firmware/app/prj.conf) for the actual config.
 - `CONFIG_CPP_EXCEPTIONS=n` and `CONFIG_CPP_RTTI=n` — no exceptions, no RTTI, for the whole
@@ -355,7 +355,7 @@ can eventually be generated rather than hand-written.
 ## Open questions to flag rather than assume
 
 - Devkit/RTOS choice: **resolved** — [ADR 0002](docs/adr/0002-devkit-selection.md), NXP
-  FRDM-RW612 on Zephyr v4.4.2, `CONFIG_STD_CPP23` confirmed present. A later switch to a
+  FRDM-RW612 on Zephyr v4.5.0, `CONFIG_STD_CPP23` confirmed present. A later switch to a
   smaller board (ESP32-C3) is expected; if that ever became ESP-IDF instead of Zephyr, the
   Firmware section's OS-specific parts (`k_*`, `west`, devicetree+Kconfig) would need an
   ESP-IDF pass, but the C++23 language rules (naming, RAII, `std::expected`, no
