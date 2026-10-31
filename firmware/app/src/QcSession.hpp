@@ -68,12 +68,20 @@ public:
 
     // Called from onReportIn() (host stack thread) once HidReassembler has
     // completed a message. Only a Version reply is meaningful to the
-    // handshake right now; everything else is logged and dropped - general
-    // dispatch is issue #5 Tier 2 work, not this issue's.
+    // handshake right now; everything else is dropped - general dispatch
+    // is issue #5 Tier 2 work, not this issue's.
+    //
+    // Deliberately does no logging of its own (a prior build's diagnostic
+    // LOG_INF here crashed real hardware with a stack overflow - see
+    // runHandshake()'s comment on lastUnexpected*_ below for the full
+    // story). This runs on Zephyr's own internal `usbh` thread
+    // (CONFIG_USBH_STACK_SIZE, 1024 bytes by default), not one of ours -
+    // any logging call's cbprintf formatting depth (CONFIG_LOG_MODE_IMMEDIATE
+    // runs it synchronously on the calling thread) is unsafe to add here
+    // without separately confirmed headroom.
     void handleMessage(std::span<const uint8_t> message) {
         const auto decoded = decodeMessage(message);
         if (!decoded) {
-            LOG_WRN("Dropped message too short for a trailer (%zu bytes)", message.size());
             return;
         }
 
@@ -81,14 +89,11 @@ public:
             pendingVersionReply_ = decodeVersionReply(decoded->protoBytes);
             k_sem_give(&versionReplySem_);
         } else if (waitingForVersionReply_.load()) {
-            // Diagnostic for issue #8's hardware report: a hardware trace
-            // showed a message arriving in this exact window yet still
-            // logged "No usable Version reply (gotReply=0)" - this settles
-            // whether that message actually was the Version reply (command
-            // == kCommandVersion, just too late for kVersionReplyTimeout -
-            // a real #7 latency bug) or something else entirely.
-            LOG_INF("Message while awaiting Version reply: command=%u, %zu bytes", decoded->command,
-                    message.size());
+            // Stash only - see runHandshake() for why this is reported from
+            // the handshake thread instead of logged right here.
+            lastUnexpectedCommand_.store(decoded->command);
+            lastUnexpectedSize_.store(message.size());
+            hasUnexpectedMessage_.store(true);
         }
     }
 
@@ -149,6 +154,7 @@ private:
         msg.clear();
         encodeVersionRead(msg);
         pendingVersionReply_.reset();
+        hasUnexpectedMessage_.store(false);
         waitingForVersionReply_.store(true);
         const bool sent = sendMessage(msg);
         const bool gotReply = sent && k_sem_take(&versionReplySem_, kVersionReplyTimeout) == 0;
@@ -157,6 +163,22 @@ private:
         if (!sent) {
             LOG_ERR("Handshake: failed to send Version READ");
             return;
+        }
+
+        // Diagnostic for issue #8's hardware report: a hardware trace
+        // showed a message arriving during this exact wait yet still
+        // logged "No usable Version reply (gotReply=0)" below - this
+        // settles whether that message actually was the Version reply
+        // (command == kCommandVersion, just too late for
+        // kVersionReplyTimeout - a real #7 latency bug) or something else
+        // entirely. Logged here (handshake thread, 2048-byte stack, already
+        // proven safe for LOG_* calls on real hardware - see #7's verified
+        // trace) rather than from handleMessage() itself - see that
+        // function's comment for why logging there crashed a previous
+        // diagnostic build.
+        if (hasUnexpectedMessage_.load()) {
+            LOG_INF("Message while awaiting Version reply: command=%u, %zu bytes",
+                    lastUnexpectedCommand_.load(), lastUnexpectedSize_.load());
         }
 
         FirmwareVersionString mirroredVersion;
@@ -310,6 +332,13 @@ private:
     std::atomic<bool> waitingForVersionReply_{false};
     std::optional<VersionReply> pendingVersionReply_;
     uint64_t requestIdCounter_ = 0;
+
+    // Written from handleMessage() (the usbh thread), read/cleared from
+    // runHandshake() (the handshake thread) - see both for why this is a
+    // plain stash rather than a log call made where it's detected.
+    std::atomic<bool> hasUnexpectedMessage_{false};
+    std::atomic<uint16_t> lastUnexpectedCommand_{0};
+    std::atomic<size_t> lastUnexpectedSize_{0};
 };
 
 }  // namespace qcbridge

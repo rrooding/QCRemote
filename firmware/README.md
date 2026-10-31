@@ -381,20 +381,68 @@ apart from the console:
   device genuinely isn't sending meaningful data; if `M` goes flat with no
   `Failed to re-arm IN transfer` error either, the receive loop silently stalled - point
   4 above, not point 1-3.
-- `handleMessage()` now logs `Message while awaiting Version reply: command=C, N bytes`
-  for anything that arrives during the handshake's Version-reply wait that isn't
-  recognized as one - settles point 5 directly: if `C` is `10` (`kCommandVersion`), the
-  41-byte message *is* the real reply landing too late, a genuine #7 timing bug to fix
-  separately; if it's something else, `gotReply=0` was correct and qc-mcp's own 150ms
-  wait (vs. our 500ms) suggests this device answers fast, so a late reply would be
-  surprising.
+- `runHandshake()` now logs `Message while awaiting Version reply: command=C, N bytes`
+  right after the Version-reply wait resolves, for anything that arrived during that wait
+  without being recognized as the reply - settles point 5 directly: if `C` is `10`
+  (`kCommandVersion`), the 41-byte message *is* the real reply landing too late, a genuine
+  #7 timing bug to fix separately; if it's something else, `gotReply=0` was correct and
+  qc-mcp's own 150ms wait (vs. our 500ms) suggests this device answers fast, so a late
+  reply would be surprising.
+
+### That diagnostic build crashed on hardware - fixed, still not verified
+
+The build above (commit `be92310`) was flashed and crashed with a `USAGE FAULT` /
+"Stack overflow (context area not valid)" right after the first `Reassembled message: 41
+bytes` line - before the handshake even completed, so that run said nothing about the
+heartbeat or receive-path theories either. Root-caused rather than guessed at:
+
+- `addr2line` against that build's `zephyr.elf` resolved the faulting PC/LR (`0x1800c2df`/
+  `0x1800c2e7`) to `cbputc` in `lib/libc/picolibc/cbprintf.c` - log/printf formatting code.
+- The faulting thread's TCB address (`0x10047758`, shown as `(unknown)` in the fault dump)
+  matched `usbh_core.c`'s static `usbh_thread_data` exactly (found via `nm` on the same
+  ELF) - Zephyr's own internal USB host stack thread, the one that runs
+  `onProbe()`/`onReportIn()` (see `UsbHostClass.hpp`).
+- That thread's stack (`CONFIG_USBH_STACK_SIZE`, Zephyr's own default) is **1024 bytes**,
+  and this project's `CONFIG_LOG_MODE_IMMEDIATE=y` means every `LOG_*` call formats
+  synchronously on the calling thread's own stack. The diagnostic `LOG_INF` the previous
+  build added to `handleMessage()` - called from `onReportIn()`, i.e. on this exact
+  thread - was the straw that broke it; the reassembly path already running there without
+  it was evidently already close to the limit.
+- It showed `(unknown)` instead of `usbh` (Zephyr does call
+  `k_thread_name_set(&usbh_thread_data, "usbh")` itself) because `CONFIG_THREAD_NAME` was
+  never enabled in this project's `prj.conf` - true for Zephyr's internal threads and our
+  own (`qc_session`, `qc_heartbeat`) alike, despite calling `k_thread_name_set()` on ours.
+
+Fixed:
+
+- `handleMessage()` no longer logs anything at all (it also dropped a pre-existing
+  `LOG_WRN` for too-short messages, on the same reasoning) - it only stashes the unexpected
+  command/size into a few `std::atomic`s now. `runHandshake()` (the handshake thread, a
+  2048-byte stack that already ran this same kind of `LOG_*` call successfully in #7's
+  verified hardware trace) reports it instead, after the wait resolves - the diagnostic
+  value described above is unchanged, just moved to a thread with real headroom.
+- `CONFIG_THREAD_NAME=y` - fault dumps (and `k_thread_name_set()` generally) now actually
+  work, Zephyr's internal threads included.
+- `CONFIG_USBH_STACK_SIZE=2048` (doubled from Zephyr's 1024 default) - the thread was
+  already marginal before this issue's changes added anything to its workload; this isn't
+  independently measured on hardware, just a conservative margin given what just happened.
+- `CONFIG_THREAD_ANALYZER` with `THREAD_ANALYZER_AUTO` (every 15s, `printk`-based, its own
+  thread's stack explicitly sized to 2048 for the same cbprintf-depth reason as above) -
+  periodic real stack-usage numbers for *every* thread, ours and Zephyr's internal ones,
+  rather than guessing at margins.
+
+**Still not verified on hardware** - fixing a root-caused crash from a log line isn't the
+same as confirming the heartbeat itself works, and the five explanations from the previous
+section are all still open.
 
 **Next hardware step**: flash this build, reproduce the same preset-change test, and
 capture the **raw, unfiltered** console output (not just the `main`-module summary lines
 used above) from "Session handshake complete" onward for at least 30-60s, including
-whatever `usbh_shim`-module lines appear or stop appearing. That one capture should
-settle which of the five explanations above is live, per the specific signatures named
-next to each diagnostic line.
+whatever `usbh_shim`-module lines and `THREAD_ANALYZER`/`usage` lines appear (or stop
+appearing). That capture should settle which of the five explanations above is live, per
+the specific signatures named next to each diagnostic line, and the stack-usage report
+should show real margins for `usbh`, `qc_session`, and `qc_heartbeat` instead of the
+estimates above.
 
 ## Zephyr 4.5 upgrade (issue #54)
 
