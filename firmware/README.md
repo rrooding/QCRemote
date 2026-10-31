@@ -643,10 +643,11 @@ directly answers last round's open question:
 3. **This latency bug predates #8.** `kVersionReplyTimeout` was 500ms since #7, unchanged
    by this issue's work - #7's own hardware verification hit the identical `gotReply=0`
    pattern and accepted it as a harmless fallback, since the handshake still completed
-   either way and #7 wasn't checking whether the *reply itself* ever arrived. **Question for
-   the repo owner, not decided here**: should this be tracked by reopening #7, or as a new
-   issue? Either way the fix above is already in this PR since #8's own diagnosis depends
-   on it (the probe-read test needed a window long enough to actually catch a reply).
+   either way and #7 wasn't checking whether the *reply itself* ever arrived. **#7 has been
+   reopened to track this** rather than filing a new issue; this PR still carries the fix
+   itself (`Refs #7`), since #8's own probe-read diagnostic needed a window long enough to
+   actually catch a reply, but **#7 shouldn't be closed again until a hardware log confirms
+   the handshake mirrors `4.1.1`** - the fix landing here is not yet that confirmation.
 
 **Still not confirmed - needs the next hardware run**: whether `331`/`10` really are
 `Version`-command (`10`) messages (the existing `lateVersionReplyCount_` counter rising by
@@ -659,7 +660,7 @@ actually is (candidate: a small `Connection`(`49`) ack, consistent with the size
 decoded) - it never recurs after a probe, which only re-sends `Version READ`, so it's
 unlikely to be Version-related.
 
-### Preset-change push still doesn't appear - likely a missing subscription step, not the heartbeat
+### Preset-change push still doesn't appear - a candidate explanation, not yet confirmed
 
 The owner changed the preset during this capture; nothing resembling `RecallPreset`,
 `Scene`, `SetlistPosition`, or similar showed up - every message in the log matches the
@@ -667,8 +668,8 @@ The owner changed the preset during this capture; nothing resembling `RecallPres
 known exactly when in that window the change happened), but real negative evidence.
 
 Re-reading `transport.py::_handshake()` past the point this firmware's handshake already
-mirrors found a likely explanation that has nothing to do with the heartbeat question
-above:
+mirrors found a *plausible* explanation, unproven, that would have nothing to do with the
+heartbeat question above if it holds up:
 
 ```python
 self.send("Connection", conn)
@@ -685,13 +686,15 @@ qc-mcp sends **twelve explicit READs**, including `SetlistPosition` and `PresetD
 the exact fields `PROTOCOL.md` says a preset recall autonomously pushes - right after
 `Connection` UPDATE, every connection. This firmware has never sent any of these; only ever
 `Version READ`. The comment is explicit about why: *"the app READs these on connect, which
-makes the QC start streaming."* This strongly suggests the device's autonomous-push
-behavior is gated **per message type, by having been read at least once**, not solely by
-the heartbeat being active - which would mean the missing preset-change push is explained
-by issue **#9** (and #5 Tier 2)'s scope not having landed yet, not by anything wrong with
-#8's heartbeat. Sending those subscription reads is explicitly out of scope here (#9/#5
-Tier 2), so this isn't something to fix in this PR - just documenting the likely
-explanation rather than leaving the "no push" result looking like an unexplained #8 defect.
+makes the QC start streaming."* This is **one candidate explanation, not a proven one**:
+it's plausible the device's autonomous-push behavior is gated per message type by having
+been read at least once, which would mean the missing preset-change push is explained by
+issue **#9** (and #5 Tier 2)'s scope not having landed yet, independent of the heartbeat.
+But nothing here actually tests that gating theory - it's inferred from qc-mcp's comment,
+not confirmed against this device. Sending those subscription reads is explicitly out of
+scope here (#9/#5 Tier 2) regardless, so this isn't something to fix in this PR - just a
+candidate explanation worth having on record, not a conclusion that the "no push" result
+has nothing to do with #8.
 
 The wrong mirrored version (`4.1.0` vs `4.1.1`) remains a separate, independently plausible
 contributor worth checking once point 2 above is confirmed fixed - a device that gates
