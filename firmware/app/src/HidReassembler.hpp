@@ -11,10 +11,16 @@ namespace qcbridge {
 // qc-mcp's HID report framing (see PROTOCOL.md / transport.py):
 //
 //   byte 0 : report id (0x01 in / 0x02 out)
-//   byte 1 : chunk length (0-125 payload bytes in this report)
+//   byte 1 : chunk length (0-126 payload bytes in this report)
 //   byte 2 : flags (FIRST/MIDDLE/LAST/SINGLE)
 //   byte 3+: payload, zero-padded to kHidReportSize
-inline constexpr size_t kHidReportSize = 128;
+//
+// kHidReportSize is 129, not 128: transport.py's own REPORT_SIZE (128) is the
+// *body* (chunk length + flags + payload) and excludes the report-id byte,
+// which it prepends separately (message_to_reports() allocates
+// `1 + REPORT_SIZE`). kHidReportSize here is the total wire size, report id
+// included, so it's REPORT_SIZE + 1.
+inline constexpr size_t kHidReportSize = 129;
 inline constexpr size_t kHidHeaderSize = 3;
 inline constexpr size_t kHidMaxPayloadPerReport = kHidReportSize - kHidHeaderSize;
 

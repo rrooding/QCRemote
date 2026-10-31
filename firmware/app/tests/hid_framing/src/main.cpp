@@ -127,7 +127,7 @@ ZTEST(hid_framing, test_middle_with_no_preceding_first_is_malformed)
 ZTEST(hid_framing, test_bad_chunk_length_is_malformed)
 {
     std::vector<uint8_t> payload = {1};
-    auto report = makeReport(0x01, 200 /* > 125, invalid */, 0xC0, payload);
+    auto report = makeReport(0x01, 200 /* > kHidMaxPayloadPerReport (126), invalid */, 0xC0, payload);
 
     HidReassembler<64> reasm;
     auto status = reasm.feed(report);

@@ -77,7 +77,7 @@ jobs:
           cd ~/zephyrproject
           west build -b frdm_rw612 "$GITHUB_WORKSPACE/firmware/app" --pristine
 
-      - name: Run HID framing tests (native_sim)
+      - name: Run firmware Ztest suites (native_sim)
         run: |
           cd ~/zephyrproject
-          west twister -p native_sim -T "$GITHUB_WORKSPACE/firmware/app/tests/hid_framing"
+          west twister -p native_sim -T "$GITHUB_WORKSPACE/firmware/app/tests"

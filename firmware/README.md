@@ -168,9 +168,22 @@ target interface number alongside vid/pid.
 
 [`HidReassembler.hpp`](app/src/HidReassembler.hpp) (reports in, one logical message out) and
 [`HidChunker.hpp`](app/src/HidChunker.hpp) (a message in, reports out) implement qc-mcp's
-128-byte HID report framing. Both are plain C++23 with no Zephyr dependency at all — verified
+129-byte HID report framing (1 report-id byte + a 128-byte body: chunk length + flags +
+up to 126 bytes of payload — see `transport.py`'s `REPORT_SIZE`/`message_to_reports()`, which
+allocates `1 + REPORT_SIZE`). Both are plain C++23 with no Zephyr dependency at all — verified
 by compiling and running their test cases directly with the system's `clang++` (no Zephyr SDK
 needed) before porting the same cases into the Ztest suite below.
+
+**Correction, found and confirmed during #7's hardware verification**: this was originally
+implemented as 128 bytes *total* (report id counted as part of the 128), one byte short of
+qc-mcp's actual wire format. On real hardware this produced a spurious trailing 1-byte "report"
+after every legitimate message - the device's actual 129-byte input report was being split by
+our too-small receive buffer (`QC_USBH_REPORT_SIZE`) into a 128-byte transfer plus a 1-byte
+leftover, which our strict "exactly `kHidReportSize` bytes or it's malformed" check then
+rejected. Corrected `kHidReportSize` and `QC_USBH_REPORT_SIZE` to 129 to match `transport.py`
+exactly; re-verified on hardware - each input report now arrives as a single 129-byte transfer,
+no trailing fragment. (The handshake's outgoing `SET_REPORT` also failed at the same time, with
+`-EPIPE` - that turned out to be unrelated to this off-by-one; see #7's section below.)
 
 Run the tests:
 
@@ -242,6 +255,60 @@ handshake from #7, which is genuinely out of scope here, not a shortfall of this
 IN one above) — no interrupt OUT endpoint exists. `qc_usbh_send_report()` as currently
 written always fails with `-ENODEV`; sending will need HID's `SET_REPORT` control transfer
 on endpoint 0 instead. Documented in `usbh_shim.h` and on issue #7.
+
+## Session handshake (issue #7)
+
+[`QcSession.hpp`](app/src/QcSession.hpp) sends `ResetCommsBuffers` UPDATE, `Version` READ
+then UPDATE (mirroring the device's own reported firmware version, falling back to a fixed
+string if no reply arrives in time — qc-mcp's `transport.py::_handshake()` does the same,
+with an even shorter 150ms window), and `Connection` UPDATE on a dedicated thread, per
+PROTOCOL.md section 3. `qc_usbh_send_report()`'s `SET_REPORT` control transfer
+(`usbh_shim.c`) is what actually gets the handshake messages onto the wire, since interface
+5 has no interrupt OUT endpoint (see above).
+
+**Verified 2026-10-31** against a real Quad Cortex Mini:
+
+```
+<inf> main: Claimed Quad Cortex Mini HID interface 5 (sub=0, proto=0)
+<inf> usbh_shim: Found endpoint 0x81, attributes 0x03, wMaxPacketSize 128
+<inf> usbh_shim: Interface 5 endpoints: IN=0x81
+<inf> usbh_shim: Starting receive loop on IN endpoint 0x81
+<inf> usbh_shim: IN transfer completed: 129 bytes
+<inf> main: Reassembled message: 41 bytes
+<wrn> main: No usable Version reply (gotReply=0), using fallback 4.1.0
+<inf> main: Session handshake complete (firmware version: 4.1.0)
+<inf> usbh_shim: IN transfer completed: 129 bytes
+<inf> usbh_shim: IN transfer completed: 129 bytes
+<inf> usbh_shim: IN transfer completed: 129 bytes
+<inf> main: Reassembled message: 331 bytes
+<inf> usbh_shim: IN transfer completed: 129 bytes
+<inf> main: Reassembled message: 10 bytes
+<inf> usbh_shim: IN transfer completed: 129 bytes
+<inf> main: Reassembled message: 14 bytes
+```
+
+Right after "Session handshake complete", the device starts pushing data unprompted — the
+"burst of state READs" PROTOCOL.md §3 step 4 describes (`ModelRepo`, `ModuleStats`, etc.),
+which only happens once the device treats the session as live. That's the real confirmation
+here, not just "no error was logged": the device's own behavior changed because it now
+considers this a connected session, matching Cortex Control's own effect on it.
+
+**Hardware surprise, now a documented and handled quirk**: `qc_usbh_send_report()`'s
+`SET_REPORT` call returns `-EPIPE` (a stall) on *every* send to this device, including in
+this trace, even though the handshake plainly works (see the burst above). This isn't a
+parameter bug — confirmed by reading the device's actual HID report descriptor for the
+first time (`05 01 09 00 a1 01 15 00 26 ff 00 85 01 75 08 95 80 09 00 81 82 85 02 75 08 95
+80 09 00 91 82 c0`, decoded: Report ID 1 = 128-byte Input, Report ID 2 = 128-byte Output),
+which matches `qc_usbh_send_report()`'s construction exactly (wValue `0x0202`, wLength 129).
+`GET_REPORT` for both report IDs succeeds cleanly; only the OUT direction stalls, regardless
+of data-phase encoding (tried both with and without the report id byte duplicated in the
+data). It turns out this is already documented: PROTOCOL.md §1 — *"macOS quirk:
+`IOHIDDeviceSetReport` returns a benign `0xe0005000` on this device — the official app
+ignores it too, and the data is still sent. Not an error."* A stall on the control
+endpoint's status stage self-clears on the next SETUP packet (unlike other endpoints, which
+need an explicit `CLEAR_FEATURE`), consistent with the data having actually landed despite
+the reported error. `QcSession::sendMessage()` now treats `-EPIPE` specifically as
+non-fatal and continues, matching what every reference implementation already does.
 
 ## Not yet done
 

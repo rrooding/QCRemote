@@ -15,8 +15,12 @@ extern "C" {
  * require the rest of the firmware to include a Zephyr USB header directly.
  */
 
-/* Every qc-mcp HID report is exactly this many bytes (see PROTOCOL.md). */
-#define QC_USBH_REPORT_SIZE 128
+/*
+ * Every qc-mcp HID report is exactly this many bytes (see PROTOCOL.md) -
+ * matches qcbridge::kHidReportSize (HidReassembler.hpp), which this plain-C
+ * header can't include directly. Keep the two in sync by hand.
+ */
+#define QC_USBH_REPORT_SIZE 129
 
 struct qc_usbh_filter {
 	uint16_t vid;
@@ -63,22 +67,31 @@ struct qc_usbh_ops {
 int qc_usbh_bridge_start(const struct qc_usbh_filter *filter, const struct qc_usbh_ops *ops);
 
 /*
- * Sends one HID report on the claimed device's OUT endpoint. Only valid
- * after on_probe() has accepted a device. This only confirms the transfer
- * was *submitted*; completion (success or failure) is asynchronous and,
- * as of this writing, not reported back to the caller - qc-mcp's protocol
- * has its own message-level acknowledgement for that once the session
- * handshake (issue #7) exists.
+ * Sends one HID report to the claimed device via a SET_REPORT
+ * class-specific control transfer on endpoint 0. Only valid after
+ * on_probe() has accepted a device.
  *
- * KNOWN BROKEN as written, confirmed on real hardware: the Quad Cortex
- * Mini's interface 5 has exactly one endpoint (0x81, interrupt IN) - no
- * interrupt OUT endpoint at all, so ep_out never gets set and this always
- * fails with -ENODEV. Sending will need HID's SET_REPORT class-specific
- * control transfer on endpoint 0 instead. Left as-is (not reimplemented)
- * since nothing calls this yet - #7 is where it actually needs to work.
+ * The Quad Cortex Mini's interface 5 has exactly one endpoint (0x81,
+ * interrupt IN) - no interrupt OUT endpoint at all, confirmed on real
+ * hardware (issue #4) - so a control transfer is the only way to send
+ * anything at all, not an optimization.
  *
- * Returns 0 on successful submission, a negative errno otherwise (no
- * device claimed, no OUT endpoint found, out of memory).
+ * Unlike the old (broken) interrupt-OUT-based version, this is a
+ * *blocking* call: it waits for the control transfer's full setup/data/
+ * status stage sequence to complete (Zephyr's usbh_req_setup(), up to its
+ * 5s internal timeout) and returns the actual result, not just submission
+ * status. Do not call this from on_report_in() or on_probe() - both run on
+ * the USB host stack's own thread, the same thread that completes this
+ * transfer, so calling it from either would deadlock. Call it from a
+ * separate thread instead (see QcSession.hpp).
+ *
+ * Returns 0 on success, a negative errno otherwise (no device claimed,
+ * out of memory, or whatever usbh_req_setup() itself returns - including
+ * -ETIMEDOUT). Returns the real transfer result, including -EPIPE: per
+ * PROTOCOL.md §1, this device's SET_REPORT stalls its status stage even on
+ * macOS/Windows reference implementations ("the official app ignores it
+ * too, and the data is still sent. Not an error") - this function doesn't
+ * swallow that quirk itself, callers that care should. See QcSession.hpp.
  */
 int qc_usbh_send_report(const uint8_t *report, size_t len);
 
