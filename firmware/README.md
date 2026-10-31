@@ -403,6 +403,33 @@ the checked-out source, not assumed.
 enumerate → claim → discover → receive → session-handshake flow this file documents above
 still works end-to-end.
 
+## Tier 2 protobuf decode: ModelRepo, SetlistPosition (issue #5)
+
+[`QcModelRepoMessage.hpp`](app/src/QcModelRepoMessage.hpp) and
+[`QcSetlistPositionMessage.hpp`](app/src/QcSetlistPositionMessage.hpp) add `decodeModelRepo`/
+`decodeSetlistPosition`, built directly on ADR 0003's existing `QcProtobuf.hpp` primitives -
+no changes to that file were needed. Checking both messages against qc-mcp's real descriptor
+set (rather than the nested/repeated-field shape issue #5 originally assumed) found they're
+flat and scalar-only, same as every Tier 1 message; see
+[ADR 0004](../docs/adr/0004-tier2-protobuf-codec.md) for the full reasoning and why nanopb is
+still deferred. New Ztest suite: `tests/catalog_messages` (kept separate from
+`tests/protocol_messages` to avoid touching a file issue #8 is also working in).
+
+`ModelRepoMessage.model_repo_payload` decodes to a `std::span` into the caller's buffer, not a
+copy - it's a gzip+tar of `ModelRepo.xml` (the device catalog), still opaque bytes until issue
+#6 inflates it. **Not yet verified against real device traffic** - no hardware run was done for
+this issue; tests use constructed bytes built from the verified field numbers, not a capture.
+Real `ModelRepo` traffic also needs the HID reassembly buffer (`kReassemblyCapacity`, still
+issue #33's placeholder 4096 bytes) sized to hold the *whole* compressed catalog before
+`decodeModelRepo` ever sees a complete message - that sizing work belongs to #33, not this
+issue.
+
+Run the tests the same way as `hid_framing` (see above):
+
+```bash
+west twister -p qemu_cortex_m3 -K -T firmware/app/tests/catalog_messages
+```
+
 ## Not yet done
 
 - ETL is wired in via CMake `FetchContent` (see `app/CMakeLists.txt`) but not yet used by
@@ -413,3 +440,6 @@ still works end-to-end.
   diagnostics-carrying build (`584e015`) showed repeated reads answered for several minutes
   under the heartbeat. A heartbeat-off comparison and a preset-change push are both still
   unconfirmed (the latter deferred to issue #9).
+- Tier 2's `decodeModelRepo`/`decodeSetlistPosition` aren't called from anywhere yet - wiring
+  them into the session/message-dispatch path is for whichever issue actually consumes them
+  (`ModelRepo` needs #6's inflate first; a preset-list `SetlistPosition` READ is #9's scope).
