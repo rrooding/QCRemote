@@ -57,6 +57,14 @@ protected:
     void onReportIn(std::span<const uint8_t> report) override {
         using Status = HidReassembler<kReassemblyCapacity>::Status;
 
+        // Every call here is one successful IN transfer (usbh_shim.c only
+        // invokes on_report_in when xfer->err == 0) - counted regardless of
+        // what the reassembler does with it, so a File stream's summary can
+        // tell "the device sent nothing at the USB level" apart from "it
+        // sent reports that never became a counted message" (issue #60's
+        // hardware debugging).
+        session_.recordInTransfer();
+
         switch (reassembler_.feed(report)) {
         case Status::Complete: {
             const auto message = reassembler_.message();

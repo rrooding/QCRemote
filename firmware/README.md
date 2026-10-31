@@ -538,12 +538,28 @@ run has been done for this issue - verify with:
 4. Paste back the full captured output from boot through either the `File stream finished (...)`
    line or the 35s mark, whichever comes first.
 
-A finished stream now logs two lines - paste back both:
+A finished stream now logs several lines - paste back all of them:
 
 ```
 File stream finished (quiet): N messages (C compressed, F failed), W wire bytes, I inflated bytes, E ms
 File stream limits: max wire=MW max inflated=MI, dropped (dispatch=DD gzip=DG), reassembly (overflow=RO malformed=RM)
+File stream tally: T total IN transfers
+File stream tally: command=CMD count=CNT    (one line per distinct command id seen, or "no messages of any command seen in this window")
 ```
+
+The last two are a diagnostic added after the first hardware run reported a File stream that
+finished with every count above at 0 (`0 messages ... 0 wire bytes ... 0 inflated bytes`, dropped
+and reassembly all 0 too) - evidence consistent with either "the device sent nothing at all
+during the window" or "the device sent something, just never anything this build recognized as
+File" (every other command's traffic was invisible before this). `QcMessageTally.hpp`
+(`QcSession`'s `messageTally_`) records every message handed to `onMessage()`/`onInflateFailed()`
+by command id, not just File, for the lifetime of one File stream; `T` (`QcSession::totalInTransfers_`,
+incremented in `QcHidBridge::onReportIn()`) counts one layer lower still - every successful USB IN
+transfer, regardless of whether the reassembler ever turned it into a counted message at all. The
+per-transfer `LOG_INF` in `usbh_shim.c` that used to show this detail report-by-report is now
+`LOG_DBG` (and that module registers at `LOG_LEVEL_INF`, so it compiles out entirely) - `T` is the
+one place this count still appears, without swamping the log or running extra formatting on the
+`usbh` thread.
 
 What each outcome means:
 
@@ -576,6 +592,31 @@ What each outcome means:
   READ` error either**: the request went out but nothing about it is recognizable as a File
   reply - check whether `RO`/`RM` end up nonzero once a summary does eventually land, or whether
   the eventual message count is unexpectedly low.
+- **A `File stream finished (timeout)` with every count (`N`, `W`, `I`, `DD`, `DG`, `RO`, `RM`)
+  at 0, and `T` (total IN transfers) also 0**: nothing arrived on the wire at all during the
+  window - not a counting gap in this firmware, a silent device/USB layer. The first thing to
+  check here is issue #61: qc-mcp's own `_handshake()` (`transport.py`) sends 12 state READs
+  (`ModelRepo`, `ModuleStats`, `UndoRedo`, `IOSettings`, `GeneralSettings`, `Mode`, `GlobalEQ`,
+  `MasterVolume`, `GlobalTempo`, `Scene`, `PresetDirty`, `SetlistPosition`) right after its
+  `Connection` UPDATE and before any listing - its own comment on that step says plainly that
+  these are "what makes the QC start streaming and marks the session active." This firmware
+  sends none of them (issue #61's scope, deliberately not this issue's). If `T` is 0, that is
+  direct evidence the device may simply be withholding *all* traffic, File included, until a
+  session looks active by that same test - in which case #61 needs to land before or together
+  with a File READ, not after it.
+- **The same all-zero summary, but `T` > 0**: the device answered with *something* at the USB
+  level, so the session isn't completely inert - check `File stream tally`'s per-command lines
+  (or "no messages of any command seen", if the tally itself is empty despite `T` > 0, which
+  would point at `RO`/`RM` instead - a reassembly-level drop, not a session-activity one) to see
+  what command(s) it actually sent. A nonzero `T` with an empty tally and `RO`/`RM` still at 0 at
+  the same time shouldn't happen (every successful transfer feeds the reassembler, which must
+  land on Complete/Overflow/Malformed/InProgress) - treat that combination as a bug in the
+  counting itself, not a device behavior, and say so on the issue rather than guessing further.
+- **A `File stream tally` with other commands present but no command 4 (File)**: the device is
+  live and talking, just never answered the File READ specifically - that's a File-specific gap
+  (worth comparing the exact READ bytes against qc-mcp's `list_directory()`: command id 4,
+  `action=READ`, a `request_id` field - `QcFileRequest.hpp`'s `encodeFileRead()` already matches
+  all three), separate from the #61 session-activity question above.
 - **`Handshake: failed to send File READ`**: the request itself never got sent - the handshake
   completed, so this would be a new, File-specific send failure rather than the already-explained
   benign `-EPIPE` quirk (`sendMessage()` only returns false when `sendReport` fails with

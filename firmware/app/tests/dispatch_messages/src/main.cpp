@@ -5,6 +5,7 @@
 
 #include "QcFileRequest.hpp"
 #include "QcFileStream.hpp"
+#include "QcMessageTally.hpp"
 
 using namespace qcbridge;
 
@@ -155,4 +156,75 @@ ZTEST(dispatch_messages, test_file_stream_restarts_cleanly)
     const auto second = stream.checkTimeout(100100 + QcFileStream::kQuietWindowMs);
     zassert_true(second.has_value(), "expected the second run to finish");
     zassert_equal(second->messageCount, 1u, "second run messageCount should not include the first run's");
+}
+
+// --- QcMessageTally.hpp ----------------------------------------------------
+
+ZTEST(dispatch_messages, test_message_tally_ignores_record_before_start)
+{
+    QcMessageTally tally;
+    zassert_false(tally.isActive(), "expected inactive before start()");
+
+    tally.record(4);
+    zassert_equal(tally.entries().size(), 0u, "a record before start() must be dropped");
+    zassert_equal(tally.otherCount(), 0u, "otherCount must stay 0 too");
+}
+
+ZTEST(dispatch_messages, test_message_tally_counts_per_command)
+{
+    QcMessageTally tally;
+    tally.start();
+
+    tally.record(4);
+    tally.record(1);
+    tally.record(4);
+    tally.record(4);
+    tally.record(1);
+
+    const auto entries = tally.entries();
+    zassert_equal(entries.size(), 2u, "expected two distinct commands");
+    zassert_equal(entries[0].command, 4u, "first distinct command seen, in order");
+    zassert_equal(entries[0].count, 3u, "command 4 count");
+    zassert_equal(entries[1].command, 1u, "second distinct command seen, in order");
+    zassert_equal(entries[1].count, 2u, "command 1 count");
+    zassert_equal(tally.otherCount(), 0u, "otherCount should stay 0 within capacity");
+}
+
+ZTEST(dispatch_messages, test_message_tally_overflow_falls_into_other)
+{
+    QcMessageTally tally;
+    tally.start();
+
+    for (uint16_t command = 0; command < QcMessageTally::kMaxDistinctCommands; ++command) {
+        tally.record(command);
+    }
+    // One more call per already-tracked command plus three brand-new ones -
+    // the former must still find their existing entry, the latter must
+    // overflow into otherCount() rather than growing the array.
+    tally.record(0);
+    tally.record(static_cast<uint16_t>(QcMessageTally::kMaxDistinctCommands));
+    tally.record(static_cast<uint16_t>(QcMessageTally::kMaxDistinctCommands + 1));
+    tally.record(static_cast<uint16_t>(QcMessageTally::kMaxDistinctCommands + 2));
+
+    zassert_equal(tally.entries().size(), QcMessageTally::kMaxDistinctCommands,
+                  "entries must stay bounded at kMaxDistinctCommands");
+    zassert_equal(tally.entries()[0].count, 2u, "an already-tracked command keeps incrementing");
+    zassert_equal(tally.otherCount(), 3u, "every brand-new command past capacity falls into otherCount");
+}
+
+ZTEST(dispatch_messages, test_message_tally_stop_blocks_further_records_until_restart)
+{
+    QcMessageTally tally;
+    tally.start();
+    tally.record(4);
+    tally.stop();
+
+    zassert_false(tally.isActive(), "expected inactive after stop()");
+    tally.record(4);
+    zassert_equal(tally.entries()[0].count, 1u, "a record after stop() must be dropped");
+
+    // A fresh start() must not carry over the previous window's counts.
+    tally.start();
+    zassert_equal(tally.entries().size(), 0u, "expected a clean slate after restart");
+    zassert_equal(tally.otherCount(), 0u, "otherCount must reset on restart too");
 }

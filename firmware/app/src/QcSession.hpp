@@ -22,6 +22,7 @@
 #include "QcHandshakeMessages.hpp"
 #include "QcMessage.hpp"
 #include "QcMessageSink.hpp"
+#include "QcMessageTally.hpp"
 #include "ScopedKMutex.hpp"
 #include "UsbHostClass.hpp"
 
@@ -129,7 +130,15 @@ public:
             // LOG_INF, for the readable, once-per-stream version of this.
             LOG_DBG("File message: wire=%zu inflated=%zu compressed=%d", wireSize, inflatedSize,
                     compressed);
-            ScopedKMutex lock(fileStreamMutex_);
+        }
+
+        // messageTally_ records every command, not just File - see its own
+        // header comment (issue #60's hardware debugging: a run with zero
+        // File messages couldn't otherwise tell "the device sent nothing"
+        // apart from "the device sent something else").
+        ScopedKMutex lock(fileStreamMutex_);
+        messageTally_.record(command);
+        if (command == kCommandFile) {
             fileStream_.onMessage(k_uptime_get(), wireSize, inflatedSize, compressed);
         }
     }
@@ -137,7 +146,11 @@ public:
     void onInflateFailed(uint16_t command, size_t wireSize, const char* reason) override {
         if (command == kCommandFile) {
             LOG_WRN("File message failed to inflate (wire=%zu bytes): %s", wireSize, reason);
-            ScopedKMutex lock(fileStreamMutex_);
+        }
+
+        ScopedKMutex lock(fileStreamMutex_);
+        messageTally_.record(command);
+        if (command == kCommandFile) {
             fileStream_.onInflateFailed(k_uptime_get(), wireSize);
         }
     }
@@ -154,6 +167,14 @@ public:
     // "this happened somewhere during the stream" figure.
     void recordReassemblyOverflow() { reassemblyOverflowCount_.fetch_add(1, std::memory_order_relaxed); }
     void recordReassemblyMalformed() { reassemblyMalformedCount_.fetch_add(1, std::memory_order_relaxed); }
+
+    // Called from QcHidBridge::onReportIn() on the `usbh` thread for every
+    // successful IN transfer, regardless of what the reassembler does with
+    // it (issue #60's hardware debugging: a run that shows 0 File messages
+    // needs this to tell "the device never sent a single report" apart from
+    // "it sent reports that just never turned into a counted message").
+    // Same atomic-increment-only contract as the two above.
+    void recordInTransfer() { totalInTransfers_.fetch_add(1, std::memory_order_relaxed); }
 
 private:
     // Below the main LED-blink loop's priority; documented since nothing
@@ -269,10 +290,12 @@ private:
         {
             ScopedKMutex lock(fileStreamMutex_);
             fileStream_.start(k_uptime_get());
+            messageTally_.start();
             dispatcherDroppedAtStart_ = dispatcher_.droppedCount();
             gzipDroppedAtStart_ = gzipInflater_.droppedCount();
             reassemblyOverflowAtStart_ = reassemblyOverflowCount_.load(std::memory_order_relaxed);
             reassemblyMalformedAtStart_ = reassemblyMalformedCount_.load(std::memory_order_relaxed);
+            totalInTransfersAtStart_ = totalInTransfers_.load(std::memory_order_relaxed);
         }
         msg.clear();
         encodeFileRead(msg, nextRequestId());
@@ -330,10 +353,16 @@ private:
             // QcFileStream's 1500ms quiet window and 30s overall timeout,
             // and keeps this off the `usbh` thread (see handleMessage()).
             std::optional<QcFileStream::Summary> summary;
+            std::array<QcMessageTally::Entry, QcMessageTally::kMaxDistinctCommands> tallyEntries{};
+            size_t tallyEntryCount = 0;
+            uint32_t tallyOtherCount = 0;
+            uint32_t totalInTransfersThisStream = 0;
             {
                 ScopedKMutex lock(fileStreamMutex_);
                 summary = fileStream_.checkTimeout(k_uptime_get());
                 if (summary) {
+                    totalInTransfersThisStream =
+                        totalInTransfers_.load(std::memory_order_relaxed) - totalInTransfersAtStart_;
                     // dispatcher_.droppedCount()/gzipInflater_.droppedCount() and
                     // the reassembly counters are lifetime totals (see their
                     // own comments) - diff against the snapshot taken when
@@ -345,6 +374,16 @@ private:
                         reassemblyOverflowCount_.load(std::memory_order_relaxed) - reassemblyOverflowAtStart_;
                     summary->reassemblyMalformedCount =
                         reassemblyMalformedCount_.load(std::memory_order_relaxed) - reassemblyMalformedAtStart_;
+
+                    // Copy out before stop() so the log lines below don't
+                    // need the lock - see QcMessageTally.hpp.
+                    const auto entries = messageTally_.entries();
+                    tallyEntryCount = entries.size();
+                    for (size_t i = 0; i < tallyEntryCount; ++i) {
+                        tallyEntries[i] = entries[i];
+                    }
+                    tallyOtherCount = messageTally_.otherCount();
+                    messageTally_.stop();
                 }
             }
             if (summary) {
@@ -365,6 +404,32 @@ private:
                         summary->maxWireBytes, summary->maxInflatedBytes, summary->dispatcherDropped,
                         summary->gzipDropped, summary->reassemblyOverflowCount,
                         summary->reassemblyMalformedCount);
+                // Diagnostic (issue #60's hardware debugging): every
+                // command actually seen during the window, not just File -
+                // disambiguates "the device sent nothing" from "the device
+                // sent something, just not File". totalInTransfersThisStream
+                // goes one layer lower still: it counts successful USB IN
+                // transfers regardless of whether the reassembler ever
+                // turned them into a counted message, so a run with 0
+                // messages of every kind above but a nonzero transfer count
+                // here means the device sent *something* that never made it
+                // past HidReassembler (overflow/malformed should also be
+                // nonzero in that case) - versus 0 transfers, which means
+                // nothing arrived on the wire at all.
+                LOG_INF("File stream tally: %u total IN transfers", totalInTransfersThisStream);
+                if (tallyEntryCount == 0 && tallyOtherCount == 0) {
+                    LOG_INF("File stream tally: no messages of any command seen in this window");
+                } else {
+                    for (size_t i = 0; i < tallyEntryCount; ++i) {
+                        LOG_INF("File stream tally: command=%u count=%u", tallyEntries[i].command,
+                                tallyEntries[i].count);
+                    }
+                    if (tallyOtherCount > 0) {
+                        LOG_INF("File stream tally: %u messages from other distinct commands "
+                                "(> %zu tracked)",
+                                tallyOtherCount, QcMessageTally::kMaxDistinctCommands);
+                    }
+                }
             }
         }
     }
@@ -438,17 +503,24 @@ private:
     std::atomic<uint32_t> reassemblyOverflowCount_{0};
     std::atomic<uint32_t> reassemblyMalformedCount_{0};
 
-    // Guards fileStream_ and the four *AtStart_ snapshots below: all are
-    // written from runHandshake() at stream start, read/diffed from
-    // runHeartbeat() at stream finish, and fileStream_ is also written
-    // from onMessage()/onInflateFailed() (the dispatcher_/gzipInflater_
-    // worker threads) - never from `usbh`.
+    // Written from QcHidBridge::onReportIn() on the `usbh` thread (atomic
+    // increment only, same contract as the two above) - one per successful
+    // IN transfer, independent of the reassembler's verdict on it.
+    std::atomic<uint32_t> totalInTransfers_{0};
+
+    // Guards fileStream_, messageTally_ and the five *AtStart_ snapshots
+    // below: all are written from runHandshake() at stream start, read/
+    // diffed from runHeartbeat() at stream finish, and fileStream_/
+    // messageTally_ are also written from onMessage()/onInflateFailed()
+    // (the dispatcher_/gzipInflater_ worker threads) - never from `usbh`.
     struct k_mutex fileStreamMutex_ {};
     QcFileStream fileStream_;
+    QcMessageTally messageTally_;
     uint32_t dispatcherDroppedAtStart_ = 0;
     uint32_t gzipDroppedAtStart_ = 0;
     uint32_t reassemblyOverflowAtStart_ = 0;
     uint32_t reassemblyMalformedAtStart_ = 0;
+    uint32_t totalInTransfersAtStart_ = 0;
 };
 
 }  // namespace qcbridge

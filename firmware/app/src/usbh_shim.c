@@ -110,7 +110,22 @@ static int in_xfer_cb(struct usb_device *const dev, struct uhc_transfer *const x
 	if (xfer->err != 0) {
 		LOG_WRN("IN transfer completed with error: %d", xfer->err);
 	} else {
-		LOG_INF("IN transfer completed: %u bytes", buf->len);
+		/*
+		 * LOG_DBG, not LOG_INF (issue #60's hardware debugging): this ran
+		 * on the `usbh` thread for every single report - during a File
+		 * stream that's ~400 calls over ~12s, each one formatting
+		 * synchronously under CONFIG_LOG_MODE_IMMEDIATE on that thread's
+		 * 1536-byte stack (the same pattern that overflowed it once
+		 * already - see QcSession.hpp's handleMessage() comment), and
+		 * slowing reception plus swamping the log at the default level.
+		 * This module registers at LOG_LEVEL_INF (see top of file), so
+		 * LOG_DBG compiles out entirely here - not just runtime-filtered.
+		 * QcSession now counts every successful IN transfer
+		 * (QcHidBridge::onReportIn() -> QcSession::recordInTransfer(),
+		 * surfaced in the File stream tally), so the per-transfer detail
+		 * traded away here is still available as a count.
+		 */
+		LOG_DBG("IN transfer completed: %u bytes", buf->len);
 		if (registered_ops != NULL && registered_ops->on_report_in != NULL) {
 			registered_ops->on_report_in(buf->data, buf->len);
 		}
