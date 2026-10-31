@@ -195,6 +195,20 @@ ZTEST(protocol_messages, test_encode_connection)
     zassert_mem_equal(out.data(), expected.data(), expected.size(), "bytes");
 }
 
+ZTEST(protocol_messages, test_encode_keep_alive)
+{
+    HandshakeMessageBuffer out;
+    encodeKeepAlive(out);
+
+    const std::vector<uint8_t> expected = {
+        0x08, 0x01,  // action = UPDATE (1)
+        0x18, 0x01,  // is_online = true (field 3)
+        0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // trailer: command=32
+    };
+    zassert_equal(out.size(), expected.size(), "size");
+    zassert_mem_equal(out.data(), expected.data(), expected.size(), "bytes");
+}
+
 ZTEST(protocol_messages, test_decode_version_reply_picks_out_the_right_fields)
 {
     etl::vector<uint8_t, 64> proto;

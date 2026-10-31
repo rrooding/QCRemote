@@ -260,55 +260,124 @@ on endpoint 0 instead. Documented in `usbh_shim.h` and on issue #7.
 
 [`QcSession.hpp`](app/src/QcSession.hpp) sends `ResetCommsBuffers` UPDATE, `Version` READ
 then UPDATE (mirroring the device's own reported firmware version, falling back to a fixed
-string if no reply arrives in time — qc-mcp's `transport.py::_handshake()` does the same,
-with an even shorter 150ms window), and `Connection` UPDATE on a dedicated thread, per
-PROTOCOL.md section 3. `qc_usbh_send_report()`'s `SET_REPORT` control transfer
-(`usbh_shim.c`) is what actually gets the handshake messages onto the wire, since interface
-5 has no interrupt OUT endpoint (see above).
+string if no reply arrives in time), and `Connection` UPDATE, per `PROTOCOL.md` section 3.
+`qc_usbh_send_report()`'s `SET_REPORT` control transfer (`usbh_shim.c`) is what actually
+gets the handshake messages onto the wire, since interface 5 has no interrupt OUT endpoint
+(see above).
 
-**Verified 2026-10-31** against a real Quad Cortex Mini:
+**Verified on real hardware**: the handshake completes, mirrors the device's real reported
+firmware version (`4.1.1`, not a fallback), and the device answers subsequent `Version`
+READs reliably while the KeepAlive heartbeat (issue #8, below) is running.
 
-```
-<inf> main: Claimed Quad Cortex Mini HID interface 5 (sub=0, proto=0)
-<inf> usbh_shim: Found endpoint 0x81, attributes 0x03, wMaxPacketSize 128
-<inf> usbh_shim: Interface 5 endpoints: IN=0x81
-<inf> usbh_shim: Starting receive loop on IN endpoint 0x81
-<inf> usbh_shim: IN transfer completed: 129 bytes
-<inf> main: Reassembled message: 41 bytes
-<wrn> main: No usable Version reply (gotReply=0), using fallback 4.1.0
-<inf> main: Session handshake complete (firmware version: 4.1.0)
-<inf> usbh_shim: IN transfer completed: 129 bytes
-<inf> usbh_shim: IN transfer completed: 129 bytes
-<inf> usbh_shim: IN transfer completed: 129 bytes
-<inf> main: Reassembled message: 331 bytes
-<inf> usbh_shim: IN transfer completed: 129 bytes
-<inf> main: Reassembled message: 10 bytes
-<inf> usbh_shim: IN transfer completed: 129 bytes
-<inf> main: Reassembled message: 14 bytes
-```
+**`SET_REPORT` returns `-EPIPE` on every send to this device**, confirmed on real hardware.
+This isn't a parameter bug — the device's own HID report descriptor (`05 01 09 00 a1 01 15
+00 26 ff 00 85 01 75 08 95 80 09 00 81 82 85 02 75 08 95 80 09 00 91 82 c0`, decoded: Report
+ID 1 = 128-byte Input, Report ID 2 = 128-byte Output) matches `qc_usbh_send_report()`'s
+construction exactly (wValue `0x0202`, wLength 129); `GET_REPORT` succeeds cleanly for both
+report IDs, only the OUT direction stalls. `PROTOCOL.md` §1 documents the same thing one
+layer up: *"macOS quirk: `IOHIDDeviceSetReport` returns a benign `0xe0005000` on this device
+— the official app ignores it too, and the data is still sent. Not an error."*
+`QcSession::sendMessage()` treats `-EPIPE` as non-fatal and continues. This is now confirmed
+functionally, not just inferred: repeated `Version` READs reliably got answered for several
+minutes with the heartbeat running, every single send still returning `-EPIPE` throughout.
 
-Right after "Session handshake complete", the device starts pushing data unprompted — the
-"burst of state READs" PROTOCOL.md §3 step 4 describes (`ModelRepo`, `ModuleStats`, etc.),
-which only happens once the device treats the session as live. That's the real confirmation
-here, not just "no error was logged": the device's own behavior changed because it now
-considers this a connected session, matching Cortex Control's own effect on it.
+**Correction**: an earlier version of this section (and of issue #53's hardware-verification
+commit) read the device's response right after the handshake as an autonomous "burst of
+state READs," offered as proof the handshake's sends had landed. Issue #8's later hardware
+debugging decoded that response's actual command ids and found it is **entirely the
+(delayed) `Version` reply itself** — a `331`-byte and a `10`-byte message, both command
+`10`, with (on the very first request only) an extra `14`-byte one. It wasn't a state
+stream at all, and the real explanation for why it looked delayed is below.
 
-**Hardware surprise, now a documented and handled quirk**: `qc_usbh_send_report()`'s
-`SET_REPORT` call returns `-EPIPE` (a stall) on *every* send to this device, including in
-this trace, even though the handshake plainly works (see the burst above). This isn't a
-parameter bug — confirmed by reading the device's actual HID report descriptor for the
-first time (`05 01 09 00 a1 01 15 00 26 ff 00 85 01 75 08 95 80 09 00 81 82 85 02 75 08 95
-80 09 00 91 82 c0`, decoded: Report ID 1 = 128-byte Input, Report ID 2 = 128-byte Output),
-which matches `qc_usbh_send_report()`'s construction exactly (wValue `0x0202`, wLength 129).
-`GET_REPORT` for both report IDs succeeds cleanly; only the OUT direction stalls, regardless
-of data-phase encoding (tried both with and without the report id byte duplicated in the
-data). It turns out this is already documented: PROTOCOL.md §1 — *"macOS quirk:
-`IOHIDDeviceSetReport` returns a benign `0xe0005000` on this device — the official app
-ignores it too, and the data is still sent. Not an error."* A stall on the control
-endpoint's status stage self-clears on the next SETUP packet (unlike other endpoints, which
-need an explicit `CLEAR_FEATURE`), consistent with the data having actually landed despite
-the reported error. `QcSession::sendMessage()` now treats `-EPIPE` specifically as
-non-fatal and continues, matching what every reference implementation already does.
+**`kVersionReplyTimeout` was 500ms and too short**, a bug present since this issue but only
+caught while debugging #8: this device's actual `Version`-reply latency runs a few hundred
+ms, past that window, so the handshake's wait reliably logged `gotReply=0` and fell back to
+a hardcoded firmware string even though the device always did reply, just late. Fixed by
+widening the wait to 1000ms (`QcSession.hpp`) — confirmed on hardware: the handshake now
+reports `4.1.1`, the device's real version, instead of the `4.1.0` fallback.
+
+## KeepAlive heartbeat (issue #8)
+
+[`QcSession.hpp`](app/src/QcSession.hpp) sends a `KeepAlive` UPDATE (`action=UPDATE,
+is_online=true`) every ~200ms, on a dedicated `k_timer` + thread so a slow or blocked send
+never stalls the handshake or vice versa: the timer's expiry callback only signals a
+semaphore (it runs in interrupt-adjacent context and must not block - CODING_STANDARDS.md's
+ISR safety rules), and the heartbeat thread does the actual blocking `SET_REPORT` send.
+`QcSession::sendMessage()` — the shared USB send path for the handshake and heartbeat
+threads — is guarded by a `k_mutex` ([`ScopedKMutex`](app/src/ScopedKMutex.hpp)) so their
+HID reports can never interleave on the wire, per the issue's explicit requirement.
+`KeepAliveMessage`'s `request_id`/`timeout` fields are deliberately left unset in
+`QcHandshakeMessages.hpp::encodeKeepAlive()` — qc-mcp's own reference implementation never
+sets them either, so they never appear on the wire.
+
+**The heartbeat is started *before* the handshake sends anything**, not after — matching
+qc-mcp's own `transport.py::open()` order (`_start_heartbeat()` then `_handshake()`, with an
+explicit comment that the heartbeat is what "keep[s] session online (required for reads)").
+An earlier version of this implementation got this backwards, leaving a window with nothing
+keeping the session alive before the first `Version` READ was even sent — found while
+diagnosing why that READ never got a reply in time (see #7's section above for the related
+500ms-timeout bug this surfaced).
+
+### What was verified on real hardware
+
+With both fixes above in place: the handshake completes and mirrors the device's real
+firmware version (`4.1.1`); a repeated `Version` READ, sent periodically while the heartbeat
+ran, was reliably answered for several minutes straight.
+
+### What this does *not* show
+
+- **No heartbeat-off comparison was run.** The claim that reads require the heartbeat
+  (issue #8's whole premise) rests on `PROTOCOL.md`'s own documentation of the device's
+  behavior ("reads require it"), not on a direct A/B test against this firmware with the
+  heartbeat disabled. Worth doing if this ever needs re-confirming: comment out the
+  `startHeartbeat()` call at the top of `runHandshake()`, reflash, and confirm reads then
+  fail where they currently succeed.
+- **No preset-change push was observed** (`RecallPreset`/`Scene`/`SetlistPosition`/
+  `PresetDirty`/`RecentsFavorites`, per `PROTOCOL.md`'s description of what a device-side
+  preset recall autonomously pushes). One candidate explanation, not a proven one: qc-mcp's
+  own `transport.py::_handshake()` sends twelve explicit subscription READs (including
+  `SetlistPosition`/`PresetDirty`) right after `Connection` UPDATE, with a comment that this
+  is what "makes the QC start streaming" — this firmware has never sent any of those.
+  Sending them is issue **#9**'s scope (and #5 Tier 2's), not this one's. If presets are
+  still silent once #9 lands, that candidate explanation needs revisiting.
+
+### The tested build differs from this one
+
+The multi-minute hardware run described above (handshake mirrors `4.1.1`, repeated `Version`
+probes answered for several minutes) was against a build carrying temporary diagnostics on
+top of the same fixes — per-send result logging, a periodic probe read, a recent-messages
+ring buffer, an IN-transfer counter, and `THREAD_ANALYZER` reporting. Those were removed in
+the cleaned-up commit (`f8ad423`) now that what they were added to determine is settled; the
+underlying fixes they helped find (heartbeat before handshake, the 1000ms `Version`-reply
+wait, the send mutex) are unchanged.
+
+**Verified on `f8ad423`** against a real Quad Cortex Mini (the smoke test below): boot,
+handshake mirrors `4.1.1` with no `No usable Version reply` warning beforehand, and no
+crash over a couple of minutes. The longer-duration repeated-reads result above is still
+only confirmed on `584e015`, the diagnostics-carrying build, not on this cleaned-up one — a
+heartbeat-off comparison and a preset-change push both remain unconfirmed on either build.
+
+### Smoke test for this build
+
+1. Flash and open the serial console (see Verify above).
+2. Confirm the boot banner, USB enumeration, and interface claim as in the traces above.
+3. Confirm `Session handshake complete (firmware version: 4.1.1)` — **not** a `No usable
+   Version reply` warning line beforehand, and **not** the `4.1.0` fallback.
+4. Confirm `KeepAlive heartbeat started (~200ms)` logs once, right after.
+5. Leave it running for a couple of minutes: no crash, no fatal error, no further `LOG_ERR`
+   lines (`Handshake: failed to send ...` or `sendReport failed`).
+
+### A lasting lesson from this debugging, for future changes here
+
+Zephyr's own internal `usbh` thread (the one that calls `onProbe()`/`onReportIn()`, see
+`UsbHostClass.hpp`) has a small stack (`CONFIG_USBH_STACK_SIZE`, now 1536 bytes — see
+`prj.conf`'s comment for the measured number behind that), and this project's
+`CONFIG_LOG_MODE_IMMEDIATE=y` means any `LOG_*` call runs its formatting synchronously on
+the calling thread's own stack. A diagnostic log call added to
+`QcSession::handleMessage()` — which runs on that thread — crashed real hardware with a
+stack overflow. Keep that function (and anything else reachable from `onProbe()`/
+`onReportIn()`) free of logging and other stack-heavy calls; do real work from one of this
+project's own threads instead.
 
 ## Zephyr 4.5 upgrade (issue #54)
 
@@ -338,3 +407,9 @@ still works end-to-end.
 
 - ETL is wired in via CMake `FetchContent` (see `app/CMakeLists.txt`) but not yet used by
   the main app - only by the HID framing tests above.
+- The KeepAlive heartbeat (issue #8, see above) is implemented, unit-tested, and verified
+  on real hardware: the cleaned-up build (`f8ad423`) passed its smoke test (boot, handshake
+  mirrors `4.1.1`, no fallback warning, no crash over a couple of minutes), and the earlier
+  diagnostics-carrying build (`584e015`) showed repeated reads answered for several minutes
+  under the heartbeat. A heartbeat-off comparison and a preset-change push are both still
+  unconfirmed (the latter deferred to issue #9).
