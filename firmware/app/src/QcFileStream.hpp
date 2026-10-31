@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -31,8 +32,29 @@ public:
         uint32_t failedCount = 0;
         size_t totalWireBytes = 0;
         size_t totalInflatedBytes = 0;
+        // Largest single message seen (successfully dispatched/inflated
+        // ones only - see maxWireBytes/maxInflatedBytes member comments
+        // below for why a message dropped for being too big never reaches
+        // here at all, and so can understate the real peak). What #33's
+        // buffer sizing actually needs.
+        size_t maxWireBytes = 0;
+        size_t maxInflatedBytes = 0;
         int64_t elapsedMs = 0;
         bool timedOut = false;  // true: hit kOverallTimeoutMs; false: went quiet
+
+        // Not computed by this class - it has no visibility into
+        // QcDispatcher/QcGzipInflater's mailboxes or QcHidBridge's
+        // HidReassembler, all of which can silently drop a File message
+        // before it ever reaches onMessage()/onInflateFailed() below (see
+        // issue #60's "known gap"). QcSession fills these in from its own
+        // snapshot-at-start/diff-at-finish of those classes' counters, so
+        // the gap shows up here instead of only in scattered log lines.
+        // Left at 0 by anything that doesn't know better (e.g. this
+        // class's own tests).
+        uint32_t dispatcherDropped = 0;
+        uint32_t gzipDropped = 0;
+        uint32_t reassemblyOverflowCount = 0;
+        uint32_t reassemblyMalformedCount = 0;
     };
 
     // Called once, right after the handshake completes.
@@ -43,6 +65,8 @@ public:
         failedCount_ = 0;
         totalWireBytes_ = 0;
         totalInflatedBytes_ = 0;
+        maxWireBytes_ = 0;
+        maxInflatedBytes_ = 0;
         startedAtMs_ = nowMs;
         lastMessageAtMs_ = nowMs;
     }
@@ -63,6 +87,8 @@ public:
         }
         totalWireBytes_ += wireSize;
         totalInflatedBytes_ += inflatedSize;
+        maxWireBytes_ = std::max(maxWireBytes_, wireSize);
+        maxInflatedBytes_ = std::max(maxInflatedBytes_, inflatedSize);
         lastMessageAtMs_ = nowMs;
     }
 
@@ -77,6 +103,7 @@ public:
         ++messageCount_;
         ++failedCount_;
         totalWireBytes_ += wireSize;
+        maxWireBytes_ = std::max(maxWireBytes_, wireSize);
         lastMessageAtMs_ = nowMs;
     }
 
@@ -99,6 +126,8 @@ public:
             .failedCount = failedCount_,
             .totalWireBytes = totalWireBytes_,
             .totalInflatedBytes = totalInflatedBytes_,
+            .maxWireBytes = maxWireBytes_,
+            .maxInflatedBytes = maxInflatedBytes_,
             .elapsedMs = nowMs - startedAtMs_,
             .timedOut = timedOut,
         };
@@ -111,6 +140,8 @@ private:
     uint32_t failedCount_ = 0;
     size_t totalWireBytes_ = 0;
     size_t totalInflatedBytes_ = 0;
+    size_t maxWireBytes_ = 0;
+    size_t maxInflatedBytes_ = 0;
     int64_t startedAtMs_ = 0;
     int64_t lastMessageAtMs_ = 0;
 };

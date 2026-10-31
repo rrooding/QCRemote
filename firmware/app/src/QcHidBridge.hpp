@@ -68,10 +68,21 @@ protected:
             break;
         }
         case Status::Overflow:
-            LOG_WRN("Reassembly overflow (> %zu bytes) - message dropped", kReassemblyCapacity);
+            // No LOG_WRN here (issue #60's hardware-safety follow-up): this
+            // runs on the `usbh` thread, where CONFIG_LOG_MODE_IMMEDIATE
+            // means an *enabled* log level (unlike the LOG_DBG above, which
+            // is filtered out at the default level and so never actually
+            // formats) really does run cbprintf synchronously on that
+            // 1536-byte stack - the exact pattern that overflowed it once
+            // already (see QcSession.hpp's handleMessage() comment). An
+            // atomic counter costs nothing there; session_.recordReassemblyOverflow()
+            // surfaces the count through QcFileStream's summary instead
+            // (the known gap documented in firmware/README.md's issue #60
+            // section).
+            session_.recordReassemblyOverflow();
             break;
         case Status::Malformed:
-            LOG_WRN("Malformed HID report (%zu bytes)", report.size());
+            session_.recordReassemblyMalformed();
             break;
         case Status::InProgress:
             break;

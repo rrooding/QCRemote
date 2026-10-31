@@ -142,6 +142,19 @@ public:
         }
     }
 
+    // Called from QcHidBridge::onReportIn() on the `usbh` thread for
+    // HidReassembler::Status::Overflow/Malformed (issue #60's
+    // hardware-safety follow-up) - atomic increment only, same contract as
+    // handleMessage() above: no logging, nothing that can block. These
+    // drops happen before a command id is even known, so they can't be
+    // attributed to the File stream specifically the way
+    // dispatcher_/gzipInflater_'s drops can - see QcFileStream::Summary's
+    // comment on reassemblyOverflowCount/reassemblyMalformedCount for why
+    // they're still folded into that summary anyway, as a best-effort
+    // "this happened somewhere during the stream" figure.
+    void recordReassemblyOverflow() { reassemblyOverflowCount_.fetch_add(1, std::memory_order_relaxed); }
+    void recordReassemblyMalformed() { reassemblyMalformedCount_.fetch_add(1, std::memory_order_relaxed); }
+
 private:
     // Below the main LED-blink loop's priority; documented since nothing
     // else contends for the CPU yet.
@@ -249,10 +262,17 @@ private:
         // File READ (issue #60): asks for the device's whole catalog, which
         // comes back as a stream of File UPDATE messages - see
         // QcFileStream.hpp for how that stream is collected and
-        // runHeartbeat() for where it's polled to a finish.
+        // runHeartbeat() for where it's polled to a finish. Snapshotting
+        // the drop/overflow/malformed counters here, to diff against at
+        // the stream's finish, scopes those (otherwise lifetime) counts to
+        // this stream rather than everything since boot.
         {
             ScopedKMutex lock(fileStreamMutex_);
             fileStream_.start(k_uptime_get());
+            dispatcherDroppedAtStart_ = dispatcher_.droppedCount();
+            gzipDroppedAtStart_ = gzipInflater_.droppedCount();
+            reassemblyOverflowAtStart_ = reassemblyOverflowCount_.load(std::memory_order_relaxed);
+            reassemblyMalformedAtStart_ = reassemblyMalformedCount_.load(std::memory_order_relaxed);
         }
         msg.clear();
         encodeFileRead(msg, nextRequestId());
@@ -313,6 +333,19 @@ private:
             {
                 ScopedKMutex lock(fileStreamMutex_);
                 summary = fileStream_.checkTimeout(k_uptime_get());
+                if (summary) {
+                    // dispatcher_.droppedCount()/gzipInflater_.droppedCount() and
+                    // the reassembly counters are lifetime totals (see their
+                    // own comments) - diff against the snapshot taken when
+                    // this stream started so the summary reports only what
+                    // happened during it.
+                    summary->dispatcherDropped = dispatcher_.droppedCount() - dispatcherDroppedAtStart_;
+                    summary->gzipDropped = gzipInflater_.droppedCount() - gzipDroppedAtStart_;
+                    summary->reassemblyOverflowCount =
+                        reassemblyOverflowCount_.load(std::memory_order_relaxed) - reassemblyOverflowAtStart_;
+                    summary->reassemblyMalformedCount =
+                        reassemblyMalformedCount_.load(std::memory_order_relaxed) - reassemblyMalformedAtStart_;
+                }
             }
             if (summary) {
                 LOG_INF("File stream finished (%s): %u messages (%u compressed, %u failed), "
@@ -320,6 +353,18 @@ private:
                         summary->timedOut ? "timeout" : "quiet", summary->messageCount,
                         summary->compressedCount, summary->failedCount, summary->totalWireBytes,
                         summary->totalInflatedBytes, static_cast<int>(summary->elapsedMs));
+                // Separate line: sizing (#33) and data-loss figures. A
+                // non-zero dropped/overflow/malformed count here is the
+                // known gap (see firmware/README.md's issue #60 section) -
+                // not necessarily specific to File messages for the
+                // reassembly counters (they're counted before a command id
+                // is known), but real evidence of loss during this stream's
+                // window either way.
+                LOG_INF("File stream limits: max wire=%zu max inflated=%zu, dropped "
+                        "(dispatch=%u gzip=%u), reassembly (overflow=%u malformed=%u)",
+                        summary->maxWireBytes, summary->maxInflatedBytes, summary->dispatcherDropped,
+                        summary->gzipDropped, summary->reassemblyOverflowCount,
+                        summary->reassemblyMalformedCount);
             }
         }
     }
@@ -385,11 +430,25 @@ private:
     QcDispatcher dispatcher_;
     QcGzipInflater gzipInflater_;
 
-    // Guards fileStream_: written from onMessage()/onInflateFailed() (the
-    // dispatcher_/gzipInflater_ worker threads) and read/finalized from
-    // runHeartbeat() - never from `usbh`.
+    // Written from QcHidBridge::onReportIn() on the `usbh` thread (atomic
+    // increment only - see recordReassemblyOverflow()/recordReassemblyMalformed()
+    // above), read from runHeartbeat() when assembling a File stream
+    // summary. Lifetime counts - runHandshake() snapshots them into
+    // *AtStart_ below to scope a summary to one stream.
+    std::atomic<uint32_t> reassemblyOverflowCount_{0};
+    std::atomic<uint32_t> reassemblyMalformedCount_{0};
+
+    // Guards fileStream_ and the four *AtStart_ snapshots below: all are
+    // written from runHandshake() at stream start, read/diffed from
+    // runHeartbeat() at stream finish, and fileStream_ is also written
+    // from onMessage()/onInflateFailed() (the dispatcher_/gzipInflater_
+    // worker threads) - never from `usbh`.
     struct k_mutex fileStreamMutex_ {};
     QcFileStream fileStream_;
+    uint32_t dispatcherDroppedAtStart_ = 0;
+    uint32_t gzipDroppedAtStart_ = 0;
+    uint32_t reassemblyOverflowAtStart_ = 0;
+    uint32_t reassemblyMalformedAtStart_ = 0;
 };
 
 }  // namespace qcbridge

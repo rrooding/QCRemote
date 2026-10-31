@@ -71,9 +71,36 @@ ZTEST(dispatch_messages, test_file_stream_finishes_on_quiet_window)
     zassert_equal(summary->failedCount, 1u, "failedCount");
     zassert_equal(summary->totalWireBytes, 100u + 50u + 75u, "totalWireBytes");
     zassert_equal(summary->totalInflatedBytes, 100u + 200u, "totalInflatedBytes");
+    zassert_equal(summary->maxWireBytes, 100u, "maxWireBytes");       // max(100, 50, 75)
+    zassert_equal(summary->maxInflatedBytes, 200u, "maxInflatedBytes");  // max(100, 200)
     zassert_false(summary->timedOut, "expected a quiet finish, not a timeout");
 
+    // Not computed by QcFileStream itself - see Summary's own comment.
+    // Left at the struct's defaults here; QcSession is what fills these in.
+    zassert_equal(summary->dispatcherDropped, 0u, "dispatcherDropped default");
+    zassert_equal(summary->gzipDropped, 0u, "gzipDropped default");
+    zassert_equal(summary->reassemblyOverflowCount, 0u, "reassemblyOverflowCount default");
+    zassert_equal(summary->reassemblyMalformedCount, 0u, "reassemblyMalformedCount default");
+
     zassert_false(stream.isActive(), "expected the stream to deactivate once finished");
+}
+
+ZTEST(dispatch_messages, test_file_stream_tracks_max_not_last)
+{
+    QcFileStream stream;
+    stream.start(0);
+
+    // Biggest message isn't the last one - maxWireBytes/maxInflatedBytes
+    // must track the running max, not just the most recent value.
+    stream.onMessage(10, 50, 60, false);
+    stream.onMessage(20, 4096, 16384, true);  // the peak
+    stream.onMessage(30, 10, 10, false);
+    stream.onInflateFailed(40, 2000);  // bigger wire size, but no inflated size to report
+
+    const auto summary = stream.checkTimeout(40 + QcFileStream::kQuietWindowMs);
+    zassert_true(summary.has_value(), "expected the stream to finish");
+    zassert_equal(summary->maxWireBytes, 4096u, "maxWireBytes should track the peak, not the last value");
+    zassert_equal(summary->maxInflatedBytes, 16384u, "maxInflatedBytes should track the peak");
 }
 
 ZTEST(dispatch_messages, test_file_stream_finishes_once_only)

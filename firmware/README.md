@@ -487,17 +487,45 @@ decoder): for now this only logs command, wire size, inflated size, and whether 
 compressed - at `LOG_DBG`, not `LOG_INF`, since ~400 of these would otherwise drown everything
 else in the log during the stream (the existing per-report "Reassembled message" log in
 `QcHidBridge.hpp` was downgraded to `LOG_DBG` for the same reason). The readable, once-per-stream
-version is `QcFileStream`'s summary, logged at `LOG_INF` when the stream finishes: message/
-compressed/failed counts, total wire and inflated bytes, and elapsed time - this is what feeds
-issue #33's eventual sizing work.
+version is `QcFileStream`'s summary, logged in two `LOG_INF` lines when the stream finishes: the
+first has message/compressed/failed counts, total wire and inflated bytes, and elapsed time; the
+second has the peak sizes and the data-loss figures below - together, what feeds issue #33's
+eventual sizing work.
 
-**Known gap, not fixed here**: a File folder message that overflows `QcHidBridge`'s
-`kReassemblyCapacity` (4096 bytes) is dropped by `HidReassembler` *before* `handleMessage()` ever
-sees a command id, so it can't be attributed to the File stream's counters - it only shows up as
-the existing, pre-#60 "Reassembly overflow" `LOG_WRN`. A File message that decodes far enough to
-detect gzip but then fails to inflate (e.g. exceeds `QcGzip.hpp`'s `kMaxInflatedSize`, 16384
-bytes) *is* counted, via `onInflateFailed()`/`failedCount`. Both limits are issue #33's
-placeholders to size for real, not something this issue changes.
+**Known gaps, surfaced rather than fixed here.** Two separate things can make the summary
+undercount what the device actually sent, and both are counted and folded into the summary
+instead of only showing up as scattered log lines:
+
+- `QcDispatcher` and `QcGzipInflater` each have a single in-flight mailbox slot (see their own
+  header comments) - a message arriving while the previous one on that path is still being
+  processed, or one too big for the 4096-byte mailbox, is dropped. Both now count every drop
+  (`droppedCount()`, a lifetime total); `QcSession` snapshots that count when the File stream
+  starts and diffs it at the end, so the summary's `dispatcherDropped`/`gzipDropped` report only
+  what was lost *during this stream*. **There's no hardware measurement yet of whether one slot
+  actually keeps up with the device's real arrival rate** - that's exactly what these fields are
+  for: 0 across a real run means the assumption holds; consistently above 0 is real evidence of
+  data loss by design, and the fix would be a small bounded queue - not something worth adding
+  speculatively ahead of that evidence.
+- A File folder message that overflows `QcHidBridge`'s `kReassemblyCapacity` (4096 bytes) is
+  dropped by `HidReassembler` *before* `handleMessage()` ever sees a command id, so - unlike the
+  two drops above - it can't be attributed to the File stream specifically; the same goes for a
+  malformed HID report. Both are still counted (`reassemblyOverflowCount`/
+  `reassemblyMalformedCount`, same snapshot-and-diff treatment) and folded into the summary as a
+  best-effort "this happened somewhere during the stream" figure, rather than left solely to a
+  log line. These used to log via `LOG_WRN` directly in `QcHidBridge::onReportIn()` - run on the
+  `usbh` thread, where (unlike the already-filtered-out-by-default `LOG_DBG` calls nearby) an
+  *enabled* level like `LOG_WRN` really does run `cbprintf` formatting synchronously on that
+  1536-byte stack, the same pattern that overflowed it once before (see issue #8's section
+  above). Switched to atomic counters instead, with no logging on that thread at all for these
+  two cases now.
+
+A File message that decodes far enough to detect gzip but then fails to inflate (e.g. exceeds
+`QcGzip.hpp`'s `kMaxInflatedSize`, 16384 bytes) is counted differently again - via
+`onInflateFailed()`/`failedCount`, since by that point a command id and a wire size *are* known.
+All of the 4096/16384-byte limits above are issue #33's placeholders to size for real, not
+something this issue changes; the summary's new `maxWireBytes`/`maxInflatedBytes` fields (the
+largest single message actually seen, successfully processed - a message dropped for being too
+big never reaches this tracking at all) are what #33 needs for that sizing pass.
 
 **Not yet verified on real hardware.** Unlike the handshake/heartbeat sections above, no hardware
 run has been done for this issue - verify with:
@@ -510,20 +538,44 @@ run has been done for this issue - verify with:
 4. Paste back the full captured output from boot through either the `File stream finished (...)`
    line or the 35s mark, whichever comes first.
 
+A finished stream now logs two lines - paste back both:
+
+```
+File stream finished (quiet): N messages (C compressed, F failed), W wire bytes, I inflated bytes, E ms
+File stream limits: max wire=MW max inflated=MI, dropped (dispatch=DD gzip=DG), reassembly (overflow=RO malformed=RM)
+```
+
 What each outcome means:
 
-- **`File stream finished (quiet): N messages (C compressed, F failed), W wire bytes, I inflated
-  bytes, E ms`**, with `E` landing somewhere around 10-15 seconds and `N` in the neighborhood of
-  qc-mcp's ~400: the whole path works end to end - File READ reached the device, the stream was
-  collected, and the quiet window correctly ended it. `C`/`F`/the size totals are the numbers
-  issue #33 needs.
+- **`File stream finished (quiet): ...`**, with `E` landing somewhere around 10-15 seconds and `N`
+  in the neighborhood of qc-mcp's ~400: the whole path works end to end - File READ reached the
+  device, the stream was collected, and the quiet window correctly ended it. `C`/`F`/the size
+  totals are the numbers issue #33 needs.
 - **`File stream finished (timeout): ...`**: the stream never went quiet inside 30s - either the
   device kept sending (worth a longer capture to see if it ever stops) or something is stuck
   resetting the quiet window without the stream actually making progress.
+- **`DD`/`DG` (dispatcherDropped/gzipDropped) above 0**: real evidence that the single mailbox
+  slot in `QcDispatcher`/`QcGzipInflater` couldn't keep up with the device's arrival rate during
+  this stream - messages were dropped, not just slow. If this is 0 across a full run, the
+  single-slot design is fine as-is at this device's actual rate; if it's consistently above 0
+  on repeat runs, that's the signal to add a small bounded queue (not something to do without
+  this evidence). Either way, `N` above is then a *lower bound* on how many File messages the
+  device actually sent, not the true count.
+- **`RO`/`RM` (reassemblyOverflowCount/reassemblyMalformedCount) above 0**: a File folder message
+  overflowed `kReassemblyCapacity` (4096 bytes) or an HID report was malformed, during this
+  stream's window - the known gap: these happen before a command id is known, so they can't be
+  confirmed to be File messages specifically, but during this stream, File traffic is almost
+  everything on the wire. These no longer log their own warning (switched to counters - see
+  above), so this line is the only place they show up now.
+- **`MW`/`MI` (maxWireBytes/maxInflatedBytes)**: the largest single File message actually seen.
+  If `DD`/`DG`/`RO` are all 0, these are the true peak and exactly what issue #33 needs to size
+  `kReassemblyCapacity`/`kMaxInflatedSize` against. If any of those are above 0, the true peak is
+  *at least* this large - some messages that would have set a new peak never made it far enough
+  to be measured.
 - **No `File stream finished` line at all within 35s, and no `Handshake: failed to send File
   READ` error either**: the request went out but nothing about it is recognizable as a File
-  reply - check for `Reassembly overflow`/`Malformed HID report` warnings (the known gap above)
-  or an unexpectedly low/zero message count once a summary does eventually land.
+  reply - check whether `RO`/`RM` end up nonzero once a summary does eventually land, or whether
+  the eventual message count is unexpectedly low.
 - **`Handshake: failed to send File READ`**: the request itself never got sent - the handshake
   completed, so this would be a new, File-specific send failure rather than the already-explained
   benign `-EPIPE` quirk (`sendMessage()` only returns false when `sendReport` fails with

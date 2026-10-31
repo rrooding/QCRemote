@@ -57,11 +57,23 @@ namespace qcbridge {
 // QcDispatcher.hpp does for uncompressed messages. On failure, there's no
 // usable protoBytes to hand over, so onInflateFailed() goes to the sink
 // instead - still worth counting for a command like File mid-stream.
+//
+// Same open question as QcDispatcher.hpp on whether one slot is enough:
+// inflate is real CPU work (unlike a plain memcpy), so it's the more
+// plausible of the two to actually fall behind the File stream's arrival
+// rate - but there's still no hardware measurement of either side of that
+// comparison. droppedCount() is how that gets answered empirically.
 class QcGzipInflater {
 public:
     QcGzipInflater() { k_sem_init(&itemReadySem_, 0, 1); }
 
     void setSink(QcMessageSink& sink) { sink_ = &sink; }
+
+    // Lifetime count of messages dropped by submit() below (busy slot or
+    // too big for the mailbox, combined). Monotonic, never reset - see
+    // QcDispatcher::droppedCount()'s comment for why callers scoped to one
+    // stream need to snapshot-and-diff.
+    uint32_t droppedCount() const { return droppedCount_.load(std::memory_order_relaxed); }
 
     // Lazily starts the worker thread. Called from QcSession::deviceConnected()
     // (usbh thread) alongside its own lazy thread start, for the same
@@ -86,10 +98,12 @@ public:
     // HidReassembler::Status::Overflow/Malformed.
     bool submit(uint16_t command, std::span<const uint8_t> compressed, size_t wireSize) {
         if (busy_.exchange(true)) {
+            droppedCount_.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         if (compressed.size() > mailbox_.size()) {
             busy_.store(false);
+            droppedCount_.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         std::copy(compressed.begin(), compressed.end(), mailbox_.begin());
@@ -144,6 +158,7 @@ private:
 
     QcMessageSink* sink_ = nullptr;
     std::atomic<bool> busy_{false};
+    std::atomic<uint32_t> droppedCount_{0};
     std::array<uint8_t, gzip::kMaxCompressedInputSize> mailbox_{};
     size_t mailboxLen_ = 0;
     size_t mailboxWireSize_ = 0;

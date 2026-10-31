@@ -27,11 +27,33 @@ namespace qcbridge {
 // pathological bursts - not something to assume can't happen, though:
 // QcFileStream.hpp's summary reports counts rather than assuming every
 // message was seen.
+//
+// Whether a single slot is actually enough against the File stream's
+// ~400-messages-over-~12s arrival rate isn't something this codebase can
+// determine without hardware: dispatch work here is "cheap" by
+// inspection (a sink callback that does a counter update and maybe one
+// log line), but there's no measured number for how long that actually
+// takes on the real target versus how bursty the device's own send
+// timing is. droppedCount() exists precisely to answer this
+// empirically rather than by guessing: if it reads 0 across a real run,
+// one slot keeps up; if it's consistently above 0, that's real evidence
+// of data loss by design, and the fix is a small bounded queue - not
+// something to add speculatively ahead of that evidence (see
+// QcFileStream.hpp's Summary and firmware/README.md's issue #60 section
+// for how this gets surfaced).
 class QcDispatcher {
 public:
     QcDispatcher() { k_sem_init(&itemReadySem_, 0, 1); }
 
     void setSink(QcMessageSink& sink) { sink_ = &sink; }
+
+    // Lifetime count of messages dropped by submit() below (busy slot or
+    // too big for the mailbox, combined - both are "this message never
+    // reached the sink"). Monotonic, never reset: callers wanting a count
+    // scoped to one stream (QcFileStream.hpp) snapshot this at the start
+    // and diff at the end, same as QcSession does for
+    // QcGzipInflater::droppedCount().
+    uint32_t droppedCount() const { return droppedCount_.load(std::memory_order_relaxed); }
 
     // Lazily starts the worker thread - same pattern as
     // QcGzipInflater::start()/QcSession's own threads. Idempotent.
@@ -46,15 +68,19 @@ public:
     }
 
     // Called from QcSession::handleMessage() on the `usbh` thread - must
-    // stay cheap: a single bounded memcpy, nothing else. Returns false
+    // stay cheap: a single bounded memcpy, nothing else, plus an atomic
+    // counter bump on the drop paths (droppedCount_) - no logging, same
+    // safety requirement as the rest of this function. Returns false
     // (message dropped) if a previous item hasn't finished dispatching yet,
     // or if `protoBytes` is larger than this module's mailbox.
     bool submit(uint16_t command, std::span<const uint8_t> protoBytes, size_t wireSize) {
         if (busy_.exchange(true)) {
+            droppedCount_.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         if (protoBytes.size() > mailbox_.size()) {
             busy_.store(false);
+            droppedCount_.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         std::copy(protoBytes.begin(), protoBytes.end(), mailbox_.begin());
@@ -98,6 +124,7 @@ private:
 
     QcMessageSink* sink_ = nullptr;
     std::atomic<bool> busy_{false};
+    std::atomic<uint32_t> droppedCount_{0};
     std::array<uint8_t, kMailboxCapacity> mailbox_{};
     size_t mailboxLen_ = 0;
     size_t mailboxWireSize_ = 0;
