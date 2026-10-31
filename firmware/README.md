@@ -433,6 +433,27 @@ Run the tests the same way as `hid_framing` (see above):
 west twister -p qemu_cortex_m3 -K -T firmware/app/tests/catalog_messages
 ```
 
+## File message decode: folder and preset names (issue #59)
+
+[`QcFileMessage.hpp`](app/src/QcFileMessage.hpp) adds `decodeFile()`, the first Tier 2 message
+with real nested/repeated structure (`FolderInfo`, and its repeated `files`) - still built
+directly on `QcProtobuf.hpp`'s existing `ProtoFieldReader`, recursed per nesting level, with no
+changes to that file. See [ADR 0006](../docs/adr/0006-file-message-codec.md) for why nanopb is
+still deferred even here, and for the callback-based (not reply-struct) shape this decoder
+uses. New Ztest suite: `tests/file_messages`.
+
+Only `type == 0` (Presets) folders produce callbacks - IRs/Captures folders in the same stream
+decode successfully with zero callbacks, matching qc-mcp's `directory.py::structure_directory()`
+filtering. **Not yet verified against real device traffic** - tests use constructed bytes built
+from the verified field numbers in the ADR, not a capture. Wiring `decodeFile` into the
+session/message-dispatch path (the actual `File` request) is issue #10's job, not this one's.
+
+Run the tests the same way as `hid_framing`/`catalog_messages` (see above):
+
+```bash
+west twister -p qemu_cortex_m3 -K -T firmware/app/tests/file_messages
+```
+
 ## Not yet done
 
 - ETL is wired in via CMake `FetchContent` (see `app/CMakeLists.txt`) but not yet used by
@@ -443,6 +464,7 @@ west twister -p qemu_cortex_m3 -K -T firmware/app/tests/catalog_messages
   diagnostics-carrying build (`584e015`) showed repeated reads answered for several minutes
   under the heartbeat. A heartbeat-off comparison and a preset-change push are both still
   unconfirmed (the latter deferred to issue #9).
-- Tier 2's `decodeModelRepo`/`decodeSetlistPosition` aren't called from anywhere yet - wiring
-  them into the session/message-dispatch path is for whichever issue actually consumes them
-  (`ModelRepo` needs #6's inflate first; a preset-list `SetlistPosition` READ is #9's scope).
+- Tier 2's `decodeModelRepo`/`decodeSetlistPosition`/`decodeFile` aren't called from anywhere
+  yet - wiring them into the session/message-dispatch path is for whichever issue actually
+  consumes them (`ModelRepo` needs #6's inflate first; a preset-list `SetlistPosition` READ and
+  the `File` request/dispatch are issue #10's scope).
