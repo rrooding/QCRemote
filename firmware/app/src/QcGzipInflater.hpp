@@ -11,6 +11,7 @@
 #include <zephyr/logging/log.h>
 
 #include "QcGzip.hpp"
+#include "QcMessageSink.hpp"
 
 namespace qcbridge {
 
@@ -33,10 +34,8 @@ namespace qcbridge {
 //      report timing risks delaying that controller's housekeeping for
 //      however long inflate takes, independent of stack safety.
 //   3. QcSession::handleMessage() is documented log-free specifically
-//      because of (1); a failed/successful inflate is worth logging
-//      (there's no consumer for the decompressed bytes yet - see below -
-//      so logging the outcome is the only observable result for now),
-//      and LOG_* must not run on `usbh` either per CODING_STANDARDS.md.
+//      because of (1); a failed/successful inflate is worth logging, and
+//      LOG_* must not run on `usbh` either per CODING_STANDARDS.md.
 //
 // QcSession::handleMessage() detects the gzip magic prefix itself (cheap:
 // a 3-byte compare, no heavy stack) and, if present, hands the compressed
@@ -44,20 +43,37 @@ namespace qcbridge {
 //
 // Single in-flight slot: a second compressed message arriving before the
 // first has finished inflating is dropped (submit() returns false)
-// rather than queued. Acceptable for now - there is no real consumer of
-// decompressed payload yet. No command currently dispatched by
-// handleMessage() is ever compressed in practice (Version/Connection/
+// rather than queued. No command currently dispatched by handleMessage()
+// is commonly compressed in practice (Version/Connection/
 // ResetCommsBuffers/KeepAlive are all small and uncompressed, confirmed
-// in PR #56), and the one realistic candidate (ModelRepo) has no handler
-// yet (issue #5 Tier 2 / #9). This class exists to implement the
-// generic, command-id-agnostic detect+inflate step at its seam (issue
-// #6) and exercise+log it against real traffic once compressed messages
-// do start arriving, ahead of a real consumer existing to hand the
-// decompressed bytes to. Revisit the single-slot limitation if/when one
-// does, and back-to-back compressed messages turn out to matter.
+// in PR #56) except File (issue #60), whose folder-listing payloads this
+// class exists to exercise against real traffic. Revisit the single-slot
+// limitation if/when back-to-back compressed messages turn out to matter
+// for File's ~400-message stream - QcFileStream.hpp's summary counts
+// failures rather than assuming every message got through.
+//
+// On success, the decompressed bytes go to QcSession (via QcMessageSink -
+// see setSink()) from this class's own worker thread, same as
+// QcDispatcher.hpp does for uncompressed messages. On failure, there's no
+// usable protoBytes to hand over, so onInflateFailed() goes to the sink
+// instead - still worth counting for a command like File mid-stream.
+//
+// Same open question as QcDispatcher.hpp on whether one slot is enough:
+// inflate is real CPU work (unlike a plain memcpy), so it's the more
+// plausible of the two to actually fall behind the File stream's arrival
+// rate - but there's still no hardware measurement of either side of that
+// comparison. droppedCount() is how that gets answered empirically.
 class QcGzipInflater {
 public:
     QcGzipInflater() { k_sem_init(&itemReadySem_, 0, 1); }
+
+    void setSink(QcMessageSink& sink) { sink_ = &sink; }
+
+    // Lifetime count of messages dropped by submit() below (busy slot or
+    // too big for the mailbox, combined). Monotonic, never reset - see
+    // QcDispatcher::droppedCount()'s comment for why callers scoped to one
+    // stream need to snapshot-and-diff.
+    uint32_t droppedCount() const { return droppedCount_.load(std::memory_order_relaxed); }
 
     // Lazily starts the worker thread. Called from QcSession::deviceConnected()
     // (usbh thread) alongside its own lazy thread start, for the same
@@ -80,17 +96,20 @@ public:
     // than this module supports (gzip::kMaxCompressedInputSize) - either
     // way the caller just drops the message, same as it already does for
     // HidReassembler::Status::Overflow/Malformed.
-    bool submit(uint16_t command, std::span<const uint8_t> compressed) {
+    bool submit(uint16_t command, std::span<const uint8_t> compressed, size_t wireSize) {
         if (busy_.exchange(true)) {
+            droppedCount_.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         if (compressed.size() > mailbox_.size()) {
             busy_.store(false);
+            droppedCount_.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         std::copy(compressed.begin(), compressed.end(), mailbox_.begin());
         mailboxLen_ = compressed.size();
         mailboxCommand_ = command;
+        mailboxWireSize_ = wireSize;
         k_sem_give(&itemReadySem_);
         return true;
     }
@@ -112,6 +131,9 @@ private:
                 gzip::inflate({mailbox_.data(), mailboxLen_}, {output_.data(), output_.size()});
             if (result) {
                 LOG_INF("Inflated command %u: %zu -> %zu bytes", mailboxCommand_, mailboxLen_, result->size());
+                if (sink_ != nullptr) {
+                    sink_->onMessage(mailboxCommand_, *result, mailboxWireSize_, result->size(), true);
+                }
             } else {
                 // Named, not just the raw enum value, so the first real
                 // compressed message that fails shows up in a log as
@@ -120,10 +142,10 @@ private:
                 // why a failure here needs to be obvious, not silent.
                 LOG_WRN("Inflate failed for command %u (%zu compressed bytes): %s", mailboxCommand_, mailboxLen_,
                         gzip::toString(result.error()));
+                if (sink_ != nullptr) {
+                    sink_->onInflateFailed(mailboxCommand_, mailboxWireSize_, gzip::toString(result.error()));
+                }
             }
-            // No dispatch of `result`'s decompressed bytes yet - see this
-            // class's header comment. A future consumer (#5 Tier 2 / #9)
-            // reads them here, before busy_ is cleared.
 
             busy_.store(false);
         }
@@ -134,9 +156,12 @@ private:
     bool threadStarted_ = false;
     struct k_sem itemReadySem_ {};
 
+    QcMessageSink* sink_ = nullptr;
     std::atomic<bool> busy_{false};
+    std::atomic<uint32_t> droppedCount_{0};
     std::array<uint8_t, gzip::kMaxCompressedInputSize> mailbox_{};
     size_t mailboxLen_ = 0;
+    size_t mailboxWireSize_ = 0;
     uint16_t mailboxCommand_ = 0;
     std::array<uint8_t, gzip::kMaxInflatedSize> output_{};
 };

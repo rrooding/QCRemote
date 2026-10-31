@@ -335,14 +335,15 @@ ran, was reliably answered for several minutes straight.
   heartbeat disabled. Worth doing if this ever needs re-confirming: comment out the
   `startHeartbeat()` call at the top of `runHandshake()`, reflash, and confirm reads then
   fail where they currently succeed.
-- **No preset-change push was observed** (`RecallPreset`/`Scene`/`SetlistPosition`/
-  `PresetDirty`/`RecentsFavorites`, per `PROTOCOL.md`'s description of what a device-side
-  preset recall autonomously pushes). One candidate explanation, not a proven one: qc-mcp's
-  own `transport.py::_handshake()` sends twelve explicit subscription READs (including
-  `SetlistPosition`/`PresetDirty`) right after `Connection` UPDATE, with a comment that this
-  is what "makes the QC start streaming" — this firmware has never sent any of those.
-  Sending them is issue **#9**'s scope (and #5 Tier 2's), not this one's. If presets are
-  still silent once #9 lands, that candidate explanation needs revisiting.
+- **No preset-change push was observed at the time this section was written**
+  (`RecallPreset`/`Scene`/`SetlistPosition`/`PresetDirty`/`RecentsFavorites`, per
+  `PROTOCOL.md`'s description of what a device-side preset recall autonomously pushes). The
+  candidate explanation then was qc-mcp's own `transport.py::_handshake()` sending twelve
+  explicit subscription READs right after `Connection` UPDATE, with a comment that this is what
+  "makes the QC start streaming" — this firmware hadn't sent any of those yet. **Resolved in
+  issue #61**: sending those twelve READs (see the #60/#61 section below) made the device both
+  answer the File READ and push a compressed `RecallPreset` on a preset change, confirmed on real
+  hardware.
 
 ### The tested build differs from this one
 
@@ -454,6 +455,227 @@ Run the tests the same way as `hid_framing`/`catalog_messages` (see above):
 west twister -p qemu_cortex_m3 -K -T firmware/app/tests/file_messages
 ```
 
+## Message dispatch, the File stream, and post-connect state READs (issues #60, #61)
+
+General message dispatch: [`QcSession::handleMessage()`](app/src/QcSession.hpp) now hands every
+reassembled message to either [`QcGzipInflater.hpp`](app/src/QcGzipInflater.hpp) (issue #6, if
+the gzip magic prefix is present) or the new [`QcDispatcher.hpp`](app/src/QcDispatcher.hpp)
+(otherwise) - both single-slot-mailbox-plus-worker-thread classes, the same shape, so a message
+arriving while the previous one on that path is still being handled is dropped rather than
+queued. `handleMessage()` itself still does only a cheap trailer decode and a 3-byte gzip-magic
+check: no logging, no real dispatch logic, matching the lesson baked in since issue #8 (see
+above) about Zephyr's `usbh` thread stack. Both worker threads call back into `QcSession`
+through a small interface, [`QcMessageSink.hpp`](app/src/QcMessageSink.hpp)
+(`onMessage()`/`onInflateFailed()`), from their own thread - never from `usbh` - so that's where
+real dispatch logic (today: recognizing a Version reply, and the File hook below) safely lives.
+
+Post-connect state READs (issue #61): right after the handshake's Connection UPDATE and before
+the File READ below, `QcSession::runHandshake()` now sends the same twelve state READs qc-mcp's
+own `transport.py::_handshake()` sends at that point -
+[`QcStateReads.hpp`](app/src/QcStateReads.hpp)'s `kPostConnectStateReadCommands`, in the exact
+order qc-mcp uses: `ModelRepo`, `ModuleStats`, `UndoRedo`, `IOSettings`, `GeneralSettings`,
+`Mode`, `GlobalEQ`, `MasterVolume`, `GlobalTempo`, `Scene`, `PresetDirty`, `SetlistPosition`.
+qc-mcp's own comment on this step says plainly that it's what "makes the QC start streaming and
+marks the session active" - the hardware run on commit `11e43d0` (issue #60's hardware debugging,
+below: a 30-second timeout with only one message the whole window, the handshake's own delayed
+`Version` reply, and no File traffic at all) made these the leading candidate explanation.
+**Confirmed on commit `0d1edcc`** (see "Hardware results" below): with these twelve READs in
+place, the same device answered the File READ for the first time. The earlier framing of this as
+an unproven candidate - or of a bare File READ possibly being enough on its own - no longer
+applies to this device.
+
+Command ids (protocol.py's `COMMANDS` map) and field numbers (qc_descriptors-4.1.pb) were taken
+directly from qc-mcp's source, not guessed: every one of the twelve message types shares the same
+two leading fields, 1=`action` and 2=`request_id`, confirmed by decoding the descriptor set
+itself field-by-field rather than assumed from the Tier 1/File shape already in this codebase -
+so one generic encoder, `encodeStateRead()`, covers all twelve. Sent back-to-back with no wait for
+a reply in between, and no wait for any of their replies before moving on to the File READ either
+- that mirrors qc-mcp exactly: its own loop fires all twelve, then only pauses briefly
+(`time.sleep(0.3)` + a short `_collect()`) before discarding whatever already came back, never
+gating on a specific reply. This firmware mirrors that fire-and-forget shape rather than inventing
+a synchronous wait qc-mcp doesn't have. A send failure on any one of the twelve logs a warning and
+moves on to the next (and still to the File READ afterward) rather than aborting the sequence -
+matching qc-mcp's own per-READ `try`/`except`.
+
+Replies to these - including a `ModelRepo` reply that's large and/or gzip-compressed - are handled
+by the same generic dispatch path as every other message
+([`QcDispatcher.hpp`](app/src/QcDispatcher.hpp)/[`QcGzipInflater.hpp`](app/src/QcGzipInflater.hpp),
+described below), which already drops-and-counts rather than crashes on anything too big for
+`kReassemblyCapacity` or either mailbox - no new handling was needed for this issue's "don't crash,
+don't block the File READ" requirement, since issue #60 had already made that path crash-safe for
+an unknown command's reply of unknown size. A `ModelRepo` reply overflowing `kReassemblyCapacity`
+(4096 bytes) shows up as `reassemblyOverflowCount` in the File stream's summary below, same as any
+other oversized message during that window.
+
+The File request: [`QcFileRequest.hpp`](app/src/QcFileRequest.hpp) encodes a bare File READ
+(command 4), sent right after the handshake completes (`QcSession::runHandshake()`). The device
+answers with a stream of File UPDATE messages covering its whole catalog (presets, IRs,
+captures) - qc-mcp's `transport.py::list_directory()` describes about 400 messages over about
+12s on a real device. [`QcFileStream.hpp`](app/src/QcFileStream.hpp) collects that stream: a
+1500ms quiet window or a 30s overall cap, whichever comes first, mirroring that function's
+`quiet_ms`/`timeout_ms` defaults. It's plain C++23 with no Zephyr dependency, same reasoning as
+`HidReassembler.hpp` - the whole state machine takes an explicit `nowMs` rather than calling
+`k_uptime_get()` itself, so it's unit-testable with synthetic timestamps and no real waiting
+(see `tests/dispatch_messages`). `QcSession` calls it under its own mutex (`fileStreamMutex_`)
+from `onMessage()`/`onInflateFailed()` (the dispatch/inflate worker threads) and from
+`runHeartbeat()`, which polls `checkTimeout()` on its own ~200ms cadence rather than running a
+separate timer - plenty of resolution for a 1500ms window, and keeps the check off `usbh` too.
+
+The File-message hook (issue #60's scope item 3, ahead of #10 wiring in the sibling issue #59's
+decoder): for now this only logs command, wire size, inflated size, and whether a message was
+compressed - at `LOG_DBG`, not `LOG_INF`, since ~400 of these would otherwise drown everything
+else in the log during the stream (the existing per-report "Reassembled message" log in
+`QcHidBridge.hpp` was downgraded to `LOG_DBG` for the same reason). The readable, once-per-stream
+version is `QcFileStream`'s summary, logged in two `LOG_INF` lines when the stream finishes: the
+first has message/compressed/failed counts, total wire and inflated bytes, and elapsed time; the
+second has the peak sizes and the data-loss figures below - together, what feeds issue #33's
+eventual sizing work.
+
+**Known gaps, surfaced rather than fixed here.** Two separate things can make the summary
+undercount what the device actually sent, and both are counted and folded into the summary
+instead of only showing up as scattered log lines:
+
+- `QcDispatcher` and `QcGzipInflater` each have a single in-flight mailbox slot (see their own
+  header comments) - a message arriving while the previous one on that path is still being
+  processed, or one too big for the 4096-byte mailbox, is dropped. Both count every drop
+  (`droppedCount()`, a lifetime total); `QcSession` snapshots that count when the File stream
+  starts and diffs it at the end, so the summary's `dispatcherDropped`/`gzipDropped` report only
+  what was lost *during this stream*. **Measured on real hardware (commit `0d1edcc`): both 0**
+  across a 551-message, ~12s stream - the single-slot design kept up at this device's actual
+  arrival rate; no evidence yet to justify a bounded queue.
+- A File folder message that overflows `QcHidBridge`'s `kReassemblyCapacity` (4096 bytes) is
+  dropped by `HidReassembler` *before* `handleMessage()` ever sees a command id, so - unlike the
+  two drops above - it can't be attributed to the File stream specifically; the same goes for a
+  malformed HID report. Both are counted (`reassemblyOverflowCount`/`reassemblyMalformedCount`,
+  same snapshot-and-diff treatment) and folded into the summary as a best-effort "this happened
+  somewhere during the stream" figure, rather than left solely to a log line. These used to log
+  via `LOG_WRN` directly in `QcHidBridge::onReportIn()` - run on the `usbh` thread, where (unlike
+  the already-filtered-out-by-default `LOG_DBG` calls nearby) an *enabled* level like `LOG_WRN`
+  really does run `cbprintf` formatting synchronously on that 1536-byte stack, the same pattern
+  that overflowed it once before (see issue #8's section above). Switched to atomic counters
+  instead, with no logging on that thread at all for these two cases now. **Measured on real
+  hardware (commit `0d1edcc`): overflow=31, malformed=2850, out of 8843 total IN transfers - not
+  zero.** See "Hardware results" below for what that means and why it's deferred to issue #33
+  rather than fixed here.
+
+A File message that decodes far enough to detect gzip but then fails to inflate (e.g. exceeds
+`QcGzip.hpp`'s `kMaxInflatedSize`, 16384 bytes) is counted differently again - via
+`onInflateFailed()`/`failedCount`, since by that point a command id and a wire size *are* known.
+All of the 4096/16384-byte limits above are issue #33's placeholders to size for real, not
+something this issue changes; the summary's `maxWireBytes`/`maxInflatedBytes` fields (the
+largest single message actually seen, successfully processed - a message dropped for being too
+big never reaches this tracking at all) are what #33 needs for that sizing pass. This PR adds no
+overflow-size measurement beyond the existing overflow/malformed counters, and does not change
+`kReassemblyCapacity` or `kMaxInflatedSize` - sizing them for real is #33's job, not this one's.
+
+**Hardware results (commit `0d1edcc`, the state-READs commit; logging cleanup after it is not
+yet separately re-verified - see "Smoke test for this build" below).** A real Quad Cortex Mini:
+
+```
+File stream finished (quiet): 551 messages (0 compressed, 0 failed), 586523 wire bytes, 582115 inflated bytes, 11676 ms
+File stream limits: max wire=3946 max inflated=3938, dropped (dispatch=0 gzip=0), reassembly (overflow=31 malformed=2850), 8843 total IN transfers
+```
+
+followed, about 25 seconds later, by a compressed `RecallPreset` (15) - "Inflated command 15: 1223
+-> 13235 bytes" - together with `Scene` (13), `Grid` (1), and `RecentsFavorites` (20). `GlobalTempo`
+(33) streamed throughout the whole session at roughly 4 times a second. No crash.
+
+**Confirmed:**
+
+- Issue #61's post-connect state READs were the missing step: this is the same device that, on
+  commit `11e43d0` (without the state READs), got a live-but-silent session - one message in 30
+  seconds, the handshake's own delayed `Version` reply, no File traffic at all. With the state
+  READs in place, the File stream completed. The earlier "maybe a bare File READ is enough on its
+  own" framing is gone - on this device, it isn't.
+- `QcGzipInflater` inflates real compressed hardware traffic correctly: the `RecallPreset` above
+  is the first gzip-compressed message seen on real hardware, and it decompressed without issue.
+
+**Not complete, deferred to issue #33:** 31 messages overflowed `kReassemblyCapacity` (4096
+bytes) and were lost before a command id could even be read, so which command(s) they belonged to
+is unknown. `malformed=2850` is almost certainly their continuation reports - once an overflow
+resets `HidReassembler` mid-message, every MIDDLE/LAST report that follows with no preceding FIRST
+decodes as malformed, until the next FIRST report resyncs it. Some of the 31 lost messages may
+have been preset folders, so the File catalog this stream collected is **not known to be
+complete**. The owner's preset change wasn't precisely timed, so the ~25s gap before `RecallPreset`
+arrived is inferred, not measured against a stopwatch.
+
+**Not yet verified on real hardware: this cleaned-up build itself.** The result above is from
+commit `0d1edcc`, before this PR's logging cleanup (quieter post-connect tally output,
+`QcMessageTally`'s capacity fix - see below). Neither changes what the device is sent or how
+File/state-READ replies are handled, so the result shouldn't change, but it hasn't been re-run.
+
+**Smoke test for this build:**
+
+1. Flash this build and open the serial console (see Flash/Verify above).
+2. Confirm the handshake completes (`Session handshake complete (firmware version: ...)`, no `No
+   usable Version reply` warning).
+3. Confirm the File stream finishes quiet (`File stream finished (quiet): ...`, not `(timeout)`).
+4. Change the loaded preset once on the unit and confirm a `Post-connect tally: command=...` line
+   appears for it (`RecallPreset`/`Scene`/`Grid`/`RecentsFavorites`/similar).
+5. Let it run a couple of minutes: no crash, and no flood of repeated tally lines (`GlobalTempo`'s
+   continuous ticking should produce at most one post-connect tally line per minute - see below).
+
+A finished stream logs several lines - paste back all of them:
+
+```
+File stream finished (quiet): N messages (C compressed, F failed), W wire bytes, I inflated bytes, E ms
+File stream limits: max wire=MW max inflated=MI, dropped (dispatch=DD gzip=DG), reassembly (overflow=RO malformed=RM)
+File stream tally: T total IN transfers
+File stream tally: command=CMD count=CNT    (one line per distinct command id seen, or "no messages of any command seen in this window")
+Post-connect tally started: watching for preset-change pushes (RecallPreset/Scene/SetlistPosition/...) - issue #61
+```
+
+`QcMessageTally.hpp` (`QcSession`'s `messageTally_`) records every message handed to
+`onMessage()`/`onInflateFailed()` by command id, not just File, for the lifetime of one File
+stream - added so a run with zero File messages could tell "the device sent nothing at all" apart
+from "the device sent something, just not File" (see the `11e43d0` result above). `T`
+(`QcSession::totalInTransfers_`, incremented in `QcHidBridge::onReportIn()`) counts one layer
+lower still - every successful USB IN transfer, regardless of whether the reassembler ever turned
+it into a counted message at all.
+
+`QcMessageTally`'s capacity (`kMaxDistinctCommands`) was 8 through commit `0d1edcc`, and the
+`0d1edcc` hardware run above hit that limit: the twelve state-READ replies alone can fill all 8
+slots before File's own first message arrives, so an entire ~550-message File stream was counted
+as "other" instead of under command 4 ("554 messages from other distinct commands (> 8 tracked)").
+Fixed in this PR by raising the cap to 24 (comfortably above the 18 distinct command ids this
+firmware can see in one connect - the twelve state-READ replies, File, Version, and the five
+preset-change-push commands below) - static, no behavior change beyond no longer losing File to
+the limit.
+
+The last line starts a second, separate tally (`QcSession`'s `postStreamTally_`, same
+`QcMessageTally.hpp` class, a different instance) that keeps running for the rest of the session,
+specifically for issue #61's preset-change check: `messageTally_` above stops dead the moment the
+File stream finishes, so without this there'd be no visibility into anything the device sends
+afterward - including a preset-change push. It logs a `Post-connect tally: command=CMD count=CNT`
+line (same per-command shape as the File stream's own tally lines, plus a similar "other distinct
+commands" line past the 24-command cap) only when something actually worth noticing happens:
+immediately for a command id never seen before in this window (the real preset-change signal -
+`RecallPreset`/`Scene`/`Grid`/`RecentsFavorites`/`SetlistPosition`/`PresetDirty`), and at most once
+a minute for a plain count bump on an already-seen command, reprinting only the command(s) that
+actually changed rather than the whole tracked set. That one-minute throttle exists because
+`GlobalTempo` (and `CPULoad`, per qc-mcp's own comment) streams continuously under an active
+heartbeat whether or not a preset ever changes (confirmed above: ~4/s for the whole session) -
+without it, every tracked command got reprinted once a second, GlobalTempo's ticking alone
+swamping the log for the rest of the session and burying the one line that actually mattered. If
+nothing new happens after the stream, you'll simply see no further `Post-connect tally: ...`
+lines.
+
+What a few of the summary fields mean, for issue #33's sizing work:
+
+- **`DD`/`DG` (dispatcherDropped/gzipDropped) above 0**: the single-slot mailbox in
+  `QcDispatcher`/`QcGzipInflater` couldn't keep up with the device's arrival rate during this
+  stream. 0 on the hardware run above; `N` is then a lower bound on what the device actually sent
+  if this is ever nonzero on a future run.
+- **`RO`/`RM` (reassemblyOverflowCount/reassemblyMalformedCount) above 0**: confirmed nonzero on
+  real hardware (31/2850) - see "Hardware results" above.
+- **`MW`/`MI` (maxWireBytes/maxInflatedBytes)**: the largest single message actually seen,
+  successfully processed. If `DD`/`DG`/`RO` are all 0 this is the true peak; otherwise the true
+  peak is *at least* this large, since a dropped message never reaches this tracking.
+- **A crash or stack fault**: capture the fault PC/LR and `addr2line` against `zephyr.elf`, same
+  method used to find issue #8's `usbh`-stack overflow (see that section above) - and say which
+  thread's name appears in the dump (`qc_dispatch`, `qc_gzip_inflate`, `qc_session`,
+  `qc_heartbeat`, or `usbh` itself).
+
 ## Not yet done
 
 - ETL is wired in via CMake `FetchContent` (see `app/CMakeLists.txt`) but not yet used by
@@ -462,8 +684,10 @@ west twister -p qemu_cortex_m3 -K -T firmware/app/tests/file_messages
   on real hardware: the cleaned-up build (`f8ad423`) passed its smoke test (boot, handshake
   mirrors `4.1.1`, no fallback warning, no crash over a couple of minutes), and the earlier
   diagnostics-carrying build (`584e015`) showed repeated reads answered for several minutes
-  under the heartbeat. A heartbeat-off comparison and a preset-change push are both still
-  unconfirmed (the latter deferred to issue #9).
+  under the heartbeat. A heartbeat-off comparison is still unconfirmed. Issue #61's state READs
+  and preset-change push are now confirmed on real hardware too (commit `0d1edcc`, see "Hardware
+  results" in the #60/#61 section above) - a compressed `RecallPreset` arrived with the owner's
+  preset change and inflated correctly.
 - Tier 2's `decodeModelRepo`/`decodeSetlistPosition`/`decodeFile` aren't called from anywhere
   yet - wiring them into the session/message-dispatch path is for whichever issue actually
   consumes them (`ModelRepo` needs #6's inflate first; a preset-list `SetlistPosition` READ and
