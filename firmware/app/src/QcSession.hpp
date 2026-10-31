@@ -440,29 +440,40 @@ private:
                 if (postStreamTally_.isActive()) {
                     const auto entries = postStreamTally_.entries();
                     const auto otherCount = postStreamTally_.otherCount();
-                    const bool newDistinctCommand = entries.size() > postStreamLoggedEntryCount_;
-                    bool countsChanged = newDistinctCommand || otherCount != postStreamLoggedOtherCount_;
-                    for (size_t i = 0; !countsChanged && i < entries.size(); ++i) {
-                        countsChanged = entries[i].count != postStreamLoggedEntries_[i].count;
-                    }
                     const int64_t nowMs = k_uptime_get();
-                    // A brand-new command id (the actual preset-change
-                    // signal) is reported immediately; a mere count bump on
-                    // an already-seen command (e.g. continuous GlobalTempo/
-                    // CPULoad streaming) is throttled to at most once per
-                    // kPostStreamLogIntervalMs so that alone can't swamp the
-                    // log for the rest of the session.
-                    if (countsChanged && (newDistinctCommand ||
-                                           (nowMs - postStreamLastLoggedAtMs_) >= kPostStreamLogIntervalMs)) {
+                    const bool intervalDue =
+                        (nowMs - postStreamLastLoggedAtMs_) >= kPostStreamLogIntervalMs;
+
+                    // Only ever print a command that's brand new (the actual
+                    // preset-change signal - reported immediately) or whose
+                    // count moved since it was last printed (reported at
+                    // most once per kPostStreamLogIntervalMs) - never the
+                    // whole tracked set on every tick. Without the per-entry
+                    // filter, GlobalTempo's own ~4/s ticking (qc-mcp's
+                    // documented streaming-under-heartbeat behavior) bumps
+                    // *a* count on practically every heartbeat, which used
+                    // to reprint every other already-stable entry
+                    // (RecallPreset, Scene, Grid, ...) right along with it.
+                    for (size_t i = 0; i < entries.size(); ++i) {
+                        const bool isNew = i >= postStreamLoggedEntryCount_;
+                        const bool bumped = !isNew && entries[i].count != postStreamLoggedEntries_[i].count;
+                        if (isNew || (bumped && intervalDue)) {
+                            postStreamEntries[postStreamEntryCount] = entries[i];
+                            ++postStreamEntryCount;
+                            postStreamChanged = true;
+                        }
+                    }
+                    if (otherCount != postStreamLoggedOtherCount_ && intervalDue) {
+                        postStreamOtherCount = otherCount;
                         postStreamChanged = true;
-                        postStreamEntryCount = entries.size();
-                        for (size_t i = 0; i < postStreamEntryCount; ++i) {
-                            postStreamEntries[i] = entries[i];
+                    }
+
+                    if (postStreamChanged) {
+                        for (size_t i = 0; i < entries.size(); ++i) {
                             postStreamLoggedEntries_[i] = entries[i];
                         }
-                        postStreamOtherCount = otherCount;
+                        postStreamLoggedEntryCount_ = entries.size();
                         postStreamLoggedOtherCount_ = otherCount;
-                        postStreamLoggedEntryCount_ = postStreamEntryCount;
                         postStreamLastLoggedAtMs_ = nowMs;
                     }
                 }
@@ -618,10 +629,13 @@ private:
 
     // A new command id is always logged the moment it's first seen; a
     // count bump on an already-logged command is throttled to at most
-    // once per this interval (see runHeartbeat()) so continuous streaming
-    // traffic (qc-mcp's own comment: GlobalTempo/CPULoad at ~3/s under an
-    // active heartbeat) can't flood the log for the rest of the session.
-    static constexpr int64_t kPostStreamLogIntervalMs = 1000;
+    // once per this interval (see runHeartbeat()), and even then only that
+    // command's line is reprinted, not the whole tracked set. 60s is long
+    // enough that continuous streaming traffic (confirmed on hardware,
+    // commit 0d1edcc: GlobalTempo at ~4/s for the whole session) can't
+    // flood the log, while still confirming the session is alive
+    // periodically rather than going silent forever after the first line.
+    static constexpr int64_t kPostStreamLogIntervalMs = 60000;
 
     // issue #61: everything postStreamTally_ needs to answer "did a
     // preset change on the unit push something new (RecallPreset/Scene/

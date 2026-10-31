@@ -23,9 +23,20 @@ namespace qcbridge {
 // otherCount() rather than growing unboundedly - this is a short-lived
 // debugging aid watching one connect's worth of traffic, not something
 // that needs to handle an open-ended command space.
+//
+// Sized from a real hardware run (issue #60/#61, commit 0d1edcc): in one
+// connect's worth of traffic this firmware can see the 12 post-connect
+// state-READ replies (QcStateReads.hpp), File (4), Version (10), and
+// preset-change pushes (RecallPreset 15, Scene 13, Grid 1,
+// RecentsFavorites 20, PresetDirty 34, SetlistPosition 2) - 18 distinct
+// ids observed or enumerable in practice. A static 8-slot cap measured
+// smaller than that on hardware: state-READ replies alone filled every
+// slot before File's own first message arrived, so File's ~550-message
+// stream was counted entirely as "other" instead. 24 leaves headroom
+// above the 18 known ids without tracking any one command specially.
 class QcMessageTally {
 public:
-    static constexpr size_t kMaxDistinctCommands = 8;
+    static constexpr size_t kMaxDistinctCommands = 24;
 
     struct Entry {
         uint16_t command = 0;
