@@ -8,7 +8,7 @@
 
 namespace qcbridge {
 
-// Splits a logical message into a sequence of 128-byte HID reports, per
+// Splits a logical message into a sequence of 129-byte HID reports, per
 // qc-mcp's framing (see HidReassembler.hpp for the byte layout this
 // mirrors). Call next() repeatedly until done() - each call fills exactly
 // one report.

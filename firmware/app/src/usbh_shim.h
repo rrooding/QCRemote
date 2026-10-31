@@ -15,8 +15,12 @@ extern "C" {
  * require the rest of the firmware to include a Zephyr USB header directly.
  */
 
-/* Every qc-mcp HID report is exactly this many bytes (see PROTOCOL.md). */
-#define QC_USBH_REPORT_SIZE 128
+/*
+ * Every qc-mcp HID report is exactly this many bytes (see PROTOCOL.md) -
+ * matches qcbridge::kHidReportSize (HidReassembler.hpp), which this plain-C
+ * header can't include directly. Keep the two in sync by hand.
+ */
+#define QC_USBH_REPORT_SIZE 129
 
 struct qc_usbh_filter {
 	uint16_t vid;
@@ -83,7 +87,11 @@ int qc_usbh_bridge_start(const struct qc_usbh_filter *filter, const struct qc_us
  *
  * Returns 0 on success, a negative errno otherwise (no device claimed,
  * out of memory, or whatever usbh_req_setup() itself returns - including
- * -ETIMEDOUT).
+ * -ETIMEDOUT). Returns the real transfer result, including -EPIPE: per
+ * PROTOCOL.md §1, this device's SET_REPORT stalls its status stage even on
+ * macOS/Windows reference implementations ("the official app ignores it
+ * too, and the data is still sent. Not an error") - this function doesn't
+ * swallow that quirk itself, callers that care should. See QcSession.hpp.
  */
 int qc_usbh_send_report(const uint8_t *report, size_t len);
 

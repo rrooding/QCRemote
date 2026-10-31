@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cerrno>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -163,9 +164,23 @@ private:
 
         while (chunker.next({report.data(), report.size()})) {
             const int ret = UsbHostClass::sendReport({report.data(), report.size()});
-            if (ret != 0) {
+            if (ret != 0 && ret != -EPIPE) {
                 LOG_ERR("sendReport failed: %d", ret);
                 return false;
+            }
+            if (ret == -EPIPE) {
+                // PROTOCOL.md §1: "macOS quirk: IOHIDDeviceSetReport returns a
+                // benign 0xe0005000 on this device - the official app ignores
+                // it too, and the data is still sent. Not an error." -EPIPE
+                // here is the same thing one layer down: the SET_REPORT
+                // control transfer's status stage reports a stall on this
+                // device even though the data stage completed and the device
+                // acted on it. Confirmed on real hardware (#7): with this in
+                // place the handshake completes and the device immediately
+                // starts streaming its post-connect burst of state reads -
+                // proof the sends landed despite the reported stall.
+                LOG_DBG("sendReport: -EPIPE (documented benign quirk, PROTOCOL.md §1) - "
+                        "continuing");
             }
         }
         return true;

@@ -38,8 +38,7 @@ public:
     }
 
 protected:
-    bool onProbe(uint8_t iface, uint8_t ifaceClass, uint8_t /*ifaceSub*/,
-                uint8_t /*ifaceProto*/) override {
+    bool onProbe(uint8_t iface, uint8_t ifaceClass, uint8_t ifaceSub, uint8_t ifaceProto) override {
         // iface is always kQuadCortexHidInterface here - the shim looks up
         // that specific interface before calling onProbe at all. Still
         // worth checking the class code: a CorOS change moving what's at
@@ -47,7 +46,8 @@ protected:
         if (ifaceClass != kUsbBaseClassHid) {
             return false;
         }
-        LOG_INF("Claimed Quad Cortex Mini HID interface %u", iface);
+        LOG_INF("Claimed Quad Cortex Mini HID interface %u (sub=%u, proto=%u)", iface, ifaceSub,
+                ifaceProto);
         session_.deviceConnected();
         return true;
     }
