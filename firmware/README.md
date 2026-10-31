@@ -343,15 +343,19 @@ ran, was reliably answered for several minutes straight.
 
 ### The tested build differs from this one
 
-The hardware runs described above (handshake mirrors `4.1.1`, `Version` probes answered for
-minutes) were against a build carrying temporary diagnostics on top of the same fixes —
-per-send result logging, a periodic probe read, a recent-messages ring buffer, an IN-transfer
-counter, and `THREAD_ANALYZER` reporting. Those have since been removed now that what they
-were added to determine is settled; the underlying fixes they helped find (heartbeat before
-handshake, the 1000ms `Version`-reply wait, the send mutex) are unchanged. The diagnostics'
-removal is a reasonably mechanical cleanup, but this exact cleaned-up build has not itself
-been re-run on hardware — treat the smoke test below as the thing to actually confirm before
-relying on it.
+The multi-minute hardware run described above (handshake mirrors `4.1.1`, repeated `Version`
+probes answered for several minutes) was against a build carrying temporary diagnostics on
+top of the same fixes — per-send result logging, a periodic probe read, a recent-messages
+ring buffer, an IN-transfer counter, and `THREAD_ANALYZER` reporting. Those were removed in
+the cleaned-up commit (`f8ad423`) now that what they were added to determine is settled; the
+underlying fixes they helped find (heartbeat before handshake, the 1000ms `Version`-reply
+wait, the send mutex) are unchanged.
+
+**Verified on `f8ad423`** against a real Quad Cortex Mini (the smoke test below): boot,
+handshake mirrors `4.1.1` with no `No usable Version reply` warning beforehand, and no
+crash over a couple of minutes. The longer-duration repeated-reads result above is still
+only confirmed on `584e015`, the diagnostics-carrying build, not on this cleaned-up one — a
+heartbeat-off comparison and a preset-change push both remain unconfirmed on either build.
 
 ### Smoke test for this build
 
@@ -404,7 +408,8 @@ still works end-to-end.
 - ETL is wired in via CMake `FetchContent` (see `app/CMakeLists.txt`) but not yet used by
   the main app - only by the HID framing tests above.
 - The KeepAlive heartbeat (issue #8, see above) is implemented, unit-tested, and verified
-  on real hardware for the core behavior - but the final cleaned-up build (diagnostics
-  removed) hasn't itself been re-run; see that section's smoke test before relying on it.
-  A heartbeat-off comparison and a preset-change push are both still unconfirmed (the
-  latter deferred to issue #9).
+  on real hardware: the cleaned-up build (`f8ad423`) passed its smoke test (boot, handshake
+  mirrors `4.1.1`, no fallback warning, no crash over a couple of minutes), and the earlier
+  diagnostics-carrying build (`584e015`) showed repeated reads answered for several minutes
+  under the heartbeat. A heartbeat-off comparison and a preset-change push are both still
+  unconfirmed (the latter deferred to issue #9).
