@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,14 @@ namespace qcbridge {
 // every other command's traffic during the window was invisible. This
 // tallies every message actually handed to QcSession::onMessage()/
 // onInflateFailed() by command id, regardless of what it is, while active.
+//
+// Also tracks, per command, the largest wire size and inflated size seen
+// (issue #33's sizing exercise: QcFileStream.hpp's own maxWireBytes/
+// maxInflatedBytes are useful totals across the whole stream, but #33 needs
+// to know which specific command produced the peak, not just that some
+// command did). record()'s size parameters default to 0 so a caller that
+// only cares about counts (this class's own existing tests) doesn't need to
+// pass them.
 //
 // Plain C++23, no Zephyr dependency - same reasoning as QcFileStream.hpp:
 // trivial to unit-test, and QcSession is what actually calls this under its
@@ -41,6 +50,8 @@ public:
     struct Entry {
         uint16_t command = 0;
         uint32_t count = 0;
+        size_t maxWireBytes = 0;
+        size_t maxInflatedBytes = 0;
     };
 
     void start() {
@@ -53,19 +64,26 @@ public:
     bool isActive() const { return active_; }
 
     // Ignored once stopped - same "don't reopen a finished window" contract
-    // as QcFileStream::onMessage().
-    void record(uint16_t command) {
+    // as QcFileStream::onMessage(). `wireSize`/`inflatedSize` feed the
+    // per-command peak-size tracking (issue #33) - leave at 0 if unknown or
+    // not relevant to the caller (e.g. no decoded size at all).
+    void record(uint16_t command, size_t wireSize = 0, size_t inflatedSize = 0) {
         if (!active_) {
             return;
         }
         for (size_t i = 0; i < entryCount_; ++i) {
             if (entries_[i].command == command) {
                 ++entries_[i].count;
+                entries_[i].maxWireBytes = std::max(entries_[i].maxWireBytes, wireSize);
+                entries_[i].maxInflatedBytes = std::max(entries_[i].maxInflatedBytes, inflatedSize);
                 return;
             }
         }
         if (entryCount_ < entries_.size()) {
-            entries_[entryCount_] = Entry{.command = command, .count = 1};
+            entries_[entryCount_] = Entry{.command = command,
+                                          .count = 1,
+                                          .maxWireBytes = wireSize,
+                                          .maxInflatedBytes = inflatedSize};
             ++entryCount_;
             return;
         }

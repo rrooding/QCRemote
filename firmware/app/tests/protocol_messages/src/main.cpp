@@ -137,6 +137,39 @@ ZTEST(protocol_messages, test_decode_message_too_short_fails)
                   "expected decode to fail on < 8 bytes");
 }
 
+// --- decodeTrailerCommand() (issue #33) -----------------------------------
+
+ZTEST(protocol_messages, test_decode_trailer_command_from_bare_trailer)
+{
+    // Exactly the 8-byte trailer, as HidReassembler::overflowTrailer()
+    // would hand back for an overflowed message - command=0x1234, same as
+    // test_encode_decode_message_round_trip's trailer above.
+    const std::vector<uint8_t> trailer = {0x34, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    const auto command = decodeTrailerCommand({trailer.data(), trailer.size()});
+    zassert_true(command.has_value(), "expected a decoded command");
+    zassert_equal(*command, 0x1234, "command");
+}
+
+ZTEST(protocol_messages, test_decode_trailer_command_from_longer_span_reads_the_last_8_bytes)
+{
+    // A longer span ending in the trailer (e.g. a whole reassembled
+    // message) must read the *last* 8 bytes, same as decodeMessage().
+    etl::vector<uint8_t, 32> out;
+    const std::vector<uint8_t> proto = {0xAA, 0xBB, 0xCC};
+    encodeMessage(out, 7, {proto.data(), proto.size()});
+
+    const auto command = decodeTrailerCommand({out.data(), out.size()});
+    zassert_true(command.has_value(), "expected a decoded command");
+    zassert_equal(*command, 7, "command");
+}
+
+ZTEST(protocol_messages, test_decode_trailer_command_too_short_fails)
+{
+    const std::vector<uint8_t> tooShort(7, 0);
+    zassert_false(decodeTrailerCommand({tooShort.data(), tooShort.size()}).has_value(),
+                  "expected decode to fail on < 8 bytes");
+}
+
 // --- QcHandshakeMessages.hpp ---------------------------------------------
 
 ZTEST(protocol_messages, test_encode_reset_comms_buffers)

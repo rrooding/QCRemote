@@ -7,6 +7,7 @@
 #include "QcFileRequest.hpp"
 #include "QcFileStream.hpp"
 #include "QcMessageTally.hpp"
+#include "QcReassemblyOverflowTally.hpp"
 #include "QcStateReads.hpp"
 
 using namespace qcbridge;
@@ -104,6 +105,42 @@ ZTEST(dispatch_messages, test_file_stream_tracks_max_not_last)
     zassert_true(summary.has_value(), "expected the stream to finish");
     zassert_equal(summary->maxWireBytes, 4096u, "maxWireBytes should track the peak, not the last value");
     zassert_equal(summary->maxInflatedBytes, 16384u, "maxInflatedBytes should track the peak");
+}
+
+ZTEST(dispatch_messages, test_file_stream_inflate_failed_true_size_feeds_max_inflated_bytes)
+{
+    // issue #33: a message that failed to inflate because it was too big
+    // for the output buffer still has a real, known decompressed size
+    // (QcGzip.hpp's peekDecompressedSize(), read off the gzip trailer) -
+    // that must still count toward maxInflatedBytes, otherwise the summary
+    // understates the true peak for exactly the case that matters most for
+    // sizing a bigger buffer.
+    QcFileStream stream;
+    stream.start(0);
+
+    stream.onMessage(10, 100, 100, false);
+    stream.onInflateFailed(20, 2408, 20480);  // too big for kMaxInflatedSize, true size known
+
+    const auto summary = stream.checkTimeout(20 + QcFileStream::kQuietWindowMs);
+    zassert_true(summary.has_value(), "expected the stream to finish");
+    zassert_equal(summary->maxInflatedBytes, 20480u,
+                  "maxInflatedBytes should reflect the failed message's true size");
+    zassert_equal(summary->totalInflatedBytes, 100u,
+                  "totalInflatedBytes should NOT credit a failed inflate's bytes (none were produced)");
+}
+
+ZTEST(dispatch_messages, test_file_stream_inflate_failed_without_true_size_leaves_max_inflated_bytes_alone)
+{
+    QcFileStream stream;
+    stream.start(0);
+
+    stream.onMessage(10, 50, 9000, false);
+    stream.onInflateFailed(20, 75);  // no third argument - true size unknown (e.g. truncated input)
+
+    const auto summary = stream.checkTimeout(20 + QcFileStream::kQuietWindowMs);
+    zassert_true(summary.has_value(), "expected the stream to finish");
+    zassert_equal(summary->maxInflatedBytes, 9000u,
+                  "maxInflatedBytes should be unaffected by an unknown true size");
 }
 
 ZTEST(dispatch_messages, test_file_stream_finishes_once_only)
@@ -212,6 +249,85 @@ ZTEST(dispatch_messages, test_message_tally_overflow_falls_into_other)
                   "entries must stay bounded at kMaxDistinctCommands");
     zassert_equal(tally.entries()[0].count, 2u, "an already-tracked command keeps incrementing");
     zassert_equal(tally.otherCount(), 3u, "every brand-new command past capacity falls into otherCount");
+}
+
+ZTEST(dispatch_messages, test_message_tally_tracks_peak_sizes_per_command)
+{
+    // issue #33: per-command peak wire/inflated size, not just count.
+    QcMessageTally tally;
+    tally.start();
+
+    tally.record(4, 100, 90);
+    tally.record(4, 3946, 3938);  // the peak for command 4
+    tally.record(4, 50, 40);
+    tally.record(15, 2408, 20480);  // a different command's own peak
+
+    const auto entries = tally.entries();
+    zassert_equal(entries.size(), 2u, "expected two distinct commands");
+    zassert_equal(entries[0].command, 4u, "command 4");
+    zassert_equal(entries[0].count, 3u, "command 4 count");
+    zassert_equal(entries[0].maxWireBytes, 3946u,
+                  "command 4 maxWireBytes should track the peak, not the last value");
+    zassert_equal(entries[0].maxInflatedBytes, 3938u, "command 4 maxInflatedBytes should track the peak");
+    zassert_equal(entries[1].command, 15u, "command 15");
+    zassert_equal(entries[1].maxWireBytes, 2408u, "command 15 maxWireBytes");
+    zassert_equal(entries[1].maxInflatedBytes, 20480u, "command 15 maxInflatedBytes");
+}
+
+ZTEST(dispatch_messages, test_message_tally_record_without_sizes_defaults_to_zero)
+{
+    // Existing single-argument record() calls (this suite's own tests
+    // above) must keep compiling and behaving the same way.
+    QcMessageTally tally;
+    tally.start();
+    tally.record(4);
+
+    zassert_equal(tally.entries()[0].maxWireBytes, 0u, "default maxWireBytes");
+    zassert_equal(tally.entries()[0].maxInflatedBytes, 0u, "default maxInflatedBytes");
+}
+
+// --- QcReassemblyOverflowTally.hpp (issue #33) ------------------------------
+
+ZTEST(dispatch_messages, test_reassembly_overflow_tally_counts_and_tracks_max_per_command)
+{
+    QcReassemblyOverflowTally tally;
+
+    tally.record(51, 5000);   // ModelRepo
+    tally.record(51, 12000);  // same command, bigger - should bump the max
+    tally.record(4, 4200);    // File
+
+    std::array<QcReassemblyOverflowTally::Entry, QcReassemblyOverflowTally::kMaxDistinctCommands> entries{};
+    const size_t count = tally.entries(entries);
+
+    zassert_equal(count, 2u, "expected two distinct commands");
+    zassert_equal(entries[0].command, 51u, "first distinct command seen, in order");
+    zassert_equal(entries[0].count, 2u, "command 51 count");
+    zassert_equal(entries[0].maxTrueSize, 12000u,
+                  "command 51 maxTrueSize should track the peak, not the last value");
+    zassert_equal(entries[1].command, 4u, "second distinct command seen, in order");
+    zassert_equal(entries[1].count, 1u, "command 4 count");
+    zassert_equal(entries[1].maxTrueSize, 4200u, "command 4 maxTrueSize");
+    zassert_equal(tally.otherCount(), 0u, "otherCount should stay 0 within capacity");
+}
+
+ZTEST(dispatch_messages, test_reassembly_overflow_tally_overflow_falls_into_other)
+{
+    QcReassemblyOverflowTally tally;
+
+    for (uint16_t command = 0; command < QcReassemblyOverflowTally::kMaxDistinctCommands; ++command) {
+        tally.record(command, 5000);
+    }
+    tally.record(static_cast<uint16_t>(QcReassemblyOverflowTally::kMaxDistinctCommands), 6000);
+    tally.record(static_cast<uint16_t>(QcReassemblyOverflowTally::kMaxDistinctCommands + 1), 9000);
+
+    std::array<QcReassemblyOverflowTally::Entry, QcReassemblyOverflowTally::kMaxDistinctCommands> entries{};
+    const size_t count = tally.entries(entries);
+
+    zassert_equal(count, QcReassemblyOverflowTally::kMaxDistinctCommands,
+                  "entries must stay bounded at kMaxDistinctCommands");
+    zassert_equal(tally.otherCount(), 2u, "every brand-new command past capacity falls into otherCount");
+    zassert_equal(tally.otherMaxTrueSize(), 9000u,
+                  "otherMaxTrueSize should track the peak across the overflow bucket");
 }
 
 // --- QcStateReads.hpp -------------------------------------------------------

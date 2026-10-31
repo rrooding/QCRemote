@@ -103,6 +103,38 @@ ZTEST(gzip_inflate, test_inflate_output_too_large_fails_cleanly)
     zassert_true(result.error() == gzip::InflateError::OutputTooLarge, "expected OutputTooLarge");
 }
 
+// --- peekDecompressedSize() (issue #33) -----------------------------------
+
+ZTEST(gzip_inflate, test_peek_decompressed_size_matches_real_plaintext_size)
+{
+    const auto size = gzip::peekDecompressedSize({kValidGzip.data(), kValidGzip.size()});
+    zassert_true(size.has_value(), "expected a decoded ISIZE");
+    zassert_equal(*size, kPlaintext.size(), "ISIZE should match the real decompressed size");
+}
+
+ZTEST(gzip_inflate, test_peek_decompressed_size_works_even_when_output_is_too_small)
+{
+    // The real point of this function (issue #33: a RecallPreset on real
+    // hardware that was too big for kMaxInflatedSize) - the true size must
+    // still be readable straight from the trailer without decompressing
+    // anything, independent of whatever `output` inflate() was given.
+    std::array<uint8_t, 4> tinyOutput{};
+    const auto result =
+        gzip::inflate({kValidGzip.data(), kValidGzip.size()}, {tinyOutput.data(), tinyOutput.size()});
+    zassert_false(result.has_value(), "expected inflate() itself to still fail");
+
+    const auto size = gzip::peekDecompressedSize({kValidGzip.data(), kValidGzip.size()});
+    zassert_true(size.has_value(), "expected a decoded ISIZE despite the failed inflate");
+    zassert_equal(*size, kPlaintext.size(), "ISIZE should match the real decompressed size");
+}
+
+ZTEST(gzip_inflate, test_peek_decompressed_size_too_short_fails)
+{
+    const std::array<uint8_t, 4> tooShort{};
+    zassert_false(gzip::peekDecompressedSize({tooShort.data(), tooShort.size()}).has_value(),
+                  "expected failure on fewer than 8 bytes");
+}
+
 // --- inflate(): truncated input ------------------------------------------
 
 ZTEST(gzip_inflate, test_inflate_truncated_input_fails_cleanly)

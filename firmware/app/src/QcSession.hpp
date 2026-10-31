@@ -23,6 +23,7 @@
 #include "QcMessage.hpp"
 #include "QcMessageSink.hpp"
 #include "QcMessageTally.hpp"
+#include "QcReassemblyOverflowTally.hpp"
 #include "QcStateReads.hpp"
 #include "ScopedKMutex.hpp"
 #include "UsbHostClass.hpp"
@@ -136,39 +137,47 @@ public:
         // messageTally_ records every command, not just File - see its own
         // header comment (issue #60's hardware debugging: a run with zero
         // File messages couldn't otherwise tell "the device sent nothing"
-        // apart from "the device sent something else").
+        // apart from "the device sent something else"). wireSize/
+        // inflatedSize feed its per-command peak-size tracking (issue #33).
         ScopedKMutex lock(fileStreamMutex_);
-        messageTally_.record(command);
-        postStreamTally_.record(command);
+        messageTally_.record(command, wireSize, inflatedSize);
+        postStreamTally_.record(command, wireSize, inflatedSize);
         if (command == kCommandFile) {
             fileStream_.onMessage(k_uptime_get(), wireSize, inflatedSize, compressed);
         }
     }
 
-    void onInflateFailed(uint16_t command, size_t wireSize, const char* reason) override {
+    void onInflateFailed(uint16_t command, size_t wireSize, const char* reason,
+                          std::optional<size_t> trueInflatedSize) override {
         if (command == kCommandFile) {
             LOG_WRN("File message failed to inflate (wire=%zu bytes): %s", wireSize, reason);
         }
 
         ScopedKMutex lock(fileStreamMutex_);
-        messageTally_.record(command);
-        postStreamTally_.record(command);
+        messageTally_.record(command, wireSize, trueInflatedSize.value_or(0));
+        postStreamTally_.record(command, wireSize, trueInflatedSize.value_or(0));
         if (command == kCommandFile) {
-            fileStream_.onInflateFailed(k_uptime_get(), wireSize);
+            fileStream_.onInflateFailed(k_uptime_get(), wireSize, trueInflatedSize);
         }
     }
 
     // Called from QcHidBridge::onReportIn() on the `usbh` thread for
-    // HidReassembler::Status::Overflow/Malformed (issue #60's
-    // hardware-safety follow-up) - atomic increment only, same contract as
-    // handleMessage() above: no logging, nothing that can block. These
-    // drops happen before a command id is even known, so they can't be
-    // attributed to the File stream specifically the way
-    // dispatcher_/gzipInflater_'s drops can - see QcFileStream::Summary's
-    // comment on reassemblyOverflowCount/reassemblyMalformedCount for why
-    // they're still folded into that summary anyway, as a best-effort
-    // "this happened somewhere during the stream" figure.
-    void recordReassemblyOverflow() { reassemblyOverflowCount_.fetch_add(1, std::memory_order_relaxed); }
+    // HidReassembler::Status::Overflow (issue #60's hardware-safety
+    // follow-up, extended by issue #33) - atomic increment only, same
+    // contract as handleMessage() above: no logging, nothing that can
+    // block. The plain lifetime count (reassemblyOverflowCount_) can't be
+    // attributed to the File stream specifically by itself - see
+    // QcFileStream::Summary's comment on reassemblyOverflowCount for why
+    // it's still folded into that summary anyway, as a best-effort "this
+    // happened somewhere during the stream" figure. `command` (decoded from
+    // the message's surviving trailer - see QcHidBridge.hpp's Overflow
+    // case) and `trueSize` additionally feed reassemblyOverflowByCommand_,
+    // which is what #33's sizing exercise actually needs: not just how
+    // often this happens, but which command(s) and how big they really are.
+    void recordReassemblyOverflow(uint16_t command, size_t trueSize) {
+        reassemblyOverflowCount_.fetch_add(1, std::memory_order_relaxed);
+        reassemblyOverflowByCommand_.record(command, trueSize);
+    }
     void recordReassemblyMalformed() { reassemblyMalformedCount_.fetch_add(1, std::memory_order_relaxed); }
 
     // Called from QcHidBridge::onReportIn() on the `usbh` thread for every
@@ -513,13 +522,47 @@ private:
                     LOG_INF("File stream tally: no messages of any command seen in this window");
                 } else {
                     for (size_t i = 0; i < tallyEntryCount; ++i) {
-                        LOG_INF("File stream tally: command=%u count=%u", tallyEntries[i].command,
-                                tallyEntries[i].count);
+                        // max_wire/max_inflated (issue #33): the peak sizes
+                        // this specific command produced among messages
+                        // that fit - QcFileStream's own maxWireBytes/
+                        // maxInflatedBytes above are the peak across every
+                        // command, this is the per-command breakdown #33's
+                        // sizing exercise needs.
+                        LOG_INF("File stream tally: command=%u count=%u max_wire=%zu max_inflated=%zu",
+                                tallyEntries[i].command, tallyEntries[i].count,
+                                tallyEntries[i].maxWireBytes, tallyEntries[i].maxInflatedBytes);
                     }
                     if (tallyOtherCount > 0) {
                         LOG_INF("File stream tally: %u messages from other distinct commands "
                                 "(> %zu tracked)",
                                 tallyOtherCount, QcMessageTally::kMaxDistinctCommands);
+                    }
+                }
+
+                // issue #33: which command(s) actually overflowed
+                // kReassemblyCapacity, and how big they really were -
+                // lifetime counts (see QcReassemblyOverflowTally.hpp), not
+                // diffed to this stream's window like the plain overflow
+                // count above, but this firmware only ever runs one File
+                // stream per connect, so that distinction doesn't matter in
+                // practice.
+                std::array<QcReassemblyOverflowTally::Entry, QcReassemblyOverflowTally::kMaxDistinctCommands>
+                    overflowEntries{};
+                const size_t overflowEntryCount = reassemblyOverflowByCommand_.entries(overflowEntries);
+                const uint32_t overflowOtherCount = reassemblyOverflowByCommand_.otherCount();
+                if (overflowEntryCount == 0 && overflowOtherCount == 0) {
+                    LOG_INF("File stream overflow by command: none");
+                } else {
+                    for (size_t i = 0; i < overflowEntryCount; ++i) {
+                        LOG_INF("File stream overflow by command: command=%u count=%u max_true_size=%u",
+                                overflowEntries[i].command, overflowEntries[i].count,
+                                overflowEntries[i].maxTrueSize);
+                    }
+                    if (overflowOtherCount > 0) {
+                        LOG_INF("File stream overflow by command: %u overflow(s) from other distinct "
+                                "commands (> %zu tracked), largest true size %u",
+                                overflowOtherCount, QcReassemblyOverflowTally::kMaxDistinctCommands,
+                                reassemblyOverflowByCommand_.otherMaxTrueSize());
                     }
                 }
                 LOG_INF("Post-connect tally started: watching for preset-change pushes "
@@ -607,6 +650,10 @@ private:
     // *AtStart_ below to scope a summary to one stream.
     std::atomic<uint32_t> reassemblyOverflowCount_{0};
     std::atomic<uint32_t> reassemblyMalformedCount_{0};
+
+    // Per-command breakdown of reassemblyOverflowCount_ above (issue #33) -
+    // own lock-free contract, see QcReassemblyOverflowTally.hpp.
+    QcReassemblyOverflowTally reassemblyOverflowByCommand_;
 
     // Written from QcHidBridge::onReportIn() on the `usbh` thread (atomic
     // increment only, same contract as the two above) - one per successful

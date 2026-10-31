@@ -676,6 +676,122 @@ What a few of the summary fields mean, for issue #33's sizing work:
   thread's name appears in the dump (`qc_dispatch`, `qc_gzip_inflate`, `qc_session`,
   `qc_heartbeat`, or `usbh` itself).
 
+## Reassembly/inflate overflow sizing, step 1: measurement (issue #33)
+
+Issue #33 predates ADR 0003/0004 and issue #6: there are no nanopb buffers to size (this
+project uses a hand-written codec - see the issue's latest comment), and the real placeholders
+needing real numbers are `kReassemblyCapacity` (4096, `QcHidBridge.hpp`) and `kMaxInflatedSize`
+(16384, `QcGzip.hpp`). The #60/#61 hardware run above measured both as too small for real
+traffic - `reassembly (overflow=31 malformed=2850)` out of 8843 IN transfers, and a later run
+(commit `f0a4939`) hit `kMaxInflatedSize` too: a compressed `RecallPreset` (command 15, 2408
+compressed bytes) failed with `OutputTooLarge`. Which command(s) were involved, and how big
+they really are, was unknown either time - **this is step 1: measure that, by command, without
+choosing new sizes yet.** Step 2 (picking real sizes from that data, and deciding whether a very
+large message type like `ModelRepo` should be ignored outright rather than buffered) is a
+separate, later change - `kReassemblyCapacity`/`kMaxInflatedSize` are unchanged by this one.
+
+**`HidReassembler::Status::Overflow` no longer aborts the moment Capacity is exceeded.** Before
+this change, the first report that pushed a message over Capacity reset the reassembler
+immediately and returned `Overflow`, discarding all knowledge of the message - every later
+MIDDLE/LAST report belonging to it then had no preceding FIRST and miscounted as a *second,
+unrelated* `Malformed`. This is almost certainly the real explanation for `malformed=2850`
+above (2850 is close to what a handful of these ~4000-byte-overflowing messages' remaining
+reports would add up to). Now `HidReassembler` keeps consuming reports for an overflowing
+message - without growing the stored body past `Capacity` - until its LAST/SINGLE report
+arrives, tracking the message's true total size (`overflowSize()`) and retaining only its last
+8 bytes (`overflowTrailer()`). Those last 8 bytes are always `QcMessage.hpp`'s message trailer
+(`[command][reserved][hash]`, always the final bytes of a message), so
+`decodeTrailerCommand()` (`QcMessage.hpp`) can still say which command overflowed even though
+its body was dropped. New Ztest cases in `tests/hid_framing` cover the overflow-then-complete
+sequence, the true size/trailer it reports, resync on the next FIRST, a malformed report
+arriving mid-overflow, and that continuation reports after an overflow are no longer
+`Malformed`.
+
+**Per-command reporting, added to the File stream's summary:**
+
+- `QcHidBridge::onReportIn()`'s `Overflow` case now decodes the command from `overflowTrailer()`
+  and calls `QcSession::recordReassemblyOverflow(command, trueSize)` - still atomic-increment-only,
+  no logging, same `usbh`-thread safety contract as before (see that function's comment: this
+  thread's 1536-byte stack with `CONFIG_LOG_MODE_IMMEDIATE` means an enabled log level really
+  does run `cbprintf` formatting synchronously on it - the exact pattern that crashed real
+  hardware once already, issue #8). The per-command breakdown lands in a new, lock-free
+  `QcReassemblyOverflowTally` (`QcReassemblyOverflowTally.hpp`) - plain C++23, `std::atomic`
+  only, no mutex, since `usbh` is the sole writer and the only safety requirement is that the
+  heartbeat thread's read doesn't race it.
+- `QcMessageTally.hpp`'s `Entry` gained `maxWireBytes`/`maxInflatedBytes`, and `record()` takes
+  optional wire/inflated sizes - so the existing per-command tally (`messageTally_`, scoped to
+  one File stream) now also reports each command's own peak sizes, not just its count.
+- A message that fails to inflate because it's too big for `kMaxInflatedSize`
+  (`gzip::InflateError::OutputTooLarge`) still has a real, known decompressed size: gzip's own
+  trailer carries it (the ISIZE field, RFC 1952) at a fixed offset from the *end* of the
+  compressed bytes, readable without finishing - or even attempting - decompression. New
+  `gzip::peekDecompressedSize()` (`QcGzip.hpp`) reads it directly; `QcGzipInflater.hpp` calls it
+  on every inflate failure and passes the result through `QcMessageSink::onInflateFailed()`'s
+  new `trueInflatedSize` parameter, which `QcSession` folds into both `messageTally_`'s
+  per-command `maxInflatedBytes` and `QcFileStream`'s own summary-wide `maxInflatedBytes` - so a
+  `RecallPreset` that was too big to actually inflate still shows its true size in both places,
+  not just a `failedCount` bump with no size attached.
+
+**What the stream-finish log block now looks like** (new lines in **bold**, relative to the
+#60/#61 section above):
+
+```
+File stream finished (quiet): N messages (C compressed, F failed), W wire bytes, I inflated bytes, E ms
+File stream limits: max wire=MW max inflated=MI, dropped (dispatch=DD gzip=DG), reassembly (overflow=RO malformed=RM)
+File stream tally: T total IN transfers
+File stream tally: command=CMD count=CNT max_wire=MWC max_inflated=MIC   (one line per distinct command, or "no messages of any command seen in this window")
+File stream overflow by command: command=CMD count=CNT max_true_size=MTS   (one line per command that ever overflowed, or "none")
+Post-connect tally started: watching for preset-change pushes (RecallPreset/Scene/SetlistPosition/...) - issue #61
+```
+
+`max_wire`/`max_inflated` on the per-command tally line are that *specific* command's own peak
+sizes (`MW`/`MI` on the line above remain the peak across every command, unchanged). The new
+overflow-by-command line(s) are lifetime counts, not diffed to this one stream's window the way
+`RO`/`RM` are - this firmware does one connect per boot, so since-boot and since-this-stream are
+the same thing in practice, and it wasn't worth a second, atomics-only snapshot-and-diff scheme
+for a count this rare (31 across a whole connect's ~8800 IN transfers). If `File stream overflow
+by command` ever shows `> 16 tracked` falling into "other distinct commands", that's worth a
+comment on #33 before trusting the per-command numbers - 16 is sized for "a handful of large
+commands overflow," not an arbitrary count.
+
+**Hardware test - run this on the next flash:**
+
+1. Flash this build and let the handshake, state READs, and File stream run exactly as the
+   #60/#61 smoke test above describes.
+2. Paste back the full stream-finish log block above, including the new `File stream overflow
+   by command: ...` line(s).
+3. If a preset change pushes a compressed message that's too big to inflate (the `f0a4939`
+   hardware run's `RecallPreset` case), paste the `Inflate failed for command ...` line too - it
+   now includes `true inflated size NNNN` when the trailer was readable.
+
+**What each outcome means:**
+
+- **`File stream overflow by command` lists one or more real commands (e.g. `command=51
+  count=1 max_true_size=XXXXX`)**: that command's true size is now known - #33's step 2 can size
+  `kReassemblyCapacity` to it directly (or decide to deliberately exclude that command instead,
+  if its true size is large enough that buffering it outright isn't worth the RAM - the
+  `ModelRepo` case the issue flags).
+- **`File stream overflow by command: none` but `RO` (reassembly overflow count) above is still
+  > 0**: a real discrepancy - the per-command tracking missed something the plain counter saw.
+  Worth a comment on #33 rather than trusting either number blindly; likely a bug in this PR's
+  bookkeeping, not a hardware fluke.
+- **Every per-command `max_wire`/`max_inflated` line this run is comfortably under
+  `kReassemblyCapacity`/`kMaxInflatedSize`, and `File stream overflow by command: none`**: the
+  31/2850 result from the `0d1edcc` hardware run didn't reproduce on this build. Worth noting
+  explicitly either way (don't assume it was fixed by this PR - this PR doesn't change
+  `kReassemblyCapacity`, so a disappearance would be a hardware/timing difference between runs,
+  not this change).
+- **`Inflate failed for command ... true inflated size NNNN`**: that command's real decompressed
+  size, even though decompression itself failed - directly feeds `kMaxInflatedSize`'s step-2
+  sizing the same way an overflow's `max_true_size` feeds `kReassemblyCapacity`'s.
+- **No `Inflate failed` line at all this run**: either nothing this run needed decompression
+  past `kMaxInflatedSize`, or (less likely, given the `f0a4939` result) that result doesn't
+  reproduce - note which, don't assume silence means fixed.
+
+**Not verified on real hardware** - this PR adds measurement only; no hardware run has been
+done against this build. The `0d1edcc`/`f0a4939` numbers quoted above are from the owner's
+prior runs, documented in issue #33 and the #60/#61 section above, not reproduced here.
+
 ## Not yet done
 
 - ETL is wired in via CMake `FetchContent` (see `app/CMakeLists.txt`) but not yet used by

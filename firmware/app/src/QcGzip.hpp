@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <span>
 
 #include <miniz.h>
@@ -259,6 +260,32 @@ inline std::expected<std::span<const uint8_t>, InflateError> inflate(std::span<c
     }
 
     return decompressed;
+}
+
+// Reads the gzip trailer's ISIZE field (RFC 1952: the last 4 of the
+// member's last 8 bytes, little-endian, the uncompressed size modulo 2^32)
+// directly from the compressed bytes, without running tinfl at all. The
+// trailer sits at a fixed offset from the *end* of a gzip member
+// regardless of header length (FEXTRA/FNAME/FCOMMENT don't move it), so
+// this works even when inflate() above fails with OutputTooLarge - issue
+// #33's measurement needs the true decompressed size of a message that's
+// too big for `output` to size a buffer for real, and this is the cheap
+// way to get it without decompressing anything. Real hardware hit exactly
+// this case: a `RecallPreset` whose compressed size (2408 bytes) implied
+// an inflated size past kMaxInflatedSize.
+//
+// std::nullopt if `gzipped` is too short to even hold a trailer - callers
+// already holding a hasMagic()'d, reassembled message (the only way
+// inflate() gets called at all) always have enough bytes here in
+// practice. Doesn't itself check hasMagic()/the header - a caller already
+// knows that by construction (same contract as inflate() above).
+inline std::optional<uint32_t> peekDecompressedSize(std::span<const uint8_t> gzipped) {
+    constexpr size_t kTrailerSize = 8;
+    if (gzipped.size() < kTrailerSize) {
+        return std::nullopt;
+    }
+    const auto trailer = gzipped.last(kTrailerSize);
+    return detail::readLE32(trailer.subspan<4, 4>());
 }
 
 }  // namespace qcbridge::gzip

@@ -7,6 +7,8 @@
 #include <zephyr/logging/log.h>
 
 #include "HidReassembler.hpp"
+#include "QcMessage.hpp"
+#include "QcReassemblyOverflowTally.hpp"
 #include "QcSession.hpp"
 #include "UsbHostClass.hpp"
 
@@ -75,20 +77,32 @@ protected:
             session_.handleMessage(message);
             break;
         }
-        case Status::Overflow:
+        case Status::Overflow: {
             // No LOG_WRN here (issue #60's hardware-safety follow-up): this
             // runs on the `usbh` thread, where CONFIG_LOG_MODE_IMMEDIATE
             // means an *enabled* log level (unlike the LOG_DBG above, which
             // is filtered out at the default level and so never actually
             // formats) really does run cbprintf synchronously on that
             // 1536-byte stack - the exact pattern that overflowed it once
-            // already (see QcSession.hpp's handleMessage() comment). An
-            // atomic counter costs nothing there; session_.recordReassemblyOverflow()
-            // surfaces the count through QcFileStream's summary instead
-            // (the known gap documented in firmware/README.md's issue #60
+            // already (see QcSession.hpp's handleMessage() comment). Atomic
+            // counters cost nothing there; session_.recordReassemblyOverflow()
+            // surfaces them through QcFileStream's summary instead (the
+            // known gap documented in firmware/README.md's issue #60
             // section).
-            session_.recordReassemblyOverflow();
+            //
+            // issue #33's measurement step: the message's body is gone,
+            // but HidReassembler kept its trailer (overflowTrailer()) -
+            // decoding just the command id out of that (decodeTrailerCommand(),
+            // a plain memory read, no heavier than the trailer decode
+            // handleMessage() already does for a message that fits) is
+            // what lets the by-command overflow report below say *which*
+            // command(s) are actually too big for kReassemblyCapacity,
+            // instead of only a lifetime total.
+            const auto decodedCommand = decodeTrailerCommand(reassembler_.overflowTrailer());
+            const uint16_t command = decodedCommand.value_or(QcReassemblyOverflowTally::kUnknownCommand);
+            session_.recordReassemblyOverflow(command, reassembler_.overflowSize());
             break;
+        }
         case Status::Malformed:
             session_.recordReassemblyMalformed();
             break;

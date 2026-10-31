@@ -135,15 +135,30 @@ private:
                     sink_->onMessage(mailboxCommand_, *result, mailboxWireSize_, result->size(), true);
                 }
             } else {
+                // issue #33: the gzip trailer's ISIZE field gives the true
+                // decompressed size without needing to finish decompressing -
+                // in particular, always recoverable for OutputTooLarge, the
+                // exact case that needs it (a message too big for
+                // kMaxInflatedSize still has an intact trailer; only
+                // Truncated input can leave this std::nullopt).
+                const auto trueInflatedSize = gzip::peekDecompressedSize({mailbox_.data(), mailboxLen_});
+
                 // Named, not just the raw enum value, so the first real
                 // compressed message that fails shows up in a log as
                 // e.g. "CrcMismatch" rather than an opaque "error 5" -
                 // see ADR 0005's note on qc-mcp's gunzip() fallback for
                 // why a failure here needs to be obvious, not silent.
-                LOG_WRN("Inflate failed for command %u (%zu compressed bytes): %s", mailboxCommand_, mailboxLen_,
-                        gzip::toString(result.error()));
+                if (trueInflatedSize) {
+                    LOG_WRN("Inflate failed for command %u (%zu compressed bytes, true inflated size "
+                            "%u): %s",
+                            mailboxCommand_, mailboxLen_, *trueInflatedSize, gzip::toString(result.error()));
+                } else {
+                    LOG_WRN("Inflate failed for command %u (%zu compressed bytes): %s", mailboxCommand_,
+                            mailboxLen_, gzip::toString(result.error()));
+                }
                 if (sink_ != nullptr) {
-                    sink_->onInflateFailed(mailboxCommand_, mailboxWireSize_, gzip::toString(result.error()));
+                    sink_->onInflateFailed(mailboxCommand_, mailboxWireSize_, gzip::toString(result.error()),
+                                           trueInflatedSize);
                 }
             }
 
