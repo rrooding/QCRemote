@@ -14,6 +14,8 @@
 
 #include "HidChunker.hpp"
 #include "HidReassembler.hpp"
+#include "QcGzip.hpp"
+#include "QcGzipInflater.hpp"
 #include "QcHandshakeMessages.hpp"
 #include "QcMessage.hpp"
 #include "ScopedKMutex.hpp"
@@ -62,6 +64,7 @@ public:
             k_thread_name_set(&thread_, "qc_session");
             threadStarted_ = true;
         }
+        gzipInflater_.start();
         k_sem_give(&deviceReadySem_);
     }
 
@@ -70,17 +73,25 @@ public:
     // handshake right now; everything else is dropped - general dispatch
     // is issue #5 Tier 2 work, not this issue's.
     //
-    // Deliberately does no logging of its own. A diagnostic LOG_INF added
-    // here during issue #8's hardware debugging crashed real hardware with
-    // a stack overflow: this runs on Zephyr's own internal `usbh` thread
-    // (CONFIG_USBH_STACK_SIZE), not one of ours, and CONFIG_LOG_MODE_IMMEDIATE
-    // means a log call's cbprintf formatting runs synchronously on the
-    // calling thread's own stack. Keep this function free of logging (and
-    // of anything else with real stack depth) rather than re-deriving that
-    // the hard way again.
+    // Deliberately does no logging of its own, and does not inflate a
+    // gzip-compressed protoBytes in place - only detects it (issue #6: any
+    // command's protobuf may be gzip'd, generically, not just ModelRepo's).
+    // A diagnostic LOG_INF added here during issue #8's hardware debugging
+    // crashed real hardware with a stack overflow: this runs on Zephyr's
+    // own internal `usbh` thread (CONFIG_USBH_STACK_SIZE), not one of ours,
+    // and CONFIG_LOG_MODE_IMMEDIATE means a log call's cbprintf formatting
+    // runs synchronously on the calling thread's own stack. Keep this
+    // function free of logging and of real inflate work (see
+    // QcGzipInflater.hpp for why that includes gzip::inflate()) rather than
+    // re-deriving that the hard way again.
     void handleMessage(std::span<const uint8_t> message) {
         const auto decoded = decodeMessage(message);
         if (!decoded) {
+            return;
+        }
+
+        if (gzip::hasMagic(decoded->protoBytes)) {
+            gzipInflater_.submit(decoded->command, decoded->protoBytes);
             return;
         }
 
@@ -298,6 +309,8 @@ private:
     std::atomic<bool> waitingForVersionReply_{false};
     std::optional<VersionReply> pendingVersionReply_;
     uint64_t requestIdCounter_ = 0;
+
+    QcGzipInflater gzipInflater_;
 };
 
 }  // namespace qcbridge

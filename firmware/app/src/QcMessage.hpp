@@ -39,8 +39,9 @@ struct DecodedMessage {
 // Splits a reassembled HID message into its protobuf payload and trailer.
 // Does NOT gunzip - Tier 1 messages (issue #7's handshake) are never
 // compressed. A caller that might receive a gzip'd payload (issue #6, e.g.
-// ModelRepo) needs to inflate protoBytes itself before treating it as plain
-// protobuf.
+// ModelRepo) needs to check QcGzip.hpp's hasMagic()/inflate() itself before
+// treating protoBytes as plain protobuf - see QcSession::handleMessage() and
+// QcGzipInflater.hpp for why that inflate step can't just happen in here.
 inline std::optional<DecodedMessage> decodeMessage(std::span<const uint8_t> fullMessage) {
     if (fullMessage.size() < kMessageTrailerSize) {
         return std::nullopt;
