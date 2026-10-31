@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cerrno>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -90,7 +91,18 @@ public:
             k_sem_give(&versionReplySem_);
         } else if (waitingForVersionReply_.load()) {
             // Stash only - see runHandshake() for why this is reported from
-            // the handshake thread instead of logged right here.
+            // the handshake thread instead of logged right here. Snapshot
+            // a few proto bytes too (plain memcpy, no formatting) so the
+            // next hardware report can show whether this is a real
+            // ResetCommsBuffers ack (e.g. an echoed session_id) or an
+            // unrelated/unsolicited message that merely happens to share
+            // its command id - undecidable from command id and length
+            // alone (see firmware/README.md's KeepAlive section).
+            const size_t snapshotLen =
+                decoded->protoBytes.size() < kUnexpectedSnapshotSize ? decoded->protoBytes.size()
+                                                                     : kUnexpectedSnapshotSize;
+            std::memcpy(lastUnexpectedSnapshot_, decoded->protoBytes.data(), snapshotLen);
+            lastUnexpectedSnapshotLen_ = snapshotLen;
             lastUnexpectedCommand_.store(decoded->command);
             lastUnexpectedSize_.store(message.size());
             hasUnexpectedMessage_.store(true);
@@ -152,10 +164,25 @@ private:
     }
 
     void runHandshake() {
+        // Starts the heartbeat FIRST, before any handshake message - matching
+        // qc-mcp's own transport.py::open() exactly (`_start_heartbeat()`
+        // then `_handshake()`, with the comment "keep session online
+        // (required for reads)" on the heartbeat call). Our original
+        // ordering did this backwards (heartbeat only after the full
+        // handshake completed), discovered while investigating issue #8's
+        // hardware report that Version READ never got a reply even though
+        // PROTOCOL.md says Version is answered "from any session" - that
+        // claim may only hold once something is already keeping the
+        // session alive, which nothing was yet under the old ordering.
+        startHeartbeat();
+
         HandshakeMessageBuffer msg;
 
         encodeResetCommsBuffers(msg, kSessionId);
-        if (!sendMessage(msg)) {
+        const bool sentReset = sendMessage(msg);
+        LOG_INF("Handshake: ResetCommsBuffers send ok=%d last ret=%d", sentReset,
+                lastSendReportRet_);
+        if (!sentReset) {
             LOG_ERR("Handshake: failed to send ResetCommsBuffers");
             return;
         }
@@ -166,6 +193,7 @@ private:
         hasUnexpectedMessage_.store(false);
         waitingForVersionReply_.store(true);
         const bool sent = sendMessage(msg);
+        LOG_INF("Handshake: Version READ send ok=%d last ret=%d", sent, lastSendReportRet_);
         const bool gotReply = sent && k_sem_take(&versionReplySem_, kVersionReplyTimeout) == 0;
         waitingForVersionReply_.store(false);
 
@@ -188,6 +216,8 @@ private:
         if (hasUnexpectedMessage_.load()) {
             LOG_INF("Message while awaiting Version reply: command=%u, %zu bytes",
                     lastUnexpectedCommand_.load(), lastUnexpectedSize_.load());
+            LOG_HEXDUMP_INF(lastUnexpectedSnapshot_, lastUnexpectedSnapshotLen_,
+                             "unexpected message proto bytes (truncated)");
         }
 
         FirmwareVersionString mirroredVersion;
@@ -206,20 +236,25 @@ private:
         msg.clear();
         encodeVersionUpdate(msg, std::string_view(mirroredVersion.data(), mirroredVersion.size()),
                             nextRequestId());
-        if (!sendMessage(msg)) {
+        const bool sentVersionUpdate = sendMessage(msg);
+        LOG_INF("Handshake: Version UPDATE send ok=%d last ret=%d", sentVersionUpdate,
+                lastSendReportRet_);
+        if (!sentVersionUpdate) {
             LOG_ERR("Handshake: failed to send Version UPDATE");
             return;
         }
 
         msg.clear();
         encodeConnection(msg, true, nextRequestId());
-        if (!sendMessage(msg)) {
+        const bool sentConnection = sendMessage(msg);
+        LOG_INF("Handshake: Connection UPDATE send ok=%d last ret=%d", sentConnection,
+                lastSendReportRet_);
+        if (!sentConnection) {
             LOG_ERR("Handshake: failed to send Connection UPDATE");
             return;
         }
 
         LOG_INF("Session handshake complete (firmware version: %s)", mirroredVersion.c_str());
-        startHeartbeat();
     }
 
     // Starts (or restarts, on a reconnect) the ~200ms KeepAlive heartbeat
@@ -228,7 +263,8 @@ private:
     // semaphore from heartbeatTimerExpiryTrampoline(), never sends directly
     // - k_timer expiry functions run in interrupt-adjacent context, where a
     // blocking SET_REPORT send is forbidden (CODING_STANDARDS.md's ISR
-    // safety rules).
+    // safety rules). Called from runHandshake() before any handshake
+    // message now, not after - see that function's comment.
     void startHeartbeat() {
         if (!heartbeatThreadStarted_) {
             k_thread_create(&heartbeatThread_, heartbeatStack_, K_KERNEL_STACK_SIZEOF(heartbeatStack_),
@@ -277,12 +313,35 @@ private:
             // every ~200ms contending with it is exactly the kind of thing
             // this is meant to catch.
             if (++heartbeatSendCount_ % kHeartbeatLogInterval == 0) {
+                const bool probeReplied = probeVersionRead();
                 LOG_INF("KeepAlive heartbeat alive: %u sent, last sendReport ret=%d, "
-                        "%u IN transfers, %u late Version replies",
+                        "%u IN transfers, %u late Version replies, probe read replied=%d",
                         heartbeatSendCount_, lastSendReportRet_, UsbHostClass::inTransferCount(),
-                        lateVersionReplyCount_.load());
+                        lateVersionReplyCount_.load(), probeReplied);
             }
         }
+    }
+
+    // Sends a Version READ and waits for a reply, same as the handshake's
+    // own Version READ step - a direct test of "does a read get answered
+    // while the heartbeat is running," the exact question issue #8's
+    // hardware investigation needs settled (qc-mcp's own control check
+    // confirmed reads work under *its* heartbeat; this checks ours the
+    // same way). Reuses the handshake's wait/reply plumbing - safe because
+    // this only ever runs after the handshake thread's own one-time use of
+    // it has already finished (startHeartbeat() happens before the
+    // handshake's sends now, but the heartbeat thread doesn't reach its
+    // first kHeartbeatLogInterval tick - several seconds in - until long
+    // after runHandshake() has returned from its own wait).
+    bool probeVersionRead() {
+        HandshakeMessageBuffer msg;
+        encodeVersionRead(msg);
+        pendingVersionReply_.reset();
+        waitingForVersionReply_.store(true);
+        const bool sent = sendMessage(msg);
+        const bool gotReply = sent && k_sem_take(&versionReplySem_, kVersionReplyTimeout) == 0;
+        waitingForVersionReply_.store(false);
+        return gotReply;
     }
 
     // Shared by the handshake thread and the heartbeat thread - sendMutex_
@@ -365,6 +424,12 @@ private:
     std::atomic<bool> hasUnexpectedMessage_{false};
     std::atomic<uint16_t> lastUnexpectedCommand_{0};
     std::atomic<size_t> lastUnexpectedSize_{0};
+    // Plain (non-atomic) snapshot bytes - safe because hasUnexpectedMessage_
+    // is written last on the producer side and checked first on the
+    // consumer side, so its seq_cst store/load pair acts as the handoff.
+    static constexpr size_t kUnexpectedSnapshotSize = 16;
+    uint8_t lastUnexpectedSnapshot_[kUnexpectedSnapshotSize] = {};
+    size_t lastUnexpectedSnapshotLen_ = 0;
 
     // Written from handleMessage() (usbh thread), read from runHeartbeat()
     // (heartbeat thread) - see handleMessage() for what this counts.

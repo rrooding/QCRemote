@@ -487,9 +487,57 @@ and the `KeepAlive`/`Version` field numbers all line up against `protocol.py`/
 `ProductionAutomation.proto`. The `SET_REPORT` setup packet
 (`bmRequestType=0x21, bRequest=0x09, wValue=0x0202, wLength=129`) is also textbook-correct
 per the HID 1.11 spec and matches the device's own report descriptor decoded in #7's
-section above. **Nothing wrong was found in the bytes themselves** - which, combined with
-everything else this round, shifts the weight toward "the control transfer genuinely isn't
-landing" over "we're sending something subtly wrong."
+section above. **Nothing wrong was found in the bytes themselves.**
+
+**Correction to this section's first draft**: that byte-match result doesn't actually
+settle "the transfer isn't landing" over "we're sending something wrong" the way it was
+first written here - there's real counter-evidence against "nothing we send ever lands,"
+and it needs weighing honestly rather than filed away. The 41-byte/command-`52` message
+arrived essentially right after the *first* handshake send (`ResetCommsBuffers`, also
+command `52`), and the 331/10/14-byte burst arrived ~140ms after the *fourth*
+(`Connection` UPDATE) completed. If either of those is actually a response triggered by
+our own send landing, then "`SET_REPORT` never lands" can't be the whole story - at least
+one, probably two, of our four handshake sends would have worked. Two things are **not**
+yet checked that would settle this:
+
+- **Whether command `52` coming back is really a reply to our `ResetCommsBuffersMessage`,
+  or an unsolicited one of the device's own.** Nothing here decodes or logs the actual
+  bytes of that 41-byte message beyond its command id and length, so there's no way yet to
+  tell "echoes our `session_id`/`request_id` back" (a real ack) from "the device's own,
+  unrelated `ResetCommsBuffersMessage` push, coincidentally the same command id since
+  request and reply share one message type per `PROTOCOL.md` §4."
+- **Whether the burst's timing is actually caused by `Connection` landing, or just by a
+  fixed post-enumeration delay from the device itself**, independent of anything sent to
+  it. The ~140ms-after-heartbeat-started figure is equally consistent with "device finishes
+  its own boot-adjacent-to-this-device burst ~700ms after being claimed at the USB level,
+  regardless of what arrived over `SET_REPORT` in between" - the single trace available
+  can't distinguish these from timing alone.
+
+So, candidate explanations for "handshake sends *appear* to work while `Version READ` and
+every `KeepAlive` show no visible effect at all" - genuinely open, not concluded:
+
+1. **Ordering/session-state**: the device accepts an initial sequence
+   (`ResetCommsBuffers`, maybe `Connection`) but something about its own session state
+   machine stops accepting/answering after that point - `Version READ` and `KeepAlive`
+   specifically failing while the bookend messages work would need some such stateful
+   explanation, not just "sends fail randomly."
+2. **Timing margin specific to `Version READ`**: if the device answers slower than our
+   500ms wait for *that* request type particularly (qc-mcp itself waits only 150ms and
+   may just be more patient collecting *all* pending data afterward rather than needing a
+   fast targeted reply) - the new late-Version-reply counter below is aimed squarely at
+   this.
+3. **The burst and the 41-byte message are unsolicited**, and none of the four handshake
+   sends nor any `KeepAlive` has ever actually landed - the original reading, still live,
+   just not the only one.
+4. **Nothing further ever arrives on the IN endpoint after the burst**, for a reason
+   unrelated to whether sends land at all (e.g. the device has nothing more to push until
+   something changes, and our firmware never sends an explicit read to provoke a reply -
+   see the `PROTOCOL.md` reasoning earlier in this section). This one doesn't contradict
+   "handshake sends worked" - it just means `KeepAlive`'s *lack of visible effect* isn't
+   itself evidence of failure, independent of whatever explains `Version READ`.
+
+None of these is picked as the answer here - they're what the next evidence needs to
+distinguish between.
 
 New diagnostic added (`runHeartbeat()`'s periodic line now also reports a late-Version-
 reply count): `handleMessage()` now also counts any `Version` reply arriving **after**
@@ -497,22 +545,90 @@ reply count): `handleMessage()` now also counts any `Version` reply arriving **a
 whether our `Version READ` is *ever* answered at all, just slow, or genuinely never, which
 bears directly on whether sends are reaching the device at all.
 
-**Recommended next step - a control check qc-mcp itself can run, not more firmware
-instrumentation**: have the owner run qc-mcp (or Cortex Control) against this exact same
-physical unit and confirm its own preset-change test produces the expected
-`RecallPreset`/`Scene`/`SetlistPosition`/`RecentsFavorites`/`PresetDirty` pushes.
-This doesn't test our firmware's `SET_REPORT` implementation directly (qc-mcp goes through
-the OS's own HID driver stack, not a raw USB host control transfer), but it does establish
-whether *this unit* answers at all right now - ruling out a bad cable/port/unit state
-independently of anything in this codebase. **Not performed here** - this PR doesn't touch
-the device itself.
+### Control check: qc-mcp works against this exact unit - so look at what differs on our side
 
-**Next hardware step**: flash this build, reproduce the same preset-change test, and
-capture the **raw, unfiltered** console output from "Session handshake complete" onward
-for 30-60s+, including every `usbh_shim`-module line and **all** `THREAD_ANALYZER` reports
-(not just `qc_heartbeat`'s - `usbh`, `qc_session`, `sysworkq`, `main`, etc. too). Separately
-(or instead, if the unit/qc-mcp setup is available), the qc-mcp control check above would
-be the more decisive result.
+The control check above was run (by the coordinator, not this PR, moving the unit from the
+board to a Mac): qc-mcp's own handshake + heartbeat, direct mode, against this exact
+physical Quad Cortex Mini.
+
+- Connected: CorOS 4.1.1, protocol generation 4.1, verified.
+- `Version` READ answered: `zenos_git_hash="4.1.1"`, `app_fw_version="undefined"`.
+- `SetlistPosition` READ: position 13. The owner changed the preset on the unit; a second
+  READ showed position 12.
+
+This **rules out a dead/bad unit** - it answers reads correctly, under a different host's
+heartbeat, over USB. Caveats: it used the Mac's USB stack and a different cable/port, so it
+says nothing about the FRDM-RW612 board's own host stack or cable path; the second
+`SetlistPosition` came from an explicit READ, not from catching one of the device's
+autonomous recall pushes (qc-mcp's tools don't expose those), so it doesn't directly
+confirm the autonomous-push behavior `PROTOCOL.md` describes, only that reads work; and
+`set_report`'s actual return codes weren't captured, so it still doesn't settle what
+`-EPIPE` means on our side.
+
+What it does settle: the same request (`Version` READ) gets answered under qc-mcp's
+handshake+heartbeat but not under ours, on the same unit, and the bytes already check out
+identical. So the difference has to be something about *our side specifically* - the
+board's actual control transfer completing on the wire, timing, or what qc-mcp does that we
+don't. Re-reading `transport.py::open()` with that question in mind surfaced a real,
+concrete difference:
+
+```python
+if handshake and not self.bridge and not self.attached:
+    if self.shared and self._session_live():
+        self.riding = True
+    else:
+        self._start_heartbeat()   # keep session "online" (required for reads)
+        self._handshake()
+```
+
+**qc-mcp starts its heartbeat *before* the handshake, not after.** Our firmware did the
+opposite: `startHeartbeat()` was the very last line of `runHandshake()`, so there was a
+window of several hundred milliseconds - dominated by the 500ms `Version`-reply wait -
+during which nothing was keeping the session "online" at all, by qc-mcp's own description
+of what the heartbeat is for. `PROTOCOL.md` says `Version` is answered "from any session,"
+but that claim is reverse-engineered documentation, not a vendor spec, and qc-mcp's actual
+code doesn't rely on it being true unconditionally - it starts the heartbeat first anyway.
+This plausibly explains `Version READ` getting no reply while bookend messages *appeared*
+to have an effect, without needing any of the four candidate explanations above to be
+wrong - it's a fifth, more concrete one layered on top of them, and it's something this
+codebase controls and can fix directly rather than something to keep diagnosing.
+
+**Fixed**: `runHandshake()` now calls `startHeartbeat()` as its first line, before
+`ResetCommsBuffers` or anything else goes out - matching `transport.py::open()`'s order
+exactly. This is safe with the existing `sendMutex_` design (issue #8's own "lock around
+the send path" requirement): the heartbeat thread and the handshake thread can now
+genuinely run concurrently from the start, and `sendMessage()`'s mutex is exactly what
+keeps their reports from interleaving - this scenario is what that lock was built for, not
+an afterthought.
+
+**Also added**, since this round's evidence review showed the existing diagnostics weren't
+quite enough to isolate this:
+
+- Each of the four handshake sends now logs its own `ok=%d last ret=%d` line (handshake
+  thread, proven-safe for `LOG_*`) - previously only the heartbeat's periodic status and
+  hard failures (`LOG_ERR`) were visible, not each individual send's actual result.
+- A periodic **probe read** (`probeVersionRead()`), piggybacked on the same ~5s cadence as
+  the heartbeat's status line: sends a fresh `Version` READ and waits for a reply, exactly
+  qc-mcp's own control check above but against *our* heartbeat instead of qc-mcp's. Its
+  `probe read replied=%d` result is the most direct test yet of whether reads work once our
+  heartbeat is (now, correctly) running throughout - note it borrows up to `kVersionReplyTimeout`
+  (500ms) from the heartbeat thread's own cadence every ~5s, a deliberate, temporary
+  trade-off for this diagnostic build, not something to carry forward unchanged.
+
+**Still open, not settled by this round**: whether the 41-byte/command-`52` message and the
+331/10/14-byte burst are real responses to our sends or unsolicited - nothing here decodes
+enough of their actual bytes to tell (the new raw-byte snapshot only covers the
+*unexpected-during-Version-wait* case, not the burst). The ordering fix above doesn't
+depend on resolving this; it's justified independently by matching the reference
+implementation's own behavior.
+
+**Next hardware step**: flash this build (the unit needs to go back on the board - the
+control check above moved it to a Mac). Reproduce the preset-change test, and capture the
+full raw console output from "Session handshake complete" onward for 30-60s+, including:
+every `usbh_shim`-module line, each handshake send's new `ok=/last ret=` line, the periodic
+`probe read replied=` result, and **all** `THREAD_ANALYZER` reports (`usbh` and
+`qc_session` specifically, not just `qc_heartbeat`'s, to see their margins once the
+heartbeat starts concurrently with the handshake rather than after it).
 
 ## Zephyr 4.5 upgrade (issue #54)
 
