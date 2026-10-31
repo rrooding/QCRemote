@@ -13,11 +13,13 @@
 
 namespace qcbridge {
 
-// CortexMessageType.Enum command ids issue #7's handshake needs (qc-mcp's
-// protocol.py COMMANDS map; full field shapes recorded in issue #5).
+// CortexMessageType.Enum command ids issue #7's handshake and issue #8's
+// heartbeat need (qc-mcp's protocol.py COMMANDS map; full field shapes
+// recorded in issue #5).
 inline constexpr uint16_t kCommandVersion = 10;
 inline constexpr uint16_t kCommandConnection = 49;
 inline constexpr uint16_t kCommandResetCommsBuffers = 52;
+inline constexpr uint16_t kCommandKeepAlive = 32;
 
 // MessageAction.Enum values (protocol.py's ACTION dict).
 enum class MessageAction : int {
@@ -75,6 +77,18 @@ inline void encodeConnection(HandshakeMessageBuffer& out, bool connected, uint64
     writeUInt64(proto, 1, requestId);
     writeBool(proto, 2, connected);
     encodeMessage(out, kCommandConnection, {proto.data(), proto.size()});
+}
+
+// KeepAliveMessage UPDATE, is_online=true: 1=action, 3=is_online. request_id
+// (2) and timeout (4) are deliberately left unset, matching qc-mcp's
+// transport.py::_start_heartbeat - its reused message object only ever has
+// action/is_online assigned, so those two fields never appear on the wire
+// (proto2 omits unset optional fields entirely rather than sending a zero).
+inline void encodeKeepAlive(HandshakeMessageBuffer& out) {
+    etl::vector<uint8_t, kHandshakeMessageCapacity> proto;
+    writeEnum(proto, 1, static_cast<int>(MessageAction::Update));
+    writeBool(proto, 3, true);
+    encodeMessage(out, kCommandKeepAlive, {proto.data(), proto.size()});
 }
 
 // Firmware version fields pulled from a Version READ reply. Field

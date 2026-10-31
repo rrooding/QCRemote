@@ -310,6 +310,53 @@ need an explicit `CLEAR_FEATURE`), consistent with the data having actually land
 the reported error. `QcSession::sendMessage()` now treats `-EPIPE` specifically as
 non-fatal and continues, matching what every reference implementation already does.
 
+## KeepAlive heartbeat (issue #8)
+
+[`QcSession.hpp`](app/src/QcSession.hpp) now also sends a `KeepAlive` UPDATE
+(`action=UPDATE, is_online=true`) every ~200ms, starting right after
+"Session handshake complete" is logged. Per qc-mcp's
+`transport.py::_start_heartbeat`, the QC stops streaming state (though
+writes still work) once this lapses, so it runs on its own dedicated
+`k_timer` + thread rather than piggybacking on the handshake thread: the
+timer's expiry callback only signals a semaphore (it can't block, running in
+interrupt-adjacent context), and a separate heartbeat thread does the actual
+blocking `SET_REPORT` send. That send path (`QcSession::sendMessage()`) is
+now shared between the handshake and heartbeat threads, guarded by a
+`k_mutex` ([`ScopedKMutex`](app/src/ScopedKMutex.hpp)) so their reports can
+never interleave on the wire. `KeepAliveMessage`'s `request_id`/`timeout`
+fields are deliberately left unset in `QcHandshakeMessages.hpp::encodeKeepAlive()`
+— qc-mcp's own reference implementation never sets them either, so they
+never appear on the wire.
+
+**Hardware verification outstanding.** This has only been exercised in the
+`protocol_messages` Ztest suite (encoding only, 18/18 cases pass on
+`qemu_cortex_m3`) and a clean `frdm_rw612` build — not yet against a real
+Quad Cortex Mini. To check it on hardware:
+
+1. Flash this build (`west flash`) and connect the device.
+2. Open the serial console (see Verify above) and confirm the handshake
+   still completes as in #7's trace, immediately followed by periodic
+   `sendReport` activity roughly every 200ms — there's no dedicated log line
+   per heartbeat send today (would be log-noisy at 5/sec), so look for the
+   device continuing to push unprompted state reads well past the
+   post-connect burst (seconds, not the single burst #7 recorded) rather
+   than going quiet. Expected log shape (abbreviated, repeating):
+   ```
+   <inf> main: Session handshake complete (firmware version: ...)
+   <inf> usbh_shim: IN transfer completed: 129 bytes
+   <inf> main: Reassembled message: NN bytes
+   ... (continuing indefinitely, not stopping after the initial burst) ...
+   ```
+3. Leave it connected for at least 30-60s and confirm reads/streaming keep
+   working the whole time (e.g. turn a knob on the unit and watch for a
+   corresponding reassembled message) — the acceptance criteria this issue
+   is checking is specifically that the session stays *active*, which only
+   shows up by absence of the device going quiet, not a single log line.
+4. If a `-EPIPE` continues to show up per send (expected per #7's quirk) but
+   reads stop after a while anyway, that would mean the heartbeat isn't
+   actually landing despite the stall tolerance - a real finding, not
+   something to assume won't happen.
+
 ## Zephyr 4.5 upgrade (issue #54)
 
 Bumped the pinned release from v4.4.2 to v4.5.0 (released 2026-10-28). As scoped in #54,
@@ -338,3 +385,5 @@ still works end-to-end.
 
 - ETL is wired in via CMake `FetchContent` (see `app/CMakeLists.txt`) but not yet used by
   the main app - only by the HID framing tests above.
+- The KeepAlive heartbeat (issue #8, see above) is implemented and unit-tested but **not
+  yet confirmed on real hardware** - see that section's verification steps.

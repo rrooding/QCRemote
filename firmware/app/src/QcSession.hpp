@@ -16,6 +16,7 @@
 #include "HidReassembler.hpp"
 #include "QcHandshakeMessages.hpp"
 #include "QcMessage.hpp"
+#include "ScopedKMutex.hpp"
 #include "UsbHostClass.hpp"
 
 namespace qcbridge {
@@ -33,14 +34,23 @@ namespace qcbridge {
 // semaphores, never blocking); the actual sends happen on a dedicated
 // thread instead.
 //
-// Does not implement the continuous KeepAlive heartbeat (issue #8) or
-// general message dispatch beyond recognizing a Version reply (issue #5
-// Tier 2) - both deliberately out of scope here, see issue #7's body.
+// Also runs the ~200ms KeepAlive heartbeat (issue #8) once the handshake
+// completes, on its own dedicated thread/timer so a stalled or slow
+// handshake/heartbeat send never blocks the other. sendMessage() is shared
+// by both and guarded by sendMutex_ so their HID reports can never
+// interleave on the wire.
+//
+// General message dispatch beyond recognizing a Version reply (issue #5
+// Tier 2) is still out of scope here, see issue #7's body.
 class QcSession {
 public:
     QcSession() {
         k_sem_init(&deviceReadySem_, 0, 1);
         k_sem_init(&versionReplySem_, 0, 1);
+        k_sem_init(&heartbeatSem_, 0, 1);
+        k_mutex_init(&sendMutex_);
+        k_timer_init(&heartbeatTimer_, &heartbeatTimerExpiryTrampoline, nullptr);
+        k_timer_user_data_set(&heartbeatTimer_, this);
     }
 
     // Called from onProbe() (host stack thread) once a device is accepted.
@@ -75,10 +85,16 @@ public:
 
 private:
     // Below the main LED-blink loop's priority; documented since nothing
-    // else contends for the CPU yet - #8's heartbeat thread will need its
-    // own considered priority once it exists, not just copy this value.
+    // else contends for the CPU yet.
     static constexpr int kThreadPriority = 7;
     static constexpr k_timeout_t kVersionReplyTimeout = K_MSEC(500);
+
+    // Higher priority than the handshake thread: the handshake runs once
+    // and tolerates being delayed, but a late KeepAlive risks the device
+    // deciding the session is inactive and stopping its stream (issue #8).
+    // Still below the main LED-blink loop's priority.
+    static constexpr int kHeartbeatThreadPriority = 5;
+    static constexpr k_timeout_t kHeartbeatInterval = K_MSEC(200);
 
     // Single device, single session at a time - a fixed id is enough (no
     // need for qc-mcp's Python client's random per-run UUID-style value).
@@ -155,9 +171,60 @@ private:
         }
 
         LOG_INF("Session handshake complete (firmware version: %s)", mirroredVersion.c_str());
+        startHeartbeat();
     }
 
+    // Starts (or restarts, on a reconnect) the ~200ms KeepAlive heartbeat
+    // (issue #8). Creates the heartbeat thread on first use, same lazy
+    // pattern as deviceConnected(); the timer itself only ever signals a
+    // semaphore from heartbeatTimerExpiryTrampoline(), never sends directly
+    // - k_timer expiry functions run in interrupt-adjacent context, where a
+    // blocking SET_REPORT send is forbidden (CODING_STANDARDS.md's ISR
+    // safety rules).
+    void startHeartbeat() {
+        if (!heartbeatThreadStarted_) {
+            k_thread_create(&heartbeatThread_, heartbeatStack_, K_KERNEL_STACK_SIZEOF(heartbeatStack_),
+                            &heartbeatThreadTrampoline, this, nullptr, nullptr, kHeartbeatThreadPriority,
+                            0, K_NO_WAIT);
+            k_thread_name_set(&heartbeatThread_, "qc_heartbeat");
+            heartbeatThreadStarted_ = true;
+        }
+        // K_NO_WAIT for the first expiry: qc-mcp's own heartbeat loop
+        // (transport.py::_start_heartbeat) sends immediately on start, then
+        // waits the interval - matched here rather than waiting 200ms before
+        // the very first KeepAlive.
+        k_timer_start(&heartbeatTimer_, K_NO_WAIT, kHeartbeatInterval);
+    }
+
+    static void heartbeatTimerExpiryTrampoline(struct k_timer* timer) {
+        auto* self = static_cast<QcSession*>(k_timer_user_data_get(timer));
+        if (self != nullptr) {
+            k_sem_give(&self->heartbeatSem_);
+        }
+    }
+
+    static void heartbeatThreadTrampoline(void* p1, void*, void*) {
+        static_cast<QcSession*>(p1)->runHeartbeat();
+    }
+
+    void runHeartbeat() {
+        while (true) {
+            k_sem_take(&heartbeatSem_, K_FOREVER);
+            HandshakeMessageBuffer msg;
+            encodeKeepAlive(msg);
+            if (!sendMessage(msg)) {
+                LOG_WRN("KeepAlive send failed");
+            }
+        }
+    }
+
+    // Shared by the handshake thread and the heartbeat thread - sendMutex_
+    // keeps their reports from interleaving on the wire (issue #8's "lock
+    // around the USB send path" requirement), since a single logical
+    // message is often chunked into several reports by HidChunker.
     bool sendMessage(std::span<const uint8_t> message) {
+        ScopedKMutex lock(sendMutex_);
+
         HidChunker chunker(message, kReportIdHostToQc);
         etl::vector<uint8_t, kHidReportSize> report;
         report.resize(kHidReportSize);
@@ -191,6 +258,14 @@ private:
     K_KERNEL_STACK_MEMBER(stack_, 2048);
     struct k_thread thread_ {};
     bool threadStarted_ = false;
+
+    K_KERNEL_STACK_MEMBER(heartbeatStack_, 2048);
+    struct k_thread heartbeatThread_ {};
+    bool heartbeatThreadStarted_ = false;
+    struct k_timer heartbeatTimer_ {};
+    struct k_sem heartbeatSem_ {};
+
+    struct k_mutex sendMutex_ {};
 
     struct k_sem deviceReadySem_ {};
     struct k_sem versionReplySem_ {};
