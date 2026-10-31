@@ -454,7 +454,7 @@ Run the tests the same way as `hid_framing`/`catalog_messages` (see above):
 west twister -p qemu_cortex_m3 -K -T firmware/app/tests/file_messages
 ```
 
-## Message dispatch and the File stream (issue #60)
+## Message dispatch, the File stream, and post-connect state READs (issues #60, #61)
 
 General message dispatch: [`QcSession::handleMessage()`](app/src/QcSession.hpp) now hands every
 reassembled message to either [`QcGzipInflater.hpp`](app/src/QcGzipInflater.hpp) (issue #6, if
@@ -467,6 +467,41 @@ above) about Zephyr's `usbh` thread stack. Both worker threads call back into `Q
 through a small interface, [`QcMessageSink.hpp`](app/src/QcMessageSink.hpp)
 (`onMessage()`/`onInflateFailed()`), from their own thread - never from `usbh` - so that's where
 real dispatch logic (today: recognizing a Version reply, and the File hook below) safely lives.
+
+Post-connect state READs (issue #61): right after the handshake's Connection UPDATE and before
+the File READ below, `QcSession::runHandshake()` now sends the same twelve state READs qc-mcp's
+own `transport.py::_handshake()` sends at that point -
+[`QcStateReads.hpp`](app/src/QcStateReads.hpp)'s `kPostConnectStateReadCommands`, in the exact
+order qc-mcp uses: `ModelRepo`, `ModuleStats`, `UndoRedo`, `IOSettings`, `GeneralSettings`,
+`Mode`, `GlobalEQ`, `MasterVolume`, `GlobalTempo`, `Scene`, `PresetDirty`, `SetlistPosition`.
+qc-mcp's own comment on this step says plainly that it's what "makes the QC start streaming and
+marks the session active" - the hardware run on commit `11e43d0` (issue #60's hardware debugging,
+below: a 30-second timeout with only one message the whole window, the handshake's own delayed
+`Version` reply, and no File traffic at all) made these the leading candidate explanation, though
+still not a proven one until a real run with them in place says otherwise either way.
+
+Command ids (protocol.py's `COMMANDS` map) and field numbers (qc_descriptors-4.1.pb) were taken
+directly from qc-mcp's source, not guessed: every one of the twelve message types shares the same
+two leading fields, 1=`action` and 2=`request_id`, confirmed by decoding the descriptor set
+itself field-by-field rather than assumed from the Tier 1/File shape already in this codebase -
+so one generic encoder, `encodeStateRead()`, covers all twelve. Sent back-to-back with no wait for
+a reply in between, and no wait for any of their replies before moving on to the File READ either
+- that mirrors qc-mcp exactly: its own loop fires all twelve, then only pauses briefly
+(`time.sleep(0.3)` + a short `_collect()`) before discarding whatever already came back, never
+gating on a specific reply. This firmware mirrors that fire-and-forget shape rather than inventing
+a synchronous wait qc-mcp doesn't have. A send failure on any one of the twelve logs a warning and
+moves on to the next (and still to the File READ afterward) rather than aborting the sequence -
+matching qc-mcp's own per-READ `try`/`except`.
+
+Replies to these - including a `ModelRepo` reply that's large and/or gzip-compressed - are handled
+by the same generic dispatch path as every other message
+([`QcDispatcher.hpp`](app/src/QcDispatcher.hpp)/[`QcGzipInflater.hpp`](app/src/QcGzipInflater.hpp),
+described below), which already drops-and-counts rather than crashes on anything too big for
+`kReassemblyCapacity` or either mailbox - no new handling was needed for this issue's "don't crash,
+don't block the File READ" requirement, since issue #60 had already made that path crash-safe for
+an unknown command's reply of unknown size. A `ModelRepo` reply overflowing `kReassemblyCapacity`
+(4096 bytes) shows up as `reassemblyOverflowCount` in the File stream's summary below, same as any
+other oversized message during that window.
 
 The File request: [`QcFileRequest.hpp`](app/src/QcFileRequest.hpp) encodes a bare File READ
 (command 4), sent right after the handshake completes (`QcSession::runHandshake()`). The device
@@ -527,8 +562,11 @@ something this issue changes; the summary's new `maxWireBytes`/`maxInflatedBytes
 largest single message actually seen, successfully processed - a message dropped for being too
 big never reaches this tracking at all) are what #33 needs for that sizing pass.
 
-**Not yet verified on real hardware.** Unlike the handshake/heartbeat sections above, no hardware
-run has been done for this issue - verify with:
+**Not yet verified on real hardware.** Two hardware runs exist for issue #60's File stream itself
+(both predate #61's state READs - see the `11e43d0` result a few paragraphs up and the outcome
+list below), and neither saw File traffic. What's not yet verified on hardware at all: whether
+#61's state READs change that result, and everything about the post-connect tally/timed
+preset-change step below, all new in this PR. Verify with:
 
 1. Flash this build and open the serial console (see Flash/Verify above).
 2. Confirm the handshake completes as before (`Session handshake complete (firmware version:
@@ -537,6 +575,15 @@ run has been done for this issue - verify with:
    overall cap even if the stream never goes quiet).
 4. Paste back the full captured output from boot through either the `File stream finished (...)`
    line or the 35s mark, whichever comes first.
+5. **Timed preset-change step (issue #61):** once the `File stream finished (...)`/`File stream
+   tally: ...` lines have appeared, change the loaded preset once on the unit itself (not through
+   this firmware - there's no control path for that yet), note the wall-clock time you did it, and
+   keep capturing for another 30 seconds. Paste back everything from the `File stream tally:
+   command=...` lines (or the "no messages" line) through that 30-second mark, and say when (which
+   log line, or roughly how many seconds in) the preset change happened relative to the capture.
+   This is what tells us whether a preset recall on the unit pushes anything
+   (`RecallPreset`/`Scene`/`SetlistPosition`/`PresetDirty`/similar) - see `Post-connect tally`
+   below for where that shows up.
 
 A finished stream now logs several lines - paste back all of them:
 
@@ -545,9 +592,10 @@ File stream finished (quiet): N messages (C compressed, F failed), W wire bytes,
 File stream limits: max wire=MW max inflated=MI, dropped (dispatch=DD gzip=DG), reassembly (overflow=RO malformed=RM)
 File stream tally: T total IN transfers
 File stream tally: command=CMD count=CNT    (one line per distinct command id seen, or "no messages of any command seen in this window")
+Post-connect tally started: watching for preset-change pushes (RecallPreset/Scene/SetlistPosition/...) - issue #61
 ```
 
-The last two are a diagnostic added after the first hardware run reported a File stream that
+The middle two are a diagnostic added after the first hardware run reported a File stream that
 finished with every count above at 0 (`0 messages ... 0 wire bytes ... 0 inflated bytes`, dropped
 and reassembly all 0 too) - evidence consistent with either "the device sent nothing at all
 during the window" or "the device sent something, just never anything this build recognized as
@@ -560,6 +608,21 @@ per-transfer `LOG_INF` in `usbh_shim.c` that used to show this detail report-by-
 `LOG_DBG` (and that module registers at `LOG_LEVEL_INF`, so it compiles out entirely) - `T` is the
 one place this count still appears, without swamping the log or running extra formatting on the
 `usbh` thread.
+
+The last line starts a second, separate tally (`QcSession`'s `postStreamTally_`, same
+`QcMessageTally.hpp` class, a different instance) that keeps running for the rest of the session,
+specifically for issue #61's preset-change check: `messageTally_` above stops dead the moment the
+File stream finishes, so without this there'd be no visibility into anything the device sends
+afterward - including a preset-change push. Once started, it logs a fresh
+`Post-connect tally: command=CMD count=CNT` line (same per-command shape as the File stream's own
+tally lines, plus a `Post-connect tally: N messages from other distinct commands (> 8 tracked)`
+line if more than 8 distinct commands show up) whenever something changes - immediately for a
+command id never seen before in this window (the actual preset-change signal), throttled to at
+most once per second for a plain count bump on an already-seen command (so continuous streaming
+traffic alone - qc-mcp's own comment: GlobalTempo/CPULoad at ~3/s under an active heartbeat, with
+or without a preset change - can't flood the log for the rest of the session). If nothing at all
+shows up after the stream, you'll simply see no further `Post-connect tally: ...` lines once the
+one above.
 
 What each outcome means:
 
@@ -594,16 +657,7 @@ What each outcome means:
   the eventual message count is unexpectedly low.
 - **A `File stream finished (timeout)` with every count (`N`, `W`, `I`, `DD`, `DG`, `RO`, `RM`)
   at 0, and `T` (total IN transfers) also 0**: nothing arrived on the wire at all during the
-  window - not a counting gap in this firmware, a silent device/USB layer. The first thing to
-  check here is issue #61: qc-mcp's own `_handshake()` (`transport.py`) sends 12 state READs
-  (`ModelRepo`, `ModuleStats`, `UndoRedo`, `IOSettings`, `GeneralSettings`, `Mode`, `GlobalEQ`,
-  `MasterVolume`, `GlobalTempo`, `Scene`, `PresetDirty`, `SetlistPosition`) right after its
-  `Connection` UPDATE and before any listing - its own comment on that step says plainly that
-  these are "what makes the QC start streaming and marks the session active." This firmware
-  sends none of them (issue #61's scope, deliberately not this issue's). If `T` is 0, that is
-  direct evidence the device may simply be withholding *all* traffic, File included, until a
-  session looks active by that same test - in which case #61 needs to land before or together
-  with a File READ, not after it.
+  window - not a counting gap in this firmware, a silent device/USB layer.
 - **The same all-zero summary, but `T` > 0**: the device answered with *something* at the USB
   level, so the session isn't completely inert - check `File stream tally`'s per-command lines
   (or "no messages of any command seen", if the tally itself is empty despite `T` > 0, which
@@ -616,14 +670,47 @@ What each outcome means:
   live and talking, just never answered the File READ specifically - that's a File-specific gap
   (worth comparing the exact READ bytes against qc-mcp's `list_directory()`: command id 4,
   `action=READ`, a `request_id` field - `QcFileRequest.hpp`'s `encodeFileRead()` already matches
-  all three), separate from the #61 session-activity question above.
+  all three). **This is exactly what the second hardware run (commit `11e43d0`, after the
+  `T`/tally diagnostics landed but before issue #61's state READs) showed**: `File stream
+  finished (timeout): 0 messages ... 30138 ms` with every drop/overflow/malformed count at 0, but
+  `File stream tally: 1 total IN transfers` and `File stream tally: command=10 count=1` - exactly
+  one message the whole 30 seconds, and it was `Version` (command 10, almost certainly the
+  handshake's own delayed reply lingering in the same window), not File. That's a live-but-silent
+  session: the device accepted the connection and answered one thing, but sent nothing else at
+  all for 30 seconds, including no File reply. qc-mcp's own comment that its twelve state READs
+  are what "makes the QC start streaming and marks the session active" made them the leading
+  candidate explanation for this specific result - **unproven, not confirmed**: this PR adds
+  those twelve READs (see above) on exactly that theory, but whether they actually change this
+  outcome is still an open question for the next hardware run, not a settled one. If the next run
+  still shows a `T`/tally this sparse with the state READs now in place, that candidate
+  explanation should be treated as ruled out, not just unproven, and the search should move
+  elsewhere (re-checking the handshake sequence itself, or whether the device needs something
+  this firmware isn't sending at all yet).
+- **A `Post-connect tally: command=CMD count=CNT` line appears after the stream** (beyond the
+  one-time `Post-connect tally started: ...` line): something arrived post-stream. If `CMD` is
+  `RecallPreset` (15), `Scene` (13), `SetlistPosition` (2), `PresetDirty` (34), or
+  `RecentsFavorites` (20), and it lines up with when you changed the preset in the timed
+  preset-change step above, that's the preset-change push issue #61 asks about, finally observed
+  - say which command(s) appeared and roughly how long after the preset change. If `GlobalTempo`
+  (33) or `CPULoad` (26) show up continuously even *before* any preset change, that's qc-mcp's
+  own documented behavior (streaming under an active heartbeat) rather than anything
+  preset-specific - expected, not a new finding on its own.
+- **No `Post-connect tally: ...` line at all after the one-time "started" line, through the end
+  of the timed preset-change step**: the device stayed silent even after a preset change on the
+  unit - record that plainly rather than assuming it; per the issue's own wording, if presets are
+  still silent after #61 lands, that needs recording and investigating further, not treated as a
+  bug in this PR's counting (the same generic dispatch path that counts File traffic counts this
+  too, so a real push would show up here the same way).
 - **`Handshake: failed to send File READ`**: the request itself never got sent - the handshake
   completed, so this would be a new, File-specific send failure rather than the already-explained
   benign `-EPIPE` quirk (`sendMessage()` only returns false when `sendReport` fails with
-  something else).
+  something else). The same applies to `Handshake: failed to send state READ (command=...)` for
+  one of issue #61's twelve READs - logged as a warning, not fatal, and doesn't stop the rest of
+  the sequence or the File READ that follows (see the state-READs section above for why).
 - **Occasional `File message failed to inflate (wire=... bytes): ...` warnings**: expected if a
   folder message's compressed payload decompresses past `kMaxInflatedSize` - counted in the
-  summary's `failed` tally, not a crash and not supposed to stall later messages.
+  summary's `failed` tally, not a crash and not supposed to stall later messages. The same applies
+  to a `ModelRepo` reply specifically (issue #61) - it's handled by the same inflate path.
 - **A crash or stack fault**: capture the fault PC/LR and `addr2line` against `zephyr.elf`, same
   method used to find issue #8's `usbh`-stack overflow (see that section above) - and say which
   thread's name appears in the dump (`qc_dispatch`, `qc_gzip_inflate`, `qc_session`,
@@ -637,8 +724,9 @@ What each outcome means:
   on real hardware: the cleaned-up build (`f8ad423`) passed its smoke test (boot, handshake
   mirrors `4.1.1`, no fallback warning, no crash over a couple of minutes), and the earlier
   diagnostics-carrying build (`584e015`) showed repeated reads answered for several minutes
-  under the heartbeat. A heartbeat-off comparison and a preset-change push are both still
-  unconfirmed (the latter deferred to issue #9).
+  under the heartbeat. A heartbeat-off comparison is still unconfirmed; the preset-change push is
+  issue #61's scope (see above) - its state READs are implemented and unit-tested here, but
+  whether they actually produce a push on real hardware is still unverified.
 - Tier 2's `decodeModelRepo`/`decodeSetlistPosition`/`decodeFile` aren't called from anywhere
   yet - wiring them into the session/message-dispatch path is for whichever issue actually
   consumes them (`ModelRepo` needs #6's inflate first; a preset-list `SetlistPosition` READ and

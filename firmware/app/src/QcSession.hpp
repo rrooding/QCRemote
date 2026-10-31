@@ -23,6 +23,7 @@
 #include "QcMessage.hpp"
 #include "QcMessageSink.hpp"
 #include "QcMessageTally.hpp"
+#include "QcStateReads.hpp"
 #include "ScopedKMutex.hpp"
 #include "UsbHostClass.hpp"
 
@@ -138,6 +139,7 @@ public:
         // apart from "the device sent something else").
         ScopedKMutex lock(fileStreamMutex_);
         messageTally_.record(command);
+        postStreamTally_.record(command);
         if (command == kCommandFile) {
             fileStream_.onMessage(k_uptime_get(), wireSize, inflatedSize, compressed);
         }
@@ -150,6 +152,7 @@ public:
 
         ScopedKMutex lock(fileStreamMutex_);
         messageTally_.record(command);
+        postStreamTally_.record(command);
         if (command == kCommandFile) {
             fileStream_.onInflateFailed(k_uptime_get(), wireSize);
         }
@@ -280,6 +283,32 @@ private:
 
         LOG_INF("Session handshake complete (firmware version: %s)", mirroredVersion.c_str());
 
+        // Post-connect state READs (issue #61): qc-mcp's own
+        // transport.py::_handshake() sends these twelve READs right here -
+        // after its Connection UPDATE, before any listing - with a comment
+        // that this is what "makes the QC start streaming and marks the
+        // session active." Sent back-to-back with no wait for a reply in
+        // between (and no wait for any of their replies before moving on to
+        // the File READ below either): that's what qc-mcp itself does - its
+        // loop fires all twelve, then only pauses briefly before discarding
+        // whatever already came back, never gating on a specific reply.
+        // This firmware mirrors that fire-and-forget shape rather than
+        // inventing a synchronous wait qc-mcp doesn't have. A send failure
+        // here doesn't abort the sequence - matching qc-mcp's own per-READ
+        // try/except - since one state READ failing to go out shouldn't
+        // block the rest or the File READ that follows; the replies (if
+        // any) are handled by the same generic dispatch path as every other
+        // message (QcDispatcher.hpp/QcGzipInflater.hpp), so a large or
+        // compressed ModelRepo reply that overflows kReassemblyCapacity or
+        // either mailbox is safely dropped and counted there, not crashed.
+        for (const uint16_t command : kPostConnectStateReadCommands) {
+            msg.clear();
+            encodeStateRead(msg, command, nextRequestId());
+            if (!sendMessage(msg)) {
+                LOG_WRN("Handshake: failed to send state READ (command=%u)", command);
+            }
+        }
+
         // File READ (issue #60): asks for the device's whole catalog, which
         // comes back as a stream of File UPDATE messages - see
         // QcFileStream.hpp for how that stream is collected and
@@ -357,6 +386,10 @@ private:
             size_t tallyEntryCount = 0;
             uint32_t tallyOtherCount = 0;
             uint32_t totalInTransfersThisStream = 0;
+            bool postStreamChanged = false;
+            std::array<QcMessageTally::Entry, QcMessageTally::kMaxDistinctCommands> postStreamEntries{};
+            size_t postStreamEntryCount = 0;
+            uint32_t postStreamOtherCount = 0;
             {
                 ScopedKMutex lock(fileStreamMutex_);
                 summary = fileStream_.checkTimeout(k_uptime_get());
@@ -384,6 +417,54 @@ private:
                     }
                     tallyOtherCount = messageTally_.otherCount();
                     messageTally_.stop();
+
+                    // issue #61's preset-change check needs visibility into
+                    // whatever arrives *after* the File stream, too (a
+                    // preset recall on the unit pushing RecallPreset/Scene/
+                    // SetlistPosition or similar) - messageTally_ above is
+                    // scoped to the stream and goes silent the moment it
+                    // stops. postStreamTally_ picks up right here and keeps
+                    // running for the rest of the session; see the
+                    // "changed since last logged" check below for how it's
+                    // reported without flooding the log if the device turns
+                    // out to stream something continuously (qc-mcp's own
+                    // comment: GlobalTempo/CPULoad stream ~3/s under an
+                    // active heartbeat, with or without a preset change).
+                    postStreamTally_.start();
+                    postStreamLoggedEntries_ = {};
+                    postStreamLoggedEntryCount_ = 0;
+                    postStreamLoggedOtherCount_ = 0;
+                    postStreamLastLoggedAtMs_ = k_uptime_get();
+                }
+
+                if (postStreamTally_.isActive()) {
+                    const auto entries = postStreamTally_.entries();
+                    const auto otherCount = postStreamTally_.otherCount();
+                    const bool newDistinctCommand = entries.size() > postStreamLoggedEntryCount_;
+                    bool countsChanged = newDistinctCommand || otherCount != postStreamLoggedOtherCount_;
+                    for (size_t i = 0; !countsChanged && i < entries.size(); ++i) {
+                        countsChanged = entries[i].count != postStreamLoggedEntries_[i].count;
+                    }
+                    const int64_t nowMs = k_uptime_get();
+                    // A brand-new command id (the actual preset-change
+                    // signal) is reported immediately; a mere count bump on
+                    // an already-seen command (e.g. continuous GlobalTempo/
+                    // CPULoad streaming) is throttled to at most once per
+                    // kPostStreamLogIntervalMs so that alone can't swamp the
+                    // log for the rest of the session.
+                    if (countsChanged && (newDistinctCommand ||
+                                           (nowMs - postStreamLastLoggedAtMs_) >= kPostStreamLogIntervalMs)) {
+                        postStreamChanged = true;
+                        postStreamEntryCount = entries.size();
+                        for (size_t i = 0; i < postStreamEntryCount; ++i) {
+                            postStreamEntries[i] = entries[i];
+                            postStreamLoggedEntries_[i] = entries[i];
+                        }
+                        postStreamOtherCount = otherCount;
+                        postStreamLoggedOtherCount_ = otherCount;
+                        postStreamLoggedEntryCount_ = postStreamEntryCount;
+                        postStreamLastLoggedAtMs_ = nowMs;
+                    }
                 }
             }
             if (summary) {
@@ -429,6 +510,19 @@ private:
                                 "(> %zu tracked)",
                                 tallyOtherCount, QcMessageTally::kMaxDistinctCommands);
                     }
+                }
+                LOG_INF("Post-connect tally started: watching for preset-change pushes "
+                        "(RecallPreset/Scene/SetlistPosition/...) - issue #61");
+            }
+            if (postStreamChanged) {
+                for (size_t i = 0; i < postStreamEntryCount; ++i) {
+                    LOG_INF("Post-connect tally: command=%u count=%u", postStreamEntries[i].command,
+                            postStreamEntries[i].count);
+                }
+                if (postStreamOtherCount > 0) {
+                    LOG_INF("Post-connect tally: %u messages from other distinct commands "
+                            "(> %zu tracked)",
+                            postStreamOtherCount, QcMessageTally::kMaxDistinctCommands);
                 }
             }
         }
@@ -521,6 +615,26 @@ private:
     uint32_t reassemblyOverflowAtStart_ = 0;
     uint32_t reassemblyMalformedAtStart_ = 0;
     uint32_t totalInTransfersAtStart_ = 0;
+
+    // A new command id is always logged the moment it's first seen; a
+    // count bump on an already-logged command is throttled to at most
+    // once per this interval (see runHeartbeat()) so continuous streaming
+    // traffic (qc-mcp's own comment: GlobalTempo/CPULoad at ~3/s under an
+    // active heartbeat) can't flood the log for the rest of the session.
+    static constexpr int64_t kPostStreamLogIntervalMs = 1000;
+
+    // issue #61: everything postStreamTally_ needs to answer "did a
+    // preset change on the unit push something new (RecallPreset/Scene/
+    // SetlistPosition/...)" without re-logging unchanged counts every
+    // ~200ms heartbeat tick. Guarded by fileStreamMutex_ above, same as
+    // messageTally_ - started in runHeartbeat() the moment the File
+    // stream's summary is produced, and never stopped again (unlike
+    // messageTally_, which is scoped to one File stream).
+    QcMessageTally postStreamTally_;
+    std::array<QcMessageTally::Entry, QcMessageTally::kMaxDistinctCommands> postStreamLoggedEntries_{};
+    size_t postStreamLoggedEntryCount_ = 0;
+    uint32_t postStreamLoggedOtherCount_ = 0;
+    int64_t postStreamLastLoggedAtMs_ = 0;
 };
 
 }  // namespace qcbridge

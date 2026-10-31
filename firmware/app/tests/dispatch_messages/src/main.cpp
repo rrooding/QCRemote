@@ -1,3 +1,4 @@
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -6,6 +7,7 @@
 #include "QcFileRequest.hpp"
 #include "QcFileStream.hpp"
 #include "QcMessageTally.hpp"
+#include "QcStateReads.hpp"
 
 using namespace qcbridge;
 
@@ -210,6 +212,63 @@ ZTEST(dispatch_messages, test_message_tally_overflow_falls_into_other)
                   "entries must stay bounded at kMaxDistinctCommands");
     zassert_equal(tally.entries()[0].count, 2u, "an already-tracked command keeps incrementing");
     zassert_equal(tally.otherCount(), 3u, "every brand-new command past capacity falls into otherCount");
+}
+
+// --- QcStateReads.hpp -------------------------------------------------------
+
+ZTEST(dispatch_messages, test_post_connect_state_read_commands_match_qc_mcp_handshake_order)
+{
+    // Exact order and set of qc-mcp's transport.py::_handshake() loop
+    // (ModelRepo, ModuleStats, UndoRedo, IOSettings, GeneralSettings, Mode,
+    // GlobalEQ, MasterVolume, GlobalTempo, Scene, PresetDirty,
+    // SetlistPosition), command ids from protocol.py's COMMANDS map.
+    const std::array<uint16_t, 12> expected = {51, 35, 21, 3, 9, 14, 38, 17, 33, 13, 34, 2};
+    zassert_equal(kPostConnectStateReadCommands.size(), expected.size(), "expected 12 state READs");
+    for (size_t i = 0; i < expected.size(); ++i) {
+        zassert_equal(kPostConnectStateReadCommands[i], expected[i], "command id at index %zu", i);
+    }
+}
+
+ZTEST(dispatch_messages, test_encode_state_read_model_repo)
+{
+    HandshakeMessageBuffer out;
+    encodeStateRead(out, kCommandModelRepo, 3);
+
+    const std::vector<uint8_t> expected = {
+        0x08, 0x03,              // action = READ (3)
+        0x10, 0x03,              // request_id = 3
+        0x33, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // trailer: command=51 (ModelRepo)
+    };
+    zassert_equal(out.size(), expected.size(), "size");
+    zassert_mem_equal(out.data(), expected.data(), expected.size(), "bytes");
+}
+
+ZTEST(dispatch_messages, test_encode_state_read_setlist_position)
+{
+    HandshakeMessageBuffer out;
+    encodeStateRead(out, kCommandSetlistPosition, 5);
+
+    const std::vector<uint8_t> expected = {
+        0x08, 0x03,              // action = READ (3)
+        0x10, 0x05,              // request_id = 5
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // trailer: command=2 (SetlistPosition)
+    };
+    zassert_equal(out.size(), expected.size(), "size");
+    zassert_mem_equal(out.data(), expected.data(), expected.size(), "bytes");
+}
+
+ZTEST(dispatch_messages, test_encode_state_read_multi_byte_request_id)
+{
+    HandshakeMessageBuffer out;
+    encodeStateRead(out, kCommandGlobalTempo, 300);  // 300 -> varint [0xAC, 0x02]
+
+    const std::vector<uint8_t> expected = {
+        0x08, 0x03,                    // action = READ (3)
+        0x10, 0xAC, 0x02,              // request_id = 300
+        0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // trailer: command=33 (GlobalTempo)
+    };
+    zassert_equal(out.size(), expected.size(), "size");
+    zassert_mem_equal(out.data(), expected.data(), expected.size(), "bytes");
 }
 
 ZTEST(dispatch_messages, test_message_tally_stop_blocks_further_records_until_restart)
