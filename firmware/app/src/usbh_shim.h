@@ -92,29 +92,14 @@ int qc_usbh_bridge_start(const struct qc_usbh_filter *filter, const struct qc_us
  * doesn't swallow that itself, callers that care should (see
  * QcSession.hpp). PROTOCOL.md §1 documents a macOS quirk where
  * IOHIDDeviceSetReport returns a benign-looking error while the data still
- * lands, and #7 assumed -EPIPE here was the same thing one layer down -
- * issue #8's hardware testing put real doubt on that (see
- * firmware/README.md's KeepAlive section): usbh_req_setup() (usbh_ch9.c)
- * returns a single pass/fail result for the whole control transfer, with
- * no way to tell a status-stage-only stall apart from the data stage never
- * completing - the underlying MCUX EHCI driver only tracks bytes
- * transferred for IN-direction transfers, and this is OUT.
+ * lands, and -EPIPE here is the same thing one layer down: confirmed
+ * functionally on real hardware (issue #8's debugging) - every send
+ * returns -EPIPE, yet repeated reads reliably got answered for several
+ * minutes with the heartbeat running under this call. The exact USB-level
+ * mechanism isn't independently verified against the driver, but the
+ * functional outcome (data lands) is.
  */
 int qc_usbh_send_report(const uint8_t *report, size_t len);
-
-/*
- * Total IN-endpoint transfers completed so far (successes and errors both -
- * this counts in_xfer_cb() invocations, not reassembled messages). Added for
- * issue #8's hardware diagnosis: on_report_in() and qc_usbh_send_report()
- * share the USB host stack's single processing thread (see that function's
- * doc comment above), so if sends every ~200ms ever starve or otherwise
- * disrupt the continuous receive loop, this count going flat while the
- * KeepAlive send count keeps climbing is the signal - as opposed to the
- * device itself simply not sending anything, which this count can't
- * distinguish by itself but at least rules in/out "our receive path is
- * still alive at the transfer level".
- */
-uint32_t qc_usbh_in_xfer_count(void);
 
 #ifdef __cplusplus
 }
