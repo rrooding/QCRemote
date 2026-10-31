@@ -454,6 +454,88 @@ Run the tests the same way as `hid_framing`/`catalog_messages` (see above):
 west twister -p qemu_cortex_m3 -K -T firmware/app/tests/file_messages
 ```
 
+## Message dispatch and the File stream (issue #60)
+
+General message dispatch: [`QcSession::handleMessage()`](app/src/QcSession.hpp) now hands every
+reassembled message to either [`QcGzipInflater.hpp`](app/src/QcGzipInflater.hpp) (issue #6, if
+the gzip magic prefix is present) or the new [`QcDispatcher.hpp`](app/src/QcDispatcher.hpp)
+(otherwise) - both single-slot-mailbox-plus-worker-thread classes, the same shape, so a message
+arriving while the previous one on that path is still being handled is dropped rather than
+queued. `handleMessage()` itself still does only a cheap trailer decode and a 3-byte gzip-magic
+check: no logging, no real dispatch logic, matching the lesson baked in since issue #8 (see
+above) about Zephyr's `usbh` thread stack. Both worker threads call back into `QcSession`
+through a small interface, [`QcMessageSink.hpp`](app/src/QcMessageSink.hpp)
+(`onMessage()`/`onInflateFailed()`), from their own thread - never from `usbh` - so that's where
+real dispatch logic (today: recognizing a Version reply, and the File hook below) safely lives.
+
+The File request: [`QcFileRequest.hpp`](app/src/QcFileRequest.hpp) encodes a bare File READ
+(command 4), sent right after the handshake completes (`QcSession::runHandshake()`). The device
+answers with a stream of File UPDATE messages covering its whole catalog (presets, IRs,
+captures) - qc-mcp's `transport.py::list_directory()` describes about 400 messages over about
+12s on a real device. [`QcFileStream.hpp`](app/src/QcFileStream.hpp) collects that stream: a
+1500ms quiet window or a 30s overall cap, whichever comes first, mirroring that function's
+`quiet_ms`/`timeout_ms` defaults. It's plain C++23 with no Zephyr dependency, same reasoning as
+`HidReassembler.hpp` - the whole state machine takes an explicit `nowMs` rather than calling
+`k_uptime_get()` itself, so it's unit-testable with synthetic timestamps and no real waiting
+(see `tests/dispatch_messages`). `QcSession` calls it under its own mutex (`fileStreamMutex_`)
+from `onMessage()`/`onInflateFailed()` (the dispatch/inflate worker threads) and from
+`runHeartbeat()`, which polls `checkTimeout()` on its own ~200ms cadence rather than running a
+separate timer - plenty of resolution for a 1500ms window, and keeps the check off `usbh` too.
+
+The File-message hook (issue #60's scope item 3, ahead of #10 wiring in the sibling issue #59's
+decoder): for now this only logs command, wire size, inflated size, and whether a message was
+compressed - at `LOG_DBG`, not `LOG_INF`, since ~400 of these would otherwise drown everything
+else in the log during the stream (the existing per-report "Reassembled message" log in
+`QcHidBridge.hpp` was downgraded to `LOG_DBG` for the same reason). The readable, once-per-stream
+version is `QcFileStream`'s summary, logged at `LOG_INF` when the stream finishes: message/
+compressed/failed counts, total wire and inflated bytes, and elapsed time - this is what feeds
+issue #33's eventual sizing work.
+
+**Known gap, not fixed here**: a File folder message that overflows `QcHidBridge`'s
+`kReassemblyCapacity` (4096 bytes) is dropped by `HidReassembler` *before* `handleMessage()` ever
+sees a command id, so it can't be attributed to the File stream's counters - it only shows up as
+the existing, pre-#60 "Reassembly overflow" `LOG_WRN`. A File message that decodes far enough to
+detect gzip but then fails to inflate (e.g. exceeds `QcGzip.hpp`'s `kMaxInflatedSize`, 16384
+bytes) *is* counted, via `onInflateFailed()`/`failedCount`. Both limits are issue #33's
+placeholders to size for real, not something this issue changes.
+
+**Not yet verified on real hardware.** Unlike the handshake/heartbeat sections above, no hardware
+run has been done for this issue - verify with:
+
+1. Flash this build and open the serial console (see Flash/Verify above).
+2. Confirm the handshake completes as before (`Session handshake complete (firmware version:
+   ...)`, no `No usable Version reply` warning).
+3. Capture continuously for at least 35 seconds after that line (long enough to cover the 30s
+   overall cap even if the stream never goes quiet).
+4. Paste back the full captured output from boot through either the `File stream finished (...)`
+   line or the 35s mark, whichever comes first.
+
+What each outcome means:
+
+- **`File stream finished (quiet): N messages (C compressed, F failed), W wire bytes, I inflated
+  bytes, E ms`**, with `E` landing somewhere around 10-15 seconds and `N` in the neighborhood of
+  qc-mcp's ~400: the whole path works end to end - File READ reached the device, the stream was
+  collected, and the quiet window correctly ended it. `C`/`F`/the size totals are the numbers
+  issue #33 needs.
+- **`File stream finished (timeout): ...`**: the stream never went quiet inside 30s - either the
+  device kept sending (worth a longer capture to see if it ever stops) or something is stuck
+  resetting the quiet window without the stream actually making progress.
+- **No `File stream finished` line at all within 35s, and no `Handshake: failed to send File
+  READ` error either**: the request went out but nothing about it is recognizable as a File
+  reply - check for `Reassembly overflow`/`Malformed HID report` warnings (the known gap above)
+  or an unexpectedly low/zero message count once a summary does eventually land.
+- **`Handshake: failed to send File READ`**: the request itself never got sent - the handshake
+  completed, so this would be a new, File-specific send failure rather than the already-explained
+  benign `-EPIPE` quirk (`sendMessage()` only returns false when `sendReport` fails with
+  something else).
+- **Occasional `File message failed to inflate (wire=... bytes): ...` warnings**: expected if a
+  folder message's compressed payload decompresses past `kMaxInflatedSize` - counted in the
+  summary's `failed` tally, not a crash and not supposed to stall later messages.
+- **A crash or stack fault**: capture the fault PC/LR and `addr2line` against `zephyr.elf`, same
+  method used to find issue #8's `usbh`-stack overflow (see that section above) - and say which
+  thread's name appears in the dump (`qc_dispatch`, `qc_gzip_inflate`, `qc_session`,
+  `qc_heartbeat`, or `usbh` itself).
+
 ## Not yet done
 
 - ETL is wired in via CMake `FetchContent` (see `app/CMakeLists.txt`) but not yet used by

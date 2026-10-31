@@ -60,7 +60,10 @@ protected:
         switch (reassembler_.feed(report)) {
         case Status::Complete: {
             const auto message = reassembler_.message();
-            LOG_INF("Reassembled message: %zu bytes", message.size());
+            // LOG_DBG, not LOG_INF: a File stream (issue #60) reassembles
+            // on the order of 400 messages over ~12s, which would drown
+            // everything else logged during it at the default level.
+            LOG_DBG("Reassembled message: %zu bytes", message.size());
             session_.handleMessage(message);
             break;
         }

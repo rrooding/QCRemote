@@ -1,0 +1,107 @@
+#pragma once
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+
+#include <zephyr/kernel.h>
+
+#include "QcMessageSink.hpp"
+
+namespace qcbridge {
+
+// Runs QcMessageSink::onMessage() on its own thread, off Zephyr's internal
+// `usbh` thread - the uncompressed-message counterpart to
+// QcGzipInflater.hpp, which does the same for messages that need an inflate
+// step first. See QcSession::handleMessage() for why usbh thread work has
+// to stay to a single bounded memcpy: no decoding beyond the message
+// trailer, no logging, no real dispatch logic.
+//
+// Single in-flight slot, same tradeoff QcGzipInflater.hpp already made: a
+// message arriving while the previous one is still being dispatched is
+// dropped rather than queued. Dispatch work today is cheap (a counter
+// update, an occasional log line), so this should only drop under
+// pathological bursts - not something to assume can't happen, though:
+// QcFileStream.hpp's summary reports counts rather than assuming every
+// message was seen.
+class QcDispatcher {
+public:
+    QcDispatcher() { k_sem_init(&itemReadySem_, 0, 1); }
+
+    void setSink(QcMessageSink& sink) { sink_ = &sink; }
+
+    // Lazily starts the worker thread - same pattern as
+    // QcGzipInflater::start()/QcSession's own threads. Idempotent.
+    void start() {
+        if (threadStarted_) {
+            return;
+        }
+        k_thread_create(&thread_, stack_, K_KERNEL_STACK_SIZEOF(stack_), &threadEntryTrampoline, this,
+                        nullptr, nullptr, kThreadPriority, 0, K_NO_WAIT);
+        k_thread_name_set(&thread_, "qc_dispatch");
+        threadStarted_ = true;
+    }
+
+    // Called from QcSession::handleMessage() on the `usbh` thread - must
+    // stay cheap: a single bounded memcpy, nothing else. Returns false
+    // (message dropped) if a previous item hasn't finished dispatching yet,
+    // or if `protoBytes` is larger than this module's mailbox.
+    bool submit(uint16_t command, std::span<const uint8_t> protoBytes, size_t wireSize) {
+        if (busy_.exchange(true)) {
+            return false;
+        }
+        if (protoBytes.size() > mailbox_.size()) {
+            busy_.store(false);
+            return false;
+        }
+        std::copy(protoBytes.begin(), protoBytes.end(), mailbox_.begin());
+        mailboxLen_ = protoBytes.size();
+        mailboxCommand_ = command;
+        mailboxWireSize_ = wireSize;
+        k_sem_give(&itemReadySem_);
+        return true;
+    }
+
+private:
+    // Same priority band as QcGzipInflater - this isn't more or less urgent
+    // than an inflate.
+    static constexpr int kThreadPriority = 6;
+
+    // Mirrors QcGzip.hpp's kMaxCompressedInputSize, which itself mirrors
+    // QcHidBridge.hpp's kReassemblyCapacity (today's #33 placeholder, 4096
+    // bytes) - a message's protobuf payload can never be bigger than the
+    // whole reassembled HID message it came from. Not shared as one
+    // constant for the same reason QcGzip.hpp's comment gives: including
+    // QcHidBridge.hpp back here would be circular. Keep in sync by hand.
+    static constexpr size_t kMailboxCapacity = 4096;
+
+    static void threadEntryTrampoline(void* p1, void*, void*) { static_cast<QcDispatcher*>(p1)->run(); }
+
+    void run() {
+        while (true) {
+            k_sem_take(&itemReadySem_, K_FOREVER);
+            if (sink_ != nullptr) {
+                sink_->onMessage(mailboxCommand_, {mailbox_.data(), mailboxLen_}, mailboxWireSize_,
+                                 mailboxLen_, false);
+            }
+            busy_.store(false);
+        }
+    }
+
+    K_KERNEL_STACK_MEMBER(stack_, 2048);
+    struct k_thread thread_ {};
+    bool threadStarted_ = false;
+    struct k_sem itemReadySem_ {};
+
+    QcMessageSink* sink_ = nullptr;
+    std::atomic<bool> busy_{false};
+    std::array<uint8_t, kMailboxCapacity> mailbox_{};
+    size_t mailboxLen_ = 0;
+    size_t mailboxWireSize_ = 0;
+    uint16_t mailboxCommand_ = 0;
+};
+
+}  // namespace qcbridge

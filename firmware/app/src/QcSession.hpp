@@ -14,10 +14,14 @@
 
 #include "HidChunker.hpp"
 #include "HidReassembler.hpp"
+#include "QcDispatcher.hpp"
+#include "QcFileRequest.hpp"
+#include "QcFileStream.hpp"
 #include "QcGzip.hpp"
 #include "QcGzipInflater.hpp"
 #include "QcHandshakeMessages.hpp"
 #include "QcMessage.hpp"
+#include "QcMessageSink.hpp"
 #include "ScopedKMutex.hpp"
 #include "UsbHostClass.hpp"
 
@@ -41,17 +45,26 @@ namespace qcbridge {
 // sendMessage() is shared by both threads and guarded by sendMutex_ so
 // their HID reports can never interleave on the wire.
 //
-// General message dispatch beyond recognizing a Version reply (issue #5
-// Tier 2) is still out of scope here, see issue #7's body.
-class QcSession {
+// General message dispatch (issue #60): handleMessage() itself stays
+// minimal (see its own comment below) and hands every reassembled message
+// to either gzipInflater_ or dispatcher_, each of which calls back into this
+// class's QcMessageSink overrides (onMessage()/onInflateFailed()) from its
+// own worker thread - never from the `usbh` thread. That's also where the
+// File-read stream (fileStream_, see QcFileStream.hpp) gets its per-message
+// hook, kicked off right after the handshake in runHandshake() and polled
+// for its quiet/overall timeout from the heartbeat thread in runHeartbeat().
+class QcSession : public QcMessageSink {
 public:
     QcSession() {
         k_sem_init(&deviceReadySem_, 0, 1);
         k_sem_init(&versionReplySem_, 0, 1);
         k_sem_init(&heartbeatSem_, 0, 1);
         k_mutex_init(&sendMutex_);
+        k_mutex_init(&fileStreamMutex_);
         k_timer_init(&heartbeatTimer_, &heartbeatTimerExpiryTrampoline, nullptr);
         k_timer_user_data_set(&heartbeatTimer_, this);
+        dispatcher_.setSink(*this);
+        gzipInflater_.setSink(*this);
     }
 
     // Called from onProbe() (host stack thread) once a device is accepted.
@@ -64,14 +77,15 @@ public:
             k_thread_name_set(&thread_, "qc_session");
             threadStarted_ = true;
         }
+        dispatcher_.start();
         gzipInflater_.start();
         k_sem_give(&deviceReadySem_);
     }
 
     // Called from onReportIn() (host stack thread) once HidReassembler has
-    // completed a message. Only a Version reply is meaningful to the
-    // handshake right now; everything else is dropped - general dispatch
-    // is issue #5 Tier 2 work, not this issue's.
+    // completed a message. Hands the message off to a thread that can
+    // safely do real dispatch work and log (issue #60) - never processes it
+    // here.
     //
     // Deliberately does no logging of its own, and does not inflate a
     // gzip-compressed protoBytes in place - only detects it (issue #6: any
@@ -81,8 +95,9 @@ public:
     // own internal `usbh` thread (CONFIG_USBH_STACK_SIZE), not one of ours,
     // and CONFIG_LOG_MODE_IMMEDIATE means a log call's cbprintf formatting
     // runs synchronously on the calling thread's own stack. Keep this
-    // function free of logging and of real inflate work (see
-    // QcGzipInflater.hpp for why that includes gzip::inflate()) rather than
+    // function free of logging and of real work (decoding beyond the
+    // message trailer, dispatch logic, and - see QcGzipInflater.hpp for why
+    // that includes gzip::inflate() - decompression) rather than
     // re-deriving that the hard way again.
     void handleMessage(std::span<const uint8_t> message) {
         const auto decoded = decodeMessage(message);
@@ -91,13 +106,39 @@ public:
         }
 
         if (gzip::hasMagic(decoded->protoBytes)) {
-            gzipInflater_.submit(decoded->command, decoded->protoBytes);
+            gzipInflater_.submit(decoded->command, decoded->protoBytes, message.size());
             return;
         }
 
-        if (decoded->command == kCommandVersion && waitingForVersionReply_.load()) {
-            pendingVersionReply_ = decodeVersionReply(decoded->protoBytes);
+        dispatcher_.submit(decoded->command, decoded->protoBytes, message.size());
+    }
+
+    // QcMessageSink overrides - called from dispatcher_'s or gzipInflater_'s
+    // own worker thread (QcDispatcher.hpp/QcGzipInflater.hpp), never from
+    // `usbh`. Safe to log and do real work here.
+    void onMessage(uint16_t command, std::span<const uint8_t> protoBytes, size_t wireSize,
+                   size_t inflatedSize, bool compressed) override {
+        if (command == kCommandVersion && waitingForVersionReply_.load()) {
+            pendingVersionReply_ = decodeVersionReply(protoBytes);
             k_sem_give(&versionReplySem_);
+        }
+
+        if (command == kCommandFile) {
+            // LOG_DBG, not LOG_INF: a File stream is ~400 of these over
+            // ~12s (issue #60) - see QcFileStream.hpp's summary, logged at
+            // LOG_INF, for the readable, once-per-stream version of this.
+            LOG_DBG("File message: wire=%zu inflated=%zu compressed=%d", wireSize, inflatedSize,
+                    compressed);
+            ScopedKMutex lock(fileStreamMutex_);
+            fileStream_.onMessage(k_uptime_get(), wireSize, inflatedSize, compressed);
+        }
+    }
+
+    void onInflateFailed(uint16_t command, size_t wireSize, const char* reason) override {
+        if (command == kCommandFile) {
+            LOG_WRN("File message failed to inflate (wire=%zu bytes): %s", wireSize, reason);
+            ScopedKMutex lock(fileStreamMutex_);
+            fileStream_.onInflateFailed(k_uptime_get(), wireSize);
         }
     }
 
@@ -204,6 +245,20 @@ private:
         }
 
         LOG_INF("Session handshake complete (firmware version: %s)", mirroredVersion.c_str());
+
+        // File READ (issue #60): asks for the device's whole catalog, which
+        // comes back as a stream of File UPDATE messages - see
+        // QcFileStream.hpp for how that stream is collected and
+        // runHeartbeat() for where it's polled to a finish.
+        {
+            ScopedKMutex lock(fileStreamMutex_);
+            fileStream_.start(k_uptime_get());
+        }
+        msg.clear();
+        encodeFileRead(msg, nextRequestId());
+        if (!sendMessage(msg)) {
+            LOG_ERR("Handshake: failed to send File READ");
+        }
     }
 
     // Starts (or restarts, on a reconnect) the ~200ms KeepAlive heartbeat
@@ -248,6 +303,23 @@ private:
             encodeKeepAlive(msg);
             if (!sendMessage(msg)) {
                 LOG_WRN("KeepAlive send failed");
+            }
+
+            // Piggybacks on the heartbeat's own ~200ms cadence rather than
+            // running a separate timer - plenty of resolution against
+            // QcFileStream's 1500ms quiet window and 30s overall timeout,
+            // and keeps this off the `usbh` thread (see handleMessage()).
+            std::optional<QcFileStream::Summary> summary;
+            {
+                ScopedKMutex lock(fileStreamMutex_);
+                summary = fileStream_.checkTimeout(k_uptime_get());
+            }
+            if (summary) {
+                LOG_INF("File stream finished (%s): %u messages (%u compressed, %u failed), "
+                        "%zu wire bytes, %zu inflated bytes, %d ms",
+                        summary->timedOut ? "timeout" : "quiet", summary->messageCount,
+                        summary->compressedCount, summary->failedCount, summary->totalWireBytes,
+                        summary->totalInflatedBytes, static_cast<int>(summary->elapsedMs));
             }
         }
     }
@@ -310,7 +382,14 @@ private:
     std::optional<VersionReply> pendingVersionReply_;
     uint64_t requestIdCounter_ = 0;
 
+    QcDispatcher dispatcher_;
     QcGzipInflater gzipInflater_;
+
+    // Guards fileStream_: written from onMessage()/onInflateFailed() (the
+    // dispatcher_/gzipInflater_ worker threads) and read/finalized from
+    // runHeartbeat() - never from `usbh`.
+    struct k_mutex fileStreamMutex_ {};
+    QcFileStream fileStream_;
 };
 
 }  // namespace qcbridge
