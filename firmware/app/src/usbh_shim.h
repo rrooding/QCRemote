@@ -95,6 +95,20 @@ int qc_usbh_bridge_start(const struct qc_usbh_filter *filter, const struct qc_us
  */
 int qc_usbh_send_report(const uint8_t *report, size_t len);
 
+/*
+ * Total IN-endpoint transfers completed so far (successes and errors both -
+ * this counts in_xfer_cb() invocations, not reassembled messages). Added for
+ * issue #8's hardware diagnosis: on_report_in() and qc_usbh_send_report()
+ * share the USB host stack's single processing thread (see that function's
+ * doc comment above), so if sends every ~200ms ever starve or otherwise
+ * disrupt the continuous receive loop, this count going flat while the
+ * KeepAlive send count keeps climbing is the signal - as opposed to the
+ * device itself simply not sending anything, which this count can't
+ * distinguish by itself but at least rules in/out "our receive path is
+ * still alive at the transfer level".
+ */
+uint32_t qc_usbh_in_xfer_count(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -328,34 +328,73 @@ fields are deliberately left unset in `QcHandshakeMessages.hpp::encodeKeepAlive(
 — qc-mcp's own reference implementation never sets them either, so they
 never appear on the wire.
 
-**Hardware verification outstanding.** This has only been exercised in the
-`protocol_messages` Ztest suite (encoding only, 18/18 cases pass on
-`qemu_cortex_m3`) and a clean `frdm_rw612` build — not yet against a real
-Quad Cortex Mini. To check it on hardware:
+**Hardware verification outstanding, and the first attempt's log was inconclusive -
+not confirmed.** A real Quad Cortex Mini run of this PR's build produced the exact
+same handshake-then-silence trace #7 recorded *without* any heartbeat at all (41/331/
+10/14-byte burst, then nothing), and a follow-up preset change on the unit produced no
+console message either. **Correction to this section's first draft**: the claim below
+that the device should keep "pushing unprompted state reads well past the post-connect
+burst" was not actually grounded in anything - re-reading qc-mcp's `PROTOCOL.md` section
+3 directly, step 4's burst is a one-time thing, and the heartbeat's documented job is
+narrower: *"Writes land regardless of the heartbeat; reads require it."* Our firmware
+doesn't send any reads of its own yet (that's #9/#5 Tier 2), so there's no "nothing
+to show" expectation to begin with on its own - **except** that `PROTOCOL.md` is explicit
+that a preset *recall* on the device itself autonomously pushes `RecallPreset` + `Scene`
++ `SetlistPosition` + `RecentsFavorites` + `PresetDirty:false`, gated on the session
+being live the same way the rest of section 3 is. Getting *zero* console output after a
+preset change is real evidence against "the heartbeat is working and the session is
+live" - it just doesn't yet distinguish between these:
 
-1. Flash this build (`west flash`) and connect the device.
-2. Open the serial console (see Verify above) and confirm the handshake
-   still completes as in #7's trace, immediately followed by periodic
-   `sendReport` activity roughly every 200ms — there's no dedicated log line
-   per heartbeat send today (would be log-noisy at 5/sec), so look for the
-   device continuing to push unprompted state reads well past the
-   post-connect burst (seconds, not the single burst #7 recorded) rather
-   than going quiet. Expected log shape (abbreviated, repeating):
-   ```
-   <inf> main: Session handshake complete (firmware version: ...)
-   <inf> usbh_shim: IN transfer completed: 129 bytes
-   <inf> main: Reassembled message: NN bytes
-   ... (continuing indefinitely, not stopping after the initial burst) ...
-   ```
-3. Leave it connected for at least 30-60s and confirm reads/streaming keep
-   working the whole time (e.g. turn a knob on the unit and watch for a
-   corresponding reassembled message) — the acceptance criteria this issue
-   is checking is specifically that the session stays *active*, which only
-   shows up by absence of the device going quiet, not a single log line.
-4. If a `-EPIPE` continues to show up per send (expected per #7's quirk) but
-   reads stop after a while anyway, that would mean the heartbeat isn't
-   actually landing despite the stall tolerance - a real finding, not
-   something to assume won't happen.
+1. **The heartbeat isn't actually running/ticking** (a hung thread, a timer that never
+   fires again after the first expiry, etc.) - previously had zero console visibility
+   either way, since a successful or `-EPIPE`'d send (the documented quirk) logs nothing
+   by design.
+2. **The heartbeat runs but doesn't land** - wrong bytes, wrong command id, or the
+   control-transfer send not actually reaching the device despite returning success.
+3. **The device is ignoring/rejecting it** for a reason other than the bytes being wrong.
+4. **Our own receive path stalled** - `qc_usbh_send_report()`'s control transfer and the
+   continuous IN-endpoint receive loop share the USB host stack's single processing
+   thread (see `usbh_shim.h`'s doc comment on `qc_usbh_send_report()`); a send every
+   ~200ms contending with that shared thread, now happening continuously instead of 4
+   times total during the one-shot handshake, is a real mechanism worth ruling in or out,
+   not assumed.
+5. The already-noted `gotReply=0` (Version reply never recognized during the handshake,
+   falling back to `4.1.0`) might itself be a **real #7 bug**, not the already-accepted
+   quirk it was treated as: a 41-byte message arrives in exactly that window, and nothing
+   confirms whether that message *is* the Version reply arriving just too late for the
+   500ms wait, or something unrelated.
+
+This build adds diagnostics for all five, since the previous one had no way to tell them
+apart from the console:
+
+- `startHeartbeat()` now logs `KeepAlive heartbeat started (~200ms)` once, the first time
+  the heartbeat thread is created - if this line is missing, the heartbeat thread was
+  never started at all (rules out everything except "`runHandshake()` never reached the
+  end" - check for a `Handshake: failed to send ...` error line right before it).
+- `runHeartbeat()` now logs `KeepAlive heartbeat alive: N sent, last sendReport ret=R, M
+  IN transfers` every 25 sends (~5s) - proves the heartbeat thread is still ticking (not
+  hung) and shows what the control transfer is actually returning (`0`, `-EPIPE` per the
+  documented quirk, or something else). `M` is `UsbHostClass::inTransferCount()`
+  (new, `usbh_shim.c`) - the running count of IN-endpoint transfers completed, success or
+  error, independent of whether anything was reassembled into a logical message. If `M`
+  keeps climbing while nothing is ever reassembled, the receive path is alive but the
+  device genuinely isn't sending meaningful data; if `M` goes flat with no
+  `Failed to re-arm IN transfer` error either, the receive loop silently stalled - point
+  4 above, not point 1-3.
+- `handleMessage()` now logs `Message while awaiting Version reply: command=C, N bytes`
+  for anything that arrives during the handshake's Version-reply wait that isn't
+  recognized as one - settles point 5 directly: if `C` is `10` (`kCommandVersion`), the
+  41-byte message *is* the real reply landing too late, a genuine #7 timing bug to fix
+  separately; if it's something else, `gotReply=0` was correct and qc-mcp's own 150ms
+  wait (vs. our 500ms) suggests this device answers fast, so a late reply would be
+  surprising.
+
+**Next hardware step**: flash this build, reproduce the same preset-change test, and
+capture the **raw, unfiltered** console output (not just the `main`-module summary lines
+used above) from "Session handshake complete" onward for at least 30-60s, including
+whatever `usbh_shim`-module lines appear or stop appearing. That one capture should
+settle which of the five explanations above is live, per the specific signatures named
+next to each diagnostic line.
 
 ## Zephyr 4.5 upgrade (issue #54)
 

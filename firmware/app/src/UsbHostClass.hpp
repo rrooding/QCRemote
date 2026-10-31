@@ -53,6 +53,12 @@ public:
         return qc_usbh_send_report(report.data(), report.size());
     }
 
+    // Total completed IN-endpoint transfers so far - see
+    // qc_usbh_in_xfer_count()'s doc comment (usbh_shim.h) for why this
+    // exists: issue #8's hardware diagnosis needs to tell "the receive loop
+    // stalled" apart from "the device genuinely sent nothing".
+    static uint32_t inTransferCount() { return qc_usbh_in_xfer_count(); }
+
 protected:
     // Called once, before any device connects.
     virtual void onInit() {}

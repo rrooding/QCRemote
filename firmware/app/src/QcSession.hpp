@@ -80,6 +80,15 @@ public:
         if (decoded->command == kCommandVersion && waitingForVersionReply_.load()) {
             pendingVersionReply_ = decodeVersionReply(decoded->protoBytes);
             k_sem_give(&versionReplySem_);
+        } else if (waitingForVersionReply_.load()) {
+            // Diagnostic for issue #8's hardware report: a hardware trace
+            // showed a message arriving in this exact window yet still
+            // logged "No usable Version reply (gotReply=0)" - this settles
+            // whether that message actually was the Version reply (command
+            // == kCommandVersion, just too late for kVersionReplyTimeout -
+            // a real #7 latency bug) or something else entirely.
+            LOG_INF("Message while awaiting Version reply: command=%u, %zu bytes", decoded->command,
+                    message.size());
         }
     }
 
@@ -95,6 +104,14 @@ private:
     // Still below the main LED-blink loop's priority.
     static constexpr int kHeartbeatThreadPriority = 5;
     static constexpr k_timeout_t kHeartbeatInterval = K_MSEC(200);
+
+    // Every 25 sends (~5s at 200ms) rather than every send - issue #8's
+    // hardware report found a plain "it sent, nothing logged" heartbeat
+    // indistinguishable on the console from a hung one, since a successful
+    // or -EPIPE'd send (the documented quirk, see sendMessage() below)
+    // logs nothing by design. This is diagnostic visibility, not meant to
+    // be log-noisy at the full 5/sec cadence.
+    static constexpr uint32_t kHeartbeatLogInterval = 25;
 
     // Single device, single session at a time - a fixed id is enough (no
     // need for qc-mcp's Python client's random per-run UUID-style value).
@@ -188,6 +205,7 @@ private:
                             0, K_NO_WAIT);
             k_thread_name_set(&heartbeatThread_, "qc_heartbeat");
             heartbeatThreadStarted_ = true;
+            LOG_INF("KeepAlive heartbeat started (~200ms)");
         }
         // K_NO_WAIT for the first expiry: qc-mcp's own heartbeat loop
         // (transport.py::_start_heartbeat) sends immediately on start, then
@@ -215,6 +233,23 @@ private:
             if (!sendMessage(msg)) {
                 LOG_WRN("KeepAlive send failed");
             }
+
+            // A successful or -EPIPE'd send (the documented quirk) logs
+            // nothing on its own, so a hung/stalled heartbeat would be
+            // silent too - this periodic line is the only console evidence
+            // that the heartbeat thread is actually still ticking (issue
+            // #8's hardware report had no way to tell). inTransferCount()
+            // alongside it shows whether the receive loop is still being
+            // driven at all, independent of whether any message has been
+            // reassembled - sendReport() and on_report_in() share the USB
+            // host stack's one processing thread (usbh_shim.h), so a send
+            // every ~200ms contending with it is exactly the kind of thing
+            // this is meant to catch.
+            if (++heartbeatSendCount_ % kHeartbeatLogInterval == 0) {
+                LOG_INF("KeepAlive heartbeat alive: %u sent, last sendReport ret=%d, "
+                        "%u IN transfers",
+                        heartbeatSendCount_, lastSendReportRet_, UsbHostClass::inTransferCount());
+            }
         }
     }
 
@@ -231,6 +266,7 @@ private:
 
         while (chunker.next({report.data(), report.size()})) {
             const int ret = UsbHostClass::sendReport({report.data(), report.size()});
+            lastSendReportRet_ = ret;
             if (ret != 0 && ret != -EPIPE) {
                 LOG_ERR("sendReport failed: %d", ret);
                 return false;
@@ -264,6 +300,8 @@ private:
     bool heartbeatThreadStarted_ = false;
     struct k_timer heartbeatTimer_ {};
     struct k_sem heartbeatSem_ {};
+    uint32_t heartbeatSendCount_ = 0;
+    int lastSendReportRet_ = 0;
 
     struct k_mutex sendMutex_ {};
 

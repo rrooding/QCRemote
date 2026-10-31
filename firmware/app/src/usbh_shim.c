@@ -52,6 +52,7 @@ static struct usb_device *claimed_udev;
 static uint8_t ep_in;
 static struct uhc_transfer *in_xfer;
 static bool receiving;
+static uint32_t in_xfer_count;
 
 static int shim_init(struct usbh_class_data *const c_data)
 {
@@ -106,6 +107,8 @@ static int in_xfer_cb(struct usb_device *const dev, struct uhc_transfer *const x
 	(void)dev;
 
 	struct net_buf *buf = xfer->buf;
+
+	in_xfer_count++;
 
 	if (xfer->err != 0) {
 		LOG_WRN("IN transfer completed with error: %d", xfer->err);
@@ -312,4 +315,9 @@ int qc_usbh_send_report(const uint8_t *report, size_t len)
 
 	usbh_xfer_buf_free(claimed_udev, buf);
 	return ret;
+}
+
+uint32_t qc_usbh_in_xfer_count(void)
+{
+	return in_xfer_count;
 }
