@@ -330,11 +330,9 @@ suites (`hid_framing`, `protocol_messages`) on `qemu_cortex_m3` — all 24 cases
 `frdm_rw612` and `CONFIG_STD_CPP23` both still exist in v4.5.0, confirmed directly against
 the checked-out source, not assumed.
 
-**Not done here**: re-verification against a real Quad Cortex Mini (the "Verified" hardware
-logs elsewhere in this file) — no device was attached in this pass. The build and test
-results above give no reason to expect different behavior, since none of the USB host
-transfer/endpoint-discovery code paths changed, but that's still unconfirmed on real
-hardware until someone runs through it with the device connected.
+**Verified 2026-10-31** against a real Quad Cortex Mini on the v4.5.0 build: the full
+enumerate → claim → discover → receive → session-handshake flow this file documents above
+still works end-to-end.
 
 ## Not yet done
 
