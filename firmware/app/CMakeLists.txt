@@ -14,7 +14,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(etl)
 
 # miniz (https://github.com/richgel999/miniz) - issue #6's gzip detection
-# for compressed message payloads, see ADR 0004. We want only its
+# for compressed message payloads, see ADR 0005. We want only its
 # low-level inflate function (tinfl_decompress), not the deflate/zip-
 # archive/zlib-wrapper code the rest of miniz also provides, and not its
 # own CMakeLists.txt (which builds all of that as one target and calls

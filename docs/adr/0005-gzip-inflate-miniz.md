@@ -1,4 +1,4 @@
-# ADR 0004: miniz (tinfl-only) for issue #6's generic gzip inflate, run off the usbh thread
+# ADR 0005: miniz (tinfl-only) for issue #6's generic gzip inflate, run off the usbh thread
 
 Date: 2026-10-31
 Status: Accepted
@@ -73,6 +73,46 @@ malformed/truncated/CRC-mismatched, and letting the caller treat the message as 
 (same as `HidReassembler::Status::Overflow`/`Malformed` already do), is the safer default on
 a device with no interactive user to notice a wrong answer.
 
+### Does qc-mcp's lenient fallback exist for a reason?
+
+Before deciding not to reproduce it, we looked for one. qc-mcp's upstream history
+(`lexasoft123/qc-mcp`, four commits total) shows `gunzip()` - the strict
+`zlib.decompress()` call, the `except` catching it, and the non-validating
+`decompressobj().decompress()` fallback inside that `except` - present **unchanged since the
+very first commit** ("Initial release: Quad Cortex MCP server"), with no comment explaining
+it and no commit message, PROTOCOL.md section, or GitHub issue (searched the repo's issues
+for `gzip`/`gunzip`/`decompress`/`truncat`) ever mentioning why. Neither of the two later
+commits that touched `protocol.py` (`3121ae72` "Support CorOS 4.1", `a697607c` "Fix nine
+issues found reviewing the 4.1 branch" - the latter specifically a correctness-bug-fixing
+pass) touched `gunzip()` at all.
+
+More telling: the one call site in qc-mcp that handles a large, *real*, device-originated
+gzip payload - `catalog.py::load_from_bytes()`, decompressing `ModelRepo`'s gzip+tar
+`model_repo_payload` - uses a single plain `zlib.decompress()` call with **no** try/except,
+no fallback, nothing. If truncated/partial gzip streams from the real device were a problem
+this project had actually hit, the catalog path is exactly where it would have shown up
+first (by far the largest compressed payload the device sends), and exactly where you'd
+expect the same defensive handling to have been added - it wasn't.
+
+**We found no evidence the fallback exists because of anything observed from real device
+behavior.** It reads as generic defensive/"try harder" coding rather than a documented
+response to a real truncation case. That's not proof it's *never* needed - absence of a
+comment doesn't prove absence of a reason - but it's also not evidence *for* keeping the
+equivalent behavior here, and the one real-payload code path in the same codebase argues
+against it. Combined with the reasoning above (a firmware decoder has no good way to flag
+"unverified" data to a caller), **this ADR keeps the strict-only decision**: `inflate()`
+fails closed and does not attempt qc-mcp's non-validating fallback. If real device traffic
+ever does turn up a stream that strict validation rejects but qc-mcp's lenient path would
+have accepted, that's new evidence this ADR doesn't have today - revisit it then, with a
+concrete payload to reason about, rather than guessing now.
+
+What does change here: a failed inflate must be *visible*, not just dropped, so that the
+first time real traffic actually exercises this path and fails, it's obvious rather than a
+silent no-op. `QcGzipInflater`'s worker thread (never `usbh` - safe to call `LOG_*` there)
+logs every outcome, success or failure, naming the specific `InflateError` via
+`gzip::toString()` (e.g. `"CrcMismatch"`, not just an opaque integer) alongside the command
+id and compressed size - see `QcGzipInflater.hpp::run()`.
+
 `QcSession::handleMessage()` (still on the `usbh` thread) only adds the cheap part: a 3-byte
 magic check (`gzip::hasMagic()`) on `decoded->protoBytes`, right after `decodeMessage()`
 splits it out. If present, it hands the compressed bytes to a new `QcGzipInflater`, which
@@ -97,7 +137,7 @@ streaming decompression) regardless of this constant.
 ## Consequences
 
 - **Measured cost on `frdm_rw612`** (clean `west build`, this change vs. the same build at
-  `434439e`, the commit immediately before this one): **FLASH +4728 B** (76064 B -> 80792 B,
+  `434439e`, the commit immediately before this one): **FLASH +4860 B** (76064 B -> 80924 B,
   0.11% -> 0.12% of the board's 64MB external flash - negligible), **RAM +33160 B**
   (56736 B -> 89896 B, 5.77% -> 9.14% of the board's 960KB SRAM). The RAM increase is almost
   entirely the module's own static buffers, not code: `tinfl_decompressor`'s Huffman-table

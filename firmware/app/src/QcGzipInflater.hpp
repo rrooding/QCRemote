@@ -113,8 +113,13 @@ private:
             if (result) {
                 LOG_INF("Inflated command %u: %zu -> %zu bytes", mailboxCommand_, mailboxLen_, result->size());
             } else {
-                LOG_WRN("Inflate failed for command %u (%zu compressed bytes): error %d", mailboxCommand_,
-                        mailboxLen_, static_cast<int>(result.error()));
+                // Named, not just the raw enum value, so the first real
+                // compressed message that fails shows up in a log as
+                // e.g. "CrcMismatch" rather than an opaque "error 5" -
+                // see ADR 0005's note on qc-mcp's gunzip() fallback for
+                // why a failure here needs to be obvious, not silent.
+                LOG_WRN("Inflate failed for command %u (%zu compressed bytes): %s", mailboxCommand_, mailboxLen_,
+                        gzip::toString(result.error()));
             }
             // No dispatch of `result`'s decompressed bytes yet - see this
             // class's header comment. A future consumer (#5 Tier 2 / #9)

@@ -17,7 +17,7 @@ namespace qcbridge::gzip {
 // buffer, which is what its separate gunzip() helper does for a different
 // call site. Matched here deliberately: a command whose plain protobuf
 // encoding happens to contain "\x1f\x8b\x08" somewhere past byte 0 must
-// NOT be treated as compressed. See ADR 0004.
+// NOT be treated as compressed. See ADR 0005.
 inline constexpr std::array<uint8_t, 3> kMagic = {0x1f, 0x8b, 0x08};
 
 inline bool hasMagic(std::span<const uint8_t> data) {
@@ -32,6 +32,29 @@ enum class InflateError {
     DecompressFailed, // tinfl reported a corrupt deflate stream
     CrcMismatch,      // decompressed fully, but the trailer's CRC32/length didn't match
 };
+
+// For logging (QcGzipInflater.hpp) - so the first real compressed message
+// that fails to inflate shows up as, say, "CrcMismatch" rather than an
+// opaque integer. Not used for control flow anywhere, so a missing case
+// just falls through to the default rather than needing exhaustiveness.
+inline const char* toString(InflateError error) {
+    switch (error) {
+    case InflateError::NotGzipped:
+        return "NotGzipped";
+    case InflateError::HeaderMalformed:
+        return "HeaderMalformed";
+    case InflateError::Truncated:
+        return "Truncated";
+    case InflateError::OutputTooLarge:
+        return "OutputTooLarge";
+    case InflateError::DecompressFailed:
+        return "DecompressFailed";
+    case InflateError::CrcMismatch:
+        return "CrcMismatch";
+    default:
+        return "Unknown";
+    }
+}
 
 // Upper bound on the *compressed* gzip member this module will accept.
 // Matches QcHidBridge.hpp's kReassemblyCapacity (today's issue #33
@@ -95,7 +118,7 @@ inline uint32_t readLE32(std::span<const uint8_t, 4> bytes) {
 // the decompressed output. qc-mcp's own gunzip() helper (protocol.py)
 // falls back to a non-validating streaming decompress when its first,
 // strict attempt raises - that fallback is deliberately NOT reproduced
-// here. See ADR 0004 for why: a firmware decoder failing closed on
+// here. See ADR 0005 for why: a firmware decoder failing closed on
 // malformed/truncated/corrupt input is preferable to one that silently
 // hands a caller partially-decompressed bytes it has no way to tell apart
 // from a real, complete payload.

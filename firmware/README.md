@@ -18,7 +18,7 @@ firmware/
     │   ├── QcHidBridge.hpp         # claims the QC Mini's HID interface, on top of UsbHostClass
     │   ├── HidReassembler.hpp      # qc-mcp framing: reports in, one logical message out
     │   ├── HidChunker.hpp          # qc-mcp framing: a message in, reports out
-    │   ├── QcGzip.hpp              # issue #6: gzip detection + inflate (ADR 0004)
+    │   ├── QcGzip.hpp              # issue #6: gzip detection + inflate (ADR 0005)
     │   └── QcGzipInflater.hpp      # issue #6: runs QcGzip.hpp off the usbh thread
     └── tests/
         ├── hid_framing/            # Ztest suite for HidReassembler/HidChunker - no hardware needed
