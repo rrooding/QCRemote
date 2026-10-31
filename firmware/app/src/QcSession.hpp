@@ -94,6 +94,15 @@ public:
             lastUnexpectedCommand_.store(decoded->command);
             lastUnexpectedSize_.store(message.size());
             hasUnexpectedMessage_.store(true);
+        } else if (decoded->command == kCommandVersion) {
+            // A Version reply arriving after the wait above already closed
+            // (kVersionReplyTimeout) - issue #8's hardware report always
+            // saw gotReply=0, so this tells the next report whether our
+            // Version READ is ever actually answered at all, just late, or
+            // genuinely never. Counted (not stashed-and-logged-once) since
+            // this can fire repeatedly; reported periodically from
+            // runHeartbeat(), same reasoning as every other counter there.
+            lateVersionReplyCount_.fetch_add(1);
         }
     }
 
@@ -269,8 +278,9 @@ private:
             // this is meant to catch.
             if (++heartbeatSendCount_ % kHeartbeatLogInterval == 0) {
                 LOG_INF("KeepAlive heartbeat alive: %u sent, last sendReport ret=%d, "
-                        "%u IN transfers",
-                        heartbeatSendCount_, lastSendReportRet_, UsbHostClass::inTransferCount());
+                        "%u IN transfers, %u late Version replies",
+                        heartbeatSendCount_, lastSendReportRet_, UsbHostClass::inTransferCount(),
+                        lateVersionReplyCount_.load());
             }
         }
     }
@@ -294,18 +304,34 @@ private:
                 return false;
             }
             if (ret == -EPIPE) {
-                // PROTOCOL.md §1: "macOS quirk: IOHIDDeviceSetReport returns a
-                // benign 0xe0005000 on this device - the official app ignores
-                // it too, and the data is still sent. Not an error." -EPIPE
-                // here is the same thing one layer down: the SET_REPORT
-                // control transfer's status stage reports a stall on this
-                // device even though the data stage completed and the device
-                // acted on it. Confirmed on real hardware (#7): with this in
-                // place the handshake completes and the device immediately
-                // starts streaming its post-connect burst of state reads -
-                // proof the sends landed despite the reported stall.
-                LOG_DBG("sendReport: -EPIPE (documented benign quirk, PROTOCOL.md §1) - "
-                        "continuing");
+                // PROTOCOL.md §1 describes a macOS quirk where
+                // IOHIDDeviceSetReport returns a benign-looking error on
+                // this device while the data still lands. #7 assumed
+                // -EPIPE here was the same thing one layer down, reasoning
+                // from indirect evidence (the handshake's post-connect
+                // burst happening afterward). Issue #8's hardware testing
+                // put real doubt on that: every KeepAlive send also returns
+                // -EPIPE (850+ in a row, one real run), yet the device
+                // shows zero effect of any kind - no new IN transfers, no
+                // reply to a repeated preset-change test. qc-mcp's own
+                // transport.py has a telling comment on this exact
+                // ambiguity: a write error that looks benign on an
+                // exclusive handle is "exactly what a write that never
+                // reaches the device returns" on a shared one - the same
+                // error code, two different real meanings, context-
+                // dependent. Zephyr's NXP EHCI driver (uhc_mcux_ehci.c)
+                // doesn't help settle it either: -EPIPE is a single
+                // pass/fail result for the *whole* control transfer, and
+                // transferSofar is only tracked for IN-direction transfers
+                // (this is OUT), so there's no byte count to check even in
+                // principle. Treating -EPIPE as non-fatal (continuing
+                // rather than erroring out) is still the pragmatic choice -
+                // see firmware/README.md's KeepAlive section for the
+                // current state of this investigation and why a stricter
+                // treatment hasn't replaced it (not enough to confirm
+                // either reading yet).
+                LOG_DBG("sendReport: -EPIPE (benign per #7, now unconfirmed - see "
+                        "firmware/README.md) - continuing");
             }
         }
         return true;
@@ -339,6 +365,10 @@ private:
     std::atomic<bool> hasUnexpectedMessage_{false};
     std::atomic<uint16_t> lastUnexpectedCommand_{0};
     std::atomic<size_t> lastUnexpectedSize_{0};
+
+    // Written from handleMessage() (usbh thread), read from runHeartbeat()
+    // (heartbeat thread) - see handleMessage() for what this counts.
+    std::atomic<uint32_t> lateVersionReplyCount_{0};
 };
 
 }  // namespace qcbridge

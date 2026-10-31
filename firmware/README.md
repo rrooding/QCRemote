@@ -435,14 +435,84 @@ Fixed:
 same as confirming the heartbeat itself works, and the five explanations from the previous
 section are all still open.
 
+### The fixed build didn't crash - and most of the five explanations are now narrowed
+
+Commit `7c4ecdc` ran without crashing: `KeepAlive heartbeat started` logged, the periodic
+status line showed `25 sent` then `50 sent` ~5s apart (point 1 - **not hung**, confirmed),
+and a follow-up run let it reach **850 sends over ~170s** with `qc_heartbeat`'s own stack
+report showing `960/2048 bytes used (46%)` - healthy margin, no risk of the heartbeat
+thread itself being the problem. The diagnostic line also resolved point 5 directly: the
+41-byte message during the Version-reply wait decoded as **command 52**
+(`kCommandResetCommsBuffers`), not `10` - **not** a late Version reply. That specific
+mismatch theory is closed.
+
+But across that entire 850-send run, `inTransferCount()` **never moved past 6** (the count
+right after the initial post-connect burst) - no new IN transfers at all, success or error,
+for nearly three minutes of heartbeat activity and the preset-change test. Every single
+send still returned `ret=-32` (`-EPIPE`). A flat IN count is consistent with *either*
+remaining theory (device genuinely silent, or our receive loop itself stalled) - it doesn't
+separate them on its own, and the later `THREAD_ANALYZER` reports for `usbh` and
+`qc_session` (which would show whether *those* threads are still healthy too) haven't been
+captured yet, only `qc_heartbeat`'s.
+
+**New finding this round, from re-reading qc-mcp's own source rather than re-asserting the
+#7 assumption**: `transport.py`'s `send()` has a comment directly on point - the same
+error code this device returns is, by qc-mcp's own account, ambiguous:
+
+> on Windows `ERROR_GEN_FAILURE(31)` comes back even on an exclusive handle whose writes
+> plainly do land... But it is also exactly what a write that never reaches the device
+> returns, which is how a shared handle can look like it is controlling the QC while every
+> write is dropped. So: count it, expose it, don't guess.
+
+qc-mcp's own authors explicitly chose **not** to assume this error is benign - they count
+it (`write_errors`) and let the caller see it, specifically because the same-looking error
+has two different real meanings depending on context (and, notably, does **not** raise or
+treat it as instantly fatal either - they keep going and let the call site judge). #7's
+firmware comment asserting "-EPIPE... confirmed... the sends landed despite the reported
+stall" was reasoning from indirect evidence (the burst happened to arrive afterward) in a
+single test, not a confirmed equivalence to qc-mcp's own (different, OS-HID-API-level)
+quirk. Checked how far that indirect evidence actually goes in Zephyr's own driver source:
+`usbh_req_setup()` (`subsys/usb/host/usbh_ch9.c`) returns `xfer->err`, a single pass/fail
+result for the *entire* control transfer (setup+data+status), and the NXP EHCI driver
+(`uhc_mcux_ehci.c`) only copies `transferSofar` (bytes actually transferred) into the
+caller-visible buffer for **IN**-direction transfers - our `SET_REPORT` is OUT, so there is
+no byte count available even in principle to tell "stalled after all data landed" apart
+from "stalled before any of it did." **This is undecided, not confirmed either way, and
+isn't resolvable from this codebase's side of the stack alone.**
+
+Also checked: byte-for-byte, our outgoing wire format matches qc-mcp's exactly -
+`message_to_reports()`'s report layout (`[reportId][chunkLen][flags][payload]`, same flag
+values `0x00/0x40/0x80/0xC0`), `encode_message()`'s trailer (`command u16 LE, 0, hash u16`),
+and the `KeepAlive`/`Version` field numbers all line up against `protocol.py`/
+`ProductionAutomation.proto`. The `SET_REPORT` setup packet
+(`bmRequestType=0x21, bRequest=0x09, wValue=0x0202, wLength=129`) is also textbook-correct
+per the HID 1.11 spec and matches the device's own report descriptor decoded in #7's
+section above. **Nothing wrong was found in the bytes themselves** - which, combined with
+everything else this round, shifts the weight toward "the control transfer genuinely isn't
+landing" over "we're sending something subtly wrong."
+
+New diagnostic added (`runHeartbeat()`'s periodic line now also reports a late-Version-
+reply count): `handleMessage()` now also counts any `Version` reply arriving **after**
+`kVersionReplyTimeout` already closed, not just during the wait - so the next run shows
+whether our `Version READ` is *ever* answered at all, just slow, or genuinely never, which
+bears directly on whether sends are reaching the device at all.
+
+**Recommended next step - a control check qc-mcp itself can run, not more firmware
+instrumentation**: have the owner run qc-mcp (or Cortex Control) against this exact same
+physical unit and confirm its own preset-change test produces the expected
+`RecallPreset`/`Scene`/`SetlistPosition`/`RecentsFavorites`/`PresetDirty` pushes.
+This doesn't test our firmware's `SET_REPORT` implementation directly (qc-mcp goes through
+the OS's own HID driver stack, not a raw USB host control transfer), but it does establish
+whether *this unit* answers at all right now - ruling out a bad cable/port/unit state
+independently of anything in this codebase. **Not performed here** - this PR doesn't touch
+the device itself.
+
 **Next hardware step**: flash this build, reproduce the same preset-change test, and
-capture the **raw, unfiltered** console output (not just the `main`-module summary lines
-used above) from "Session handshake complete" onward for at least 30-60s, including
-whatever `usbh_shim`-module lines and `THREAD_ANALYZER`/`usage` lines appear (or stop
-appearing). That capture should settle which of the five explanations above is live, per
-the specific signatures named next to each diagnostic line, and the stack-usage report
-should show real margins for `usbh`, `qc_session`, and `qc_heartbeat` instead of the
-estimates above.
+capture the **raw, unfiltered** console output from "Session handshake complete" onward
+for 30-60s+, including every `usbh_shim`-module line and **all** `THREAD_ANALYZER` reports
+(not just `qc_heartbeat`'s - `usbh`, `qc_session`, `sysworkq`, `main`, etc. too). Separately
+(or instead, if the unit/qc-mcp setup is available), the qc-mcp control check above would
+be the more decisive result.
 
 ## Zephyr 4.5 upgrade (issue #54)
 

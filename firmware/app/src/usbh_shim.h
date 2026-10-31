@@ -87,11 +87,18 @@ int qc_usbh_bridge_start(const struct qc_usbh_filter *filter, const struct qc_us
  *
  * Returns 0 on success, a negative errno otherwise (no device claimed,
  * out of memory, or whatever usbh_req_setup() itself returns - including
- * -ETIMEDOUT). Returns the real transfer result, including -EPIPE: per
- * PROTOCOL.md §1, this device's SET_REPORT stalls its status stage even on
- * macOS/Windows reference implementations ("the official app ignores it
- * too, and the data is still sent. Not an error") - this function doesn't
- * swallow that quirk itself, callers that care should. See QcSession.hpp.
+ * -ETIMEDOUT). Returns the real transfer result, including -EPIPE, which
+ * every send to this device returns on real hardware - this function
+ * doesn't swallow that itself, callers that care should (see
+ * QcSession.hpp). PROTOCOL.md §1 documents a macOS quirk where
+ * IOHIDDeviceSetReport returns a benign-looking error while the data still
+ * lands, and #7 assumed -EPIPE here was the same thing one layer down -
+ * issue #8's hardware testing put real doubt on that (see
+ * firmware/README.md's KeepAlive section): usbh_req_setup() (usbh_ch9.c)
+ * returns a single pass/fail result for the whole control transfer, with
+ * no way to tell a status-stage-only stall apart from the data stage never
+ * completing - the underlying MCUX EHCI driver only tracks bytes
+ * transferred for IN-direction transfers, and this is OUT.
  */
 int qc_usbh_send_report(const uint8_t *report, size_t len);
 
