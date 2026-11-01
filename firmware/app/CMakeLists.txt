@@ -70,3 +70,9 @@ target_compile_definitions(app PRIVATE
   MINIZ_NO_ZLIB_APIS
 )
 target_link_libraries(app PRIVATE etl::etl)
+
+# Issue #71: links QcWifiWebTransport.hpp's HTTP_SERVICE_DEFINE(qcWebService,
+# ...) to its own iterable-section linker fragment (sections-rom.ld) - see
+# that file's own comment for why this is required, not optional, wiring.
+zephyr_linker_sources(SECTIONS sections-rom.ld)
+zephyr_linker_section(NAME http_resource_desc_qcWebService KVMA RAM_REGION GROUP RODATA_REGION)
