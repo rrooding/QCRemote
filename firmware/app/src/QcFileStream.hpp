@@ -69,6 +69,28 @@ public:
         uint32_t reassemblyMalformedCount = 0;
     };
 
+    // Whether a listing built from this Summary can be trusted as complete
+    // - issue #10 Copilot review. A dropped/overflowed/failed message, or
+    // the catalog itself running out of room (`catalogOverflowed`, a
+    // separate thing from the device never sending everything), both mean
+    // real data was lost. `summary.timedOut` means something different but
+    // just as real: checkTimeout() above deactivates the stream the
+    // instant kOverallTimeoutMs is hit *even if messages are still
+    // arriving* - QcSession::onMessage() gates every write on isActive()
+    // (see its own comment), so any preset the device was still sending
+    // past that instant never reaches the catalog, with nothing else here
+    // to count it as dropped. A previous version of this logic left
+    // timedOut out, reasoning a timeout alone wasn't itself evidence of
+    // loss - true for the no-messages-at-all case, but wrong for this one;
+    // folded into the OR below rather than carried as a separate carve-out.
+    // Pulled out as a free function (no QcSession/USB dependency) so it's
+    // unit-testable on its own - see tests/dispatch_messages.
+    static bool isListingIncomplete(const Summary& summary, bool catalogOverflowed) {
+        return summary.timedOut || summary.failedCount > 0 || summary.dispatcherDropped > 0 ||
+               summary.gzipDropped > 0 || summary.reassemblyOverflowCount > 0 ||
+               summary.reassemblyMalformedCount > 0 || catalogOverflowed;
+    }
+
     // Called once, right after the handshake completes.
     void start(int64_t nowMs) {
         active_ = true;
