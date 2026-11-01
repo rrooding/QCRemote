@@ -15,6 +15,7 @@
 #include "HidChunker.hpp"
 #include "HidReassembler.hpp"
 #include "QcDispatcher.hpp"
+#include "QcFileMessage.hpp"
 #include "QcFileRequest.hpp"
 #include "QcFileStream.hpp"
 #include "QcGzip.hpp"
@@ -23,6 +24,8 @@
 #include "QcMessage.hpp"
 #include "QcMessageSink.hpp"
 #include "QcMessageTally.hpp"
+#include "QcPresetCatalog.hpp"
+#include "QcPresetPrinter.hpp"
 #include "QcStateReads.hpp"
 #include "ScopedKMutex.hpp"
 #include "UsbHostClass.hpp"
@@ -81,6 +84,7 @@ public:
         }
         dispatcher_.start();
         gzipInflater_.start();
+        presetPrinter_.start();
         k_sem_give(&deviceReadySem_);
     }
 
@@ -157,6 +161,15 @@ public:
         postStreamTally_.record(command);
         if (command == kCommandFile && fileStream_.isActive()) {
             fileStream_.onMessage(k_uptime_get(), wireSize, inflatedSize, compressed);
+            // issue #10/#9: decodeFile()'s FilePreset fields are views into
+            // `protoBytes`, which belongs to the dispatcher/gzip-inflater
+            // mailbox this callback was invoked from and gets overwritten by
+            // the next message - presetCatalog_.addPreset() copies what it
+            // keeps before this call returns (QcPresetCatalog.hpp). Gating on
+            // fileStream_.isActive() under this same lock is also what keeps
+            // the catalog quiescent the moment the stream finishes, which is
+            // what lets QcPresetPrinter.hpp read it without a lock of its own.
+            decodeFile(protoBytes, [this](const FilePreset& preset) { presetCatalog_.addPreset(preset); });
         }
     }
 
@@ -350,6 +363,10 @@ private:
         {
             ScopedKMutex lock(fileStreamMutex_);
             fileStream_.start(k_uptime_get());
+            // issue #10: a new listing (first connect or a reconnect, both
+            // reach here via runHandshake()) must not carry over a previous
+            // one's presets.
+            presetCatalog_.reset();
             dispatcherDroppedAtStart_ = dispatcher_.droppedCount();
             gzipDroppedAtStart_ = gzipInflater_.droppedCount();
             reassemblyOverflowAtStart_ = reassemblyOverflowCount_.load(std::memory_order_relaxed);
@@ -520,6 +537,19 @@ private:
                 summary.gzipDropped, summary.reassemblyOverflowCount, summary.reassemblyMalformedCount,
                 totalInTransfersThisStream);
 
+        // issue #10: a dropped/overflowed/failed File message above, or the
+        // catalog itself running out of room (QcPresetCatalog::overflowed()
+        // - a separate thing from the device never sending everything),
+        // both mean the printed listing can't be trusted as complete -
+        // QcPresetPrinter.hpp says so plainly either way. timedOut isn't
+        // included here by itself: it means the stream never went quiet
+        // within kOverallTimeoutMs, which isn't itself evidence of a
+        // dropped or overflowed message.
+        const bool incomplete = summary.failedCount > 0 || summary.dispatcherDropped > 0 ||
+                                 summary.gzipDropped > 0 || summary.reassemblyOverflowCount > 0 ||
+                                 summary.reassemblyMalformedCount > 0 || presetCatalog_.overflowed();
+        presetPrinter_.requestPrint(presetCatalog_, incomplete);
+
         LOG_INF("Post-connect tally started: watching for preset-change pushes "
                 "(RecallPreset/Scene/SetlistPosition/...) - issue #61");
         // issue #61's preset-change check needs visibility into whatever
@@ -636,6 +666,14 @@ private:
 
     QcDispatcher dispatcher_;
     QcGzipInflater gzipInflater_;
+
+    // issue #10/#9: populated from onMessage() (dispatcher thread) while
+    // fileStream_ is active, reset at the same point fileStream_.start() is
+    // called (runHandshake()), and printed by presetPrinter_ once the
+    // stream finishes - see QcPresetCatalog.hpp/QcPresetPrinter.hpp for the
+    // full thread-safety reasoning.
+    QcPresetCatalog presetCatalog_;
+    QcPresetPrinter presetPrinter_;
 
     // Written from QcHidBridge::onReportIn() on the `usbh` thread (atomic
     // increment only - see recordReassemblyOverflow()/recordReassemblyMalformed()
