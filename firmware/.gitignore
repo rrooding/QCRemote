@@ -1,5 +1,6 @@
 build/
 build-*/
+twister-out*/
 *.uf2
 *.elf
 *.hex
