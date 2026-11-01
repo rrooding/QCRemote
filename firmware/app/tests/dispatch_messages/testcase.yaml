@@ -1,4 +1,6 @@
 tests:
   firmware.dispatch_messages:
-    platform_allow: native_sim
+    platform_allow:
+      - native_sim
+      - qemu_cortex_m3
     tags: firmware

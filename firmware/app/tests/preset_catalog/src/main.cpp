@@ -274,3 +274,78 @@ ZTEST(preset_catalog, test_long_preset_name_is_truncated_not_overflowed)
     zassert_true(folders[0].presets[0].name.size() <= QcPresetCatalog::kNameCapacity,
                  "name is bounded by kNameCapacity, not left as a dangling view");
 }
+
+ZTEST(preset_catalog, test_long_folder_name_is_truncated_not_overflowed)
+{
+    // Same check as the preset-name case above, for the folder's own
+    // display name (issue #10 Copilot review's "also check the display
+    // name's truncation behaviour" - folder identity no longer depends on
+    // this field at all, see the long-key tests below, but it still needs
+    // to truncate safely rather than overflow/assert).
+    const std::string longName(200, 'n');
+    const auto folder = buildFolder("1_q", longName, {"Lead Tone"});
+    const auto proto = buildFileMessage(folder);
+
+    QcPresetCatalog& catalog = freshCatalog();
+    decodeInto(catalog, {proto.data(), proto.size()});
+
+    const auto folders = catalog.folders();
+    zassert_equal(folders.size(), 1u, "expected one folder");
+    zassert_true(folders[0].name.size() <= QcPresetCatalog::kNameCapacity,
+                 "folder display name is bounded by kNameCapacity, not left dangling");
+}
+
+// --- folder identity is independent of the bounded display key -------------
+
+ZTEST(preset_catalog, test_long_folder_key_registers_one_folder_not_one_per_preset)
+{
+    // Longer than kNameCapacity (32) - real plugin "User" folder keys
+    // already run past that (issue #10 Copilot review). Before the fix,
+    // findFolder() compared the *truncated* stored key against each new
+    // preset's full key and never matched, so every one of these five
+    // presets registered its own new folder and would have exhausted
+    // kMaxFolders (8) well before all of them were seen.
+    const std::string longKey(50, 'k');
+    const std::vector<std::string_view> slots = {"Preset A", "Preset B", "Preset C", "Preset D",
+                                                   "Preset E"};
+
+    const auto folder = buildFolder(longKey, "Long Key Folder", slots);
+    const auto proto = buildFileMessage(folder);
+
+    QcPresetCatalog& catalog = freshCatalog();
+    decodeInto(catalog, {proto.data(), proto.size()});
+
+    const auto folders = catalog.folders();
+    zassert_equal(folders.size(), 1u, "all presets under the long key must land in one folder");
+    zassert_equal(folders[0].presets.size(), 5u, "all five presets kept");
+    zassert_equal(catalog.presetCount(), 5u, "preset count matches");
+    zassert_equal(catalog.folderOverflowCount(), 0u, "no folder overflow for a single long-keyed folder");
+}
+
+ZTEST(preset_catalog, test_two_long_keys_sharing_a_prefix_are_distinct_folders)
+{
+    // Both longer than kNameCapacity and identical in their first 32
+    // bytes - a regression guard that folder identity depends on the
+    // *full* key (length + hash), not just whatever a bounded comparison
+    // would see.
+    const std::string sharedPrefix(32, 'k');
+    const std::string keyA = sharedPrefix + "-alpha";
+    const std::string keyB = sharedPrefix + "-beta";
+
+    QcPresetCatalog& catalog = freshCatalog();
+    {
+        const auto folder = buildFolder(keyA, "Folder A", {"Preset A"});
+        const auto proto = buildFileMessage(folder);
+        decodeInto(catalog, {proto.data(), proto.size()});
+    }
+    {
+        const auto folder = buildFolder(keyB, "Folder B", {"Preset B"});
+        const auto proto = buildFileMessage(folder);
+        decodeInto(catalog, {proto.data(), proto.size()});
+    }
+
+    const auto folders = catalog.folders();
+    zassert_equal(folders.size(), 2u, "two distinct full keys must register as two folders");
+    zassert_equal(catalog.presetCount(), 2u, "one preset in each folder");
+    zassert_equal(catalog.folderOverflowCount(), 0u, "two folders fit well within kMaxFolders");
+}

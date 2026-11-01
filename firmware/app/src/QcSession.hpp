@@ -70,6 +70,11 @@ public:
         k_timer_user_data_set(&heartbeatTimer_, this);
         dispatcher_.setSink(*this);
         gzipInflater_.setSink(*this);
+        // issue #10 Copilot review: presetPrinter_ needs the same mutex
+        // every write to presetCatalog_ already goes through, to copy a
+        // folder's data out before printing it - see
+        // QcPresetPrinter::printCatalog()'s own comment.
+        presetPrinter_.setCatalogMutex(fileStreamMutex_);
     }
 
     // Called from onProbe() (host stack thread) once a device is accepted.
@@ -537,17 +542,12 @@ private:
                 summary.gzipDropped, summary.reassemblyOverflowCount, summary.reassemblyMalformedCount,
                 totalInTransfersThisStream);
 
-        // issue #10: a dropped/overflowed/failed File message above, or the
-        // catalog itself running out of room (QcPresetCatalog::overflowed()
-        // - a separate thing from the device never sending everything),
-        // both mean the printed listing can't be trusted as complete -
-        // QcPresetPrinter.hpp says so plainly either way. timedOut isn't
-        // included here by itself: it means the stream never went quiet
-        // within kOverallTimeoutMs, which isn't itself evidence of a
-        // dropped or overflowed message.
-        const bool incomplete = summary.failedCount > 0 || summary.dispatcherDropped > 0 ||
-                                 summary.gzipDropped > 0 || summary.reassemblyOverflowCount > 0 ||
-                                 summary.reassemblyMalformedCount > 0 || presetCatalog_.overflowed();
+        // issue #10 Copilot review: see QcFileStream::isListingIncomplete()
+        // for the full reasoning, in particular why summary.timedOut is
+        // included - a 30s overall timeout can cut the stream off while
+        // the device is still sending, and nothing else here counts what's
+        // lost that way.
+        const bool incomplete = QcFileStream::isListingIncomplete(summary, presetCatalog_.overflowed());
         presetPrinter_.requestPrint(presetCatalog_, incomplete);
 
         LOG_INF("Post-connect tally started: watching for preset-change pushes "

@@ -82,29 +82,40 @@ those slots are actually named.
 
 ## Consequences
 
-- **RAM cost, measured** (clean `frdm_rw612` build, this PR's tip): **403160 / 983040 bytes
-  (41.01%)**, up from PR #64's tip (`eca6ca6`, ADR 0007's final state) at 371272 B (37.77%) -
-  **+31888 bytes (+3.24 points)** for `QcPresetCatalog`/`QcPresetPrinter` combined
-  (`QcPresetCatalog` itself: `kMaxFolders` x (`kMaxPresetsPerFolder` x a ~36-byte
-  `etl::string<32>` name slot + two folder-level name fields) is the dominant share;
-  `QcPresetPrinter`'s own 2048 B stack plus bookkeeping fields account for the rest).
+- **RAM cost, measured** (clean `frdm_rw612` build, this PR's tip after the review fixes
+  below): **406984 / 983040 bytes (41.40%)**, up from PR #64's tip (`eca6ca6`, ADR 0007's
+  final state) at 371272 B (37.77%) - **+35712 bytes (+3.63 points)** for
+  `QcPresetCatalog`/`QcPresetPrinter` combined (`QcPresetCatalog` itself: `kMaxFolders` x
+  (`kMaxPresetsPerFolder` x a ~36-byte `etl::string<32>` name slot + two folder-level name
+  fields) is still the dominant share; `QcPresetPrinter`'s own 2048 B stack, bookkeeping
+  fields, and - after the review fixes - its per-folder `FolderSnapshot` scratch buffer
+  account for the rest). This is **+3824 bytes** over the 403160 B this ADR originally
+  reported at commit `dfc0b4f` (before PR #68's review fixes): `Folder::keyLength`/`keyHash`
+  (12 B x 8 folders = 96 B) plus `QcPresetPrinter`'s `FolderSnapshot` member
+  (a `NameString` + `kMaxPresetsPerFolder` `PresetEntry`s, ~2.6 KB) and its small
+  `requestMutex_`/`PendingRequest`/`catalogMutex_` additions account for the difference.
 - **Stack margins** (`-fstack-usage`, worst-case sequential call chain per thread, GCC's
-  inlining folded `decodeFile()`/`printCatalog()`/`labelFor()`/`findFolder()`/`addFolder()`
-  into their callers at this build's optimization level - no separate symbol, no separate
-  frame to add):
+  inlining folded `decodeFile()`/`labelFor()`/`findFolder()`/`addFolder()`/`fnv1a64()`/
+  `copyPresetEntries()` into their callers at this build's optimization level - no separate
+  symbol, no separate frame to add):
 
   | Thread | Call chain | Budget | Depth | Margin |
   | --- | --- | --- | --- | --- |
-  | `qc_dispatch` | `threadEntryTrampoline()` -> `onMessage()` (`decodeFile()` inlined) -> `addPreset()` | 2048 B | 32+352+56 = 440 B | ~78.5% free |
-  | `qc_heartbeat` | `runHeartbeat()` (`logFileStreamSummary()`/`requestPrint()` inlined) -> `sendMessage()` | 2048 B | 512+200 = 712 B | ~65.2% free |
-  | `qc_preset_print` | `threadEntryTrampoline()` -> `run()` (`printCatalog()` inlined) | 2048 B | 40 B | ~98% free |
+  | `qc_dispatch` | `threadEntryTrampoline()` -> `onMessage()` (`decodeFile()` inlined) -> `addPreset()` (`findFolder()`/`addFolder()`/`fnv1a64()` inlined) | 2048 B | 32+352+40 = 424 B | ~79.3% free |
+  | `qc_heartbeat` | `runHeartbeat()` (`logFileStreamSummary()`/`requestPrint()`/`isListingIncomplete()` inlined) -> `sendMessage()` | 2048 B | 512+200 = 712 B | ~65.2% free |
+  | `qc_preset_print` | `threadEntryTrampoline()` (`run()` inlined) -> `printCatalog()` (`copyPresetEntries()` inlined) | 2048 B | 16+96 = 112 B | ~94.5% free |
 
-  `qc_heartbeat`'s depth is essentially unchanged from ADR 0007's own measurement (720 B) -
-  `requestPrint()` itself is just a pointer/bool/u32 assignment and a semaphore give, not a
-  print. Every object this issue adds that's bigger than a few bytes
-  (`QcPresetCatalog::folders_`, `QcPresetPrinter`'s stack/thread struct) is static/member
-  storage, never a stack local - the same discipline this firmware's three prior stack
-  overflows (`usbh`, `qc_heartbeat`, `qc_session`) were each fixed by applying.
+  `qc_dispatch` is actually a few bytes *shallower* than before (424 B vs. 440 B) - the
+  hash-based `findFolder()` from the review fixes below needs less local state than the old
+  string comparison. `qc_heartbeat` is unchanged (712 B, matching ADR 0007's own 720 B
+  measurement) - `isListingIncomplete()` is a handful of bool comparisons, inlined for free.
+  `qc_preset_print` grew from one 40 B frame to two frames totalling 112 B now that
+  `printCatalog()` is too large for GCC to fold into `run()` at this optimization level (the
+  per-folder lock/copy/print loop from the review fixes below) - still under 6% of its 2048 B
+  budget. Every object bigger than a few bytes (`QcPresetCatalog::folders_`,
+  `QcPresetPrinter`'s stack/thread struct, `FolderSnapshot`) is static/member storage, never a
+  stack local - the same discipline this firmware's three prior stack overflows (`usbh`,
+  `qc_heartbeat`, `qc_session`) were each fixed by applying.
 - Picking `kMaxFolders`/`kMaxPresetsPerFolder` from the owner's one unit, rather than the
   protocol's fixed-256-slots-per-folder worst case, is a real bet: a unit with meaningfully
   more named content than this evidence (more than 8 folders ever holding a named preset, or
@@ -112,7 +123,73 @@ those slots are actually named.
   `presetOverflowCount()` go non-zero and the printed listing say so plainly, rather than
   silently showing everything. If that turns out to matter in practice, the fix is raising
   these two constants with new evidence, not redesigning the catalog.
-- **Not verified on real hardware.** The folder/preset counts and names in Context come from
-  ADR 0007's own hardware runs; this issue's own catalog/printer code has not itself been
-  flashed. See issue #10's closing comment for the exact commit and expected log output to
-  check that against.
+- **Verified on real hardware for the listing itself**: commit `dfc0b4f` printed the full
+  catalog on the owner's unit - 3 folders, 48 presets, confirmed matching. **The review fixes
+  below have not themselves been flashed** - they're correctness/robustness fixes to code
+  paths that commit's hardware run didn't exercise (no folder/preset overflow, no 30s
+  timeout, no folder key over 32 bytes on that unit) and produce byte-identical output for
+  that same run (verified by inspection: the only wording change is the folder-capacity
+  warning, which only fires when `folderOverflowCount() > 0`, never true on that unit). See
+  issue #10's closing comment for the commit to flash and a smoke test.
+
+## Review fixes (Copilot, PR #68)
+
+Five issues from Copilot's review of the commit this ADR originally described, all fixed in
+the same PR:
+
+1. **`QcPresetPrinter::requestPrint()`/`run()` raced on three separate field writes.** A
+   second `requestPrint()` landing between two of `pendingCatalog_`/`pendingGeneration_`/
+   `pendingIncomplete_`'s assignments (the low-priority worker delayed past its
+   `k_sem_take()`) could let `run()` read a mix of two requests. Fixed with a small
+   `requestMutex_` (a `ScopedKMutex`, matching this file's existing lock discipline) around
+   publishing all three fields as one step in `requestPrint()`, and around reading them back
+   as one step (into a local `PendingRequest`) in `run()` - printing itself still happens
+   outside that lock. Not practical to regression-test as an actual race (this codebase
+   doesn't unit-test its other OS-thread hand-off classes - `QcDispatcher`, `QcGzipInflater` -
+   for the same reason); correct by the same construction argument point 3 above already
+   makes for `QcPresetCatalog`'s own quiescence.
+2. **`printCatalog()` iterated the catalog's live storage while a reconnect could be
+   resetting it.** The existing generation check (point 3 above) only caught a reset that
+   landed *between* folders, not one landing *while* a folder's `presets` vector was being
+   read - an unsynchronized read of storage another thread could be clearing/refilling,
+   unsafe regardless of the storage being fixed-size. Fixed by copying one folder's data
+   (name + every preset entry) out of the catalog into a member-storage `FolderSnapshot`
+   while holding `catalogMutex_` - the *same* mutex `QcSession` holds for every catalog write
+   (`fileStreamMutex_`, wired in via `setCatalogMutex()`) - then releasing the lock before the
+   slow `LOG_INF`/`LOG_WRN` calls that print it. Each lock span is a small, bounded copy,
+   never the printing itself, so this can't delay `qc_heartbeat`'s own brief use of the same
+   mutex. The copy step (`detail::copyPresetEntries()`) is a free function with no locking of
+   its own, specifically so its only real failure mode (writing past the snapshot's bound) is
+   unit-testable without a kernel fixture - see `tests/preset_printer`.
+3. **`QcPresetCatalog::findFolder()` compared a bounded key against a full one.**
+   `addFolder()` truncates the stored `key` to `kNameCapacity` (32 B) for display, but
+   `findFolder()` compared that truncated copy against each new preset's *full* incoming key
+   - a key longer than 32 B (real plugin "User" folder keys already run past that) never
+   matched on a second preset, so every one of them registered its own new folder and could
+   exhaust `kMaxFolders` after as few as `kMaxFolders + 1` presets under one long key. Fixed
+   by giving `Folder` a stable identity independent of the bounded display copy: a
+   (length, FNV-1a 64-bit hash) pair computed from the *full* key, stored as
+   `keyLength`/`keyHash` and used by `findFolder()` instead of the truncated string compare.
+   `key` stays for display/debugging only. Regression-tested in `tests/preset_catalog`: many
+   presets under one >32 B key land in one folder, two distinct >32 B keys sharing the same
+   32 B prefix still register as two folders, and a folder's own display *name* (not just its
+   key) still truncates safely rather than overflowing.
+4. **The "folder(s) dropped" warning counted presets, not folders.** `folderOverflowCount()`
+   increments once per *preset* rejected because no folder slot was free, not once per
+   distinct folder that couldn't be added - a ninth folder with ten named presets would have
+   logged "10 folder(s) dropped" instead of "1". Fixed by rewording the log line to "N
+   preset(s) rejected - folder capacity (N) reached"; the counter's own semantics (and name)
+   are unchanged; the file-level comments already described it in terms of overflow rather
+   than distinct folders.
+5. **A stream cut off by the 30s overall timeout wasn't flagged as potentially incomplete.**
+   `checkTimeout()` deactivates the stream the instant `kOverallTimeoutMs` is hit *even if the
+   device is still sending* (`onMessage()` gates every catalog write on `isActive()`), so a
+   preset still in flight at that instant is silently never added - with nothing else counting
+   it as dropped. The code this ADR originally described left `summary.timedOut` out of the
+   incompleteness check on the (incomplete) reasoning that a timeout alone wasn't evidence of
+   loss - true for the no-messages-at-all case, wrong for this one. Fixed by folding
+   `timedOut` into the same check, pulled out as `QcFileStream::isListingIncomplete()` (a
+   free function taking the `Summary` and a `bool catalogOverflowed`, no `QcSession`/USB
+   dependency) so it's directly unit-testable - see the `isListingIncomplete` tests added to
+   `tests/dispatch_messages` (which needed `qemu_cortex_m3` added to its `platform_allow`
+   alongside `native_sim`, matching `tests/preset_catalog`'s own list).

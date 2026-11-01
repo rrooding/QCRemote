@@ -202,6 +202,66 @@ ZTEST(dispatch_messages, test_file_stream_restarts_cleanly)
     zassert_equal(second->messageCount, 1u, "second run messageCount should not include the first run's");
 }
 
+// --- QcFileStream::isListingIncomplete() ------------------------------------
+
+ZTEST(dispatch_messages, test_listing_incomplete_false_for_a_clean_quiet_finish)
+{
+    QcFileStream::Summary summary{};
+    summary.timedOut = false;
+
+    zassert_false(QcFileStream::isListingIncomplete(summary, false),
+                  "a quiet finish with nothing dropped/overflowed must be complete");
+}
+
+ZTEST(dispatch_messages, test_listing_incomplete_true_when_timed_out_even_with_no_other_evidence)
+{
+    // issue #10 Copilot review (QcSession.hpp:550): a 30s overall timeout
+    // can cut the stream off while the device is still sending - nothing
+    // else here counts what's lost that way, so timedOut alone must mark
+    // the listing incomplete.
+    QcFileStream::Summary summary{};
+    summary.timedOut = true;
+
+    zassert_true(QcFileStream::isListingIncomplete(summary, false),
+                 "a timeout finish must be treated as potentially incomplete on its own");
+}
+
+ZTEST(dispatch_messages, test_listing_incomplete_true_for_each_transport_loss_signal)
+{
+    const QcFileStream::Summary base{};
+
+    QcFileStream::Summary failed = base;
+    failed.failedCount = 1;
+    zassert_true(QcFileStream::isListingIncomplete(failed, false), "failedCount > 0");
+
+    QcFileStream::Summary dispatcherDropped = base;
+    dispatcherDropped.dispatcherDropped = 1;
+    zassert_true(QcFileStream::isListingIncomplete(dispatcherDropped, false), "dispatcherDropped > 0");
+
+    QcFileStream::Summary gzipDropped = base;
+    gzipDropped.gzipDropped = 1;
+    zassert_true(QcFileStream::isListingIncomplete(gzipDropped, false), "gzipDropped > 0");
+
+    QcFileStream::Summary reassemblyOverflow = base;
+    reassemblyOverflow.reassemblyOverflowCount = 1;
+    zassert_true(QcFileStream::isListingIncomplete(reassemblyOverflow, false),
+                 "reassemblyOverflowCount > 0");
+
+    QcFileStream::Summary reassemblyMalformed = base;
+    reassemblyMalformed.reassemblyMalformedCount = 1;
+    zassert_true(QcFileStream::isListingIncomplete(reassemblyMalformed, false),
+                 "reassemblyMalformedCount > 0");
+}
+
+ZTEST(dispatch_messages, test_listing_incomplete_true_when_catalog_overflowed_regardless_of_timeout)
+{
+    QcFileStream::Summary summary{};
+    summary.timedOut = false;
+
+    zassert_true(QcFileStream::isListingIncomplete(summary, true),
+                 "catalog overflow must mark the listing incomplete even on a clean quiet finish");
+}
+
 // --- QcMessageTally.hpp ----------------------------------------------------
 
 ZTEST(dispatch_messages, test_message_tally_ignores_record_before_start)

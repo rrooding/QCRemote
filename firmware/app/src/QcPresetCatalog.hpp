@@ -76,7 +76,19 @@ public:
     };
 
     struct Folder {
-        NameString key;
+        // Stable identity for findFolder(): a (length, FNV-1a hash) pair
+        // computed from the *full* incoming folder key (preset.folderKey),
+        // never from the bounded `key` field below. issue #10 Copilot
+        // review: `key` truncates to kNameCapacity for display, but real
+        // plugin "User" folder keys already run past that - comparing a
+        // truncated stored key against each new preset's full key never
+        // matched, so a long key registered a brand new folder per
+        // preset and exhausted kMaxFolders after as few as
+        // kMaxFolders + 1 presets. keyLength/keyHash fix that by never
+        // depending on where display truncation happens.
+        uint32_t keyLength = 0;
+        uint64_t keyHash = 0;
+        NameString key;   // display/debug only - see keyLength/keyHash for identity
         NameString name;
         etl::vector<PresetEntry, kMaxPresetsPerFolder> presets;
     };
@@ -157,9 +169,25 @@ private:
         return preset.folderKey == kDownloadsFolderKey ? kDownloadsLabel : preset.folderKey;
     }
 
+    // FNV-1a 64-bit - cheap, no heap, and collision resistance that's more
+    // than enough for the handful of folders (kMaxFolders = 8) this
+    // catalog ever holds. Always computed over the *full* key, so identity
+    // never depends on where kNameCapacity's display truncation lands
+    // (issue #10 Copilot review - see Folder::keyHash above).
+    static constexpr uint64_t fnv1a64(std::string_view data) {
+        uint64_t hash = 0xcbf29ce484222325ULL;
+        for (char c : data) {
+            hash ^= static_cast<uint64_t>(static_cast<unsigned char>(c));
+            hash *= 0x100000001b3ULL;
+        }
+        return hash;
+    }
+
     Folder* findFolder(std::string_view key) {
+        const auto length = static_cast<uint32_t>(key.size());
+        const uint64_t hash = fnv1a64(key);
         for (size_t i = 0; i < folderCount_; ++i) {
-            if (std::string_view(folders_[i].key.data(), folders_[i].key.size()) == key) {
+            if (folders_[i].keyLength == length && folders_[i].keyHash == hash) {
                 return &folders_[i];
             }
         }
@@ -173,6 +201,8 @@ private:
         }
         Folder& folder = folders_[folderCount_];
         folder.presets.clear();
+        folder.keyLength = static_cast<uint32_t>(preset.folderKey.size());
+        folder.keyHash = fnv1a64(preset.folderKey);
         folder.key.assign(preset.folderKey.data(), preset.folderKey.size());
         const std::string_view label = labelFor(preset);
         folder.name.assign(label.data(), label.size());
