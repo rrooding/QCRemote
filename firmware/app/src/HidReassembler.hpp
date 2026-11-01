@@ -171,23 +171,40 @@ private:
 
     // Keeps tailBuf_/tailLen_ as a sliding window over the last (up to)
     // kTrailerTailSize bytes fed so far, across however many feed() calls it
-    // takes to get there. `chunk` is at most kHidMaxPayloadPerReport bytes
-    // (checked in feed() before every call here), so the scratch buffer
-    // below never needs to hold more than that plus the previous tail.
+    // takes to get there. `chunk` is NOT bounded by kHidMaxPayloadPerReport
+    // here: the overflow-transition call site below passes the whole
+    // buffer_ accumulated so far (up to Capacity bytes) in one shot, so this
+    // must stay correct - and bounded to kTrailerTailSize of stack, not
+    // Capacity - for a chunk of any length. It only ever needs the last
+    // kTrailerTailSize bytes of (old tail ++ chunk), so when chunk itself is
+    // already that long or longer, the old tail is irrelevant and dropped;
+    // otherwise just enough of the old tail survives to pad chunk out to the
+    // window size.
     void appendTail(std::span<const uint8_t> chunk) {
-        std::array<uint8_t, kTrailerTailSize + kHidMaxPayloadPerReport> scratch{};
+        if (chunk.size() >= kTrailerTailSize) {
+            const uint8_t* tail = chunk.data() + (chunk.size() - kTrailerTailSize);
+            for (size_t i = 0; i < kTrailerTailSize; ++i) {
+                tailBuf_[i] = tail[i];
+            }
+            tailLen_ = kTrailerTailSize;
+            return;
+        }
+
+        const size_t keepFromOld = kTrailerTailSize - chunk.size();
+        const size_t oldKeep = tailLen_ < keepFromOld ? tailLen_ : keepFromOld;
+        const size_t oldStart = tailLen_ - oldKeep;
+        std::array<uint8_t, kTrailerTailSize> next{};
         size_t n = 0;
-        for (size_t i = 0; i < tailLen_; ++i) {
-            scratch[n++] = tailBuf_[i];
+        for (size_t i = oldStart; i < tailLen_; ++i) {
+            next[n++] = tailBuf_[i];
         }
         for (const uint8_t byte : chunk) {
-            scratch[n++] = byte;
+            next[n++] = byte;
         }
-        const size_t keep = n < tailBuf_.size() ? n : tailBuf_.size();
-        for (size_t i = 0; i < keep; ++i) {
-            tailBuf_[i] = scratch[n - keep + i];
+        for (size_t i = 0; i < n; ++i) {
+            tailBuf_[i] = next[i];
         }
-        tailLen_ = keep;
+        tailLen_ = n;
     }
 
     etl::vector<uint8_t, Capacity> buffer_;

@@ -132,6 +132,50 @@ ZTEST(hid_framing, test_overflow)
                       "overflowTrailer should be the message's last 8 bytes");
 }
 
+ZTEST(hid_framing, test_overflow_with_large_buffered_body_before_transition)
+{
+    // Regression test for issue #33's hardware MPU fault: the
+    // overflow-transition branch below hands appendTail() the *whole*
+    // buffer_ accumulated so far, not just the new report's chunk.
+    // appendTail() used to assume its argument was at most
+    // kHidMaxPayloadPerReport bytes and sized a stack scratch buffer for
+    // that - but once a couple of reports have accumulated, buffer_ is far
+    // bigger than one report's payload, and writing it into that
+    // undersized stack array smashed the stack (on real hardware with
+    // Capacity=4096, this corrupted the return address and crashed with an
+    // MPU fault a few seconds into a File stream - the first message big
+    // enough to overflow). Capacity=300 here reproduces the same shape at a
+    // size a host/qemu run can exercise directly: two full 126-byte reports
+    // (252 buffered bytes) land normally, so the third report's transition
+    // call passes a 252-byte buffer_ - already far past what the old
+    // scratch buffer could hold.
+    std::vector<uint8_t> msg(352, 0x77);
+    msg[344] = 42;
+    msg[345] = 0;
+    HidChunker chunker(msg, 0x02);
+    HidReassembler<300> reasm;
+    std::vector<uint8_t> report(kHidReportSize);
+    auto status = HidReassembler<300>::Status::InProgress;
+    int reportCount = 0;
+
+    while (chunker.next(report)) {
+        ++reportCount;
+        status = reasm.feed(report);
+    }
+
+    zassert_equal(reportCount, 3, "expected 3 reports for a 352-byte message");
+    zassert_equal(static_cast<int>(status),
+                  static_cast<int>(HidReassembler<300>::Status::Overflow), "expected Overflow");
+    zassert_equal(reasm.overflowSize(), msg.size(), "overflowSize should be the true total size");
+
+    const auto trailer = reasm.overflowTrailer();
+    zassert_equal(trailer.size(), 8u, "overflowTrailer should be exactly 8 bytes");
+    zassert_mem_equal(trailer.data(), msg.data() + msg.size() - 8, 8,
+                      "overflowTrailer should be the message's last 8 bytes even when the "
+                      "already-buffered body handed to appendTail() was far bigger than one "
+                      "report");
+}
+
 ZTEST(hid_framing, test_overflow_then_resync_on_next_first)
 {
     std::vector<uint8_t> big(300, 0xCD);

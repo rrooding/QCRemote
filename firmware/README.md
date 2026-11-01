@@ -792,6 +792,31 @@ commands overflow," not an arbitrary count.
 done against this build. The `0d1edcc`/`f0a4939` numbers quoted above are from the owner's
 prior runs, documented in issue #33 and the #60/#61 section above, not reproduced here.
 
+**Hardware result (commit `872c898`): MPU fault, root cause found and fixed.** The owner's
+hardware run on that commit halted with an MPU fault (Instruction Access Violation) on the
+`usbh` thread about 4 seconds after the handshake, mid-`File`-stream - right around when the
+first overflowing message would arrive. The faulting PC wasn't a valid code address, and the
+saved LR (`0x1800d2f5`) resolved via `arm-zephyr-eabi-addr2line` against a from-source
+`frdm_rw612` rebuild of `872c898` to `HidReassembler::appendTail()` (`HidReassembler.hpp:178`)
+- confirming a stack smash rather than a logic bug. `appendTail()`'s stack `scratch` buffer
+was sized for a chunk of at most `kHidMaxPayloadPerReport` (126) bytes, on the assumption
+that's all a caller would ever pass - true for the per-report `chunk` argument, but not for
+the overflow-transition call in `feed()`, which passes the *entire* accumulated `buffer_`
+(up to `Capacity`, 4096 in `QcHidBridge.hpp`) in one shot once a message both overflows and
+has already buffered more than one report's worth of bytes. Writing that into a
+134-byte (`kTrailerTailSize + kHidMaxPayloadPerReport`) stack array smashed the stack and
+corrupted the return address, producing exactly this symptom. Fixed by rewriting
+`appendTail()` to need only `kTrailerTailSize` (8) bytes of stack regardless of its argument's
+length - it only ever needs the last 8 bytes of (old tail ++ chunk), so a chunk already that
+long or longer makes the old tail irrelevant instead of needing to hold both at once. Added
+`test_overflow_with_large_buffered_body_before_transition` to `tests/hid_framing` (now 11
+cases), reproducing the same shape at `Capacity=300`: two full 126-byte reports (252 buffered
+bytes) land normally, so the third report's overflow-transition call passes a 252-byte
+`buffer_` into `appendTail()` - already well past the old 134-byte scratch buffer. All 6
+Ztest suites still pass (86/86, one new) on `qemu_cortex_m3`, and a clean `frdm_rw612` build
+succeeds with unchanged RAM (97816 B, 9.95%). **Not verified on real hardware** - commit to
+flash for that is the fix on top of `872c898`, still branch `firmware/reassembly-memory-budget`.
+
 ## Not yet done
 
 - ETL is wired in via CMake `FetchContent` (see `app/CMakeLists.txt`) but not yet used by
