@@ -739,6 +739,134 @@ Any deviation from the above - a `File stream limits:` line with a nonzero count
 log before assuming the sizing is wrong; it may instead be a bug in this cleanup pass itself
 (this build hasn't run on hardware at all yet, per the note above).
 
+## Wi-Fi host/client mode and a web/WebSocket transport (issue #71)
+
+Issue #71 tests whether a web UI served from the board over Wi-Fi is viable enough that the
+owner would go with web UI + Wi-Fi instead of the planned JUCE + BLE macOS/iOS app (MVP2). See
+[ADR 0009](../docs/adr/0009-wifi-web-transport.md) for the full design and the feasibility
+findings (Zephyr 4.5 supports both Wi-Fi AP and station mode on `frdm_rw612` - confirmed
+against the Zephyr source tree and its own `samples/net/wifi/apsta_mode` sample, not assumed).
+This section covers setup, build/flash, and the exact hardware test for each mode - **nothing
+below has been run on real hardware yet.**
+
+### Setup: Wi-Fi mode and credentials
+
+Copy the example file and edit it - it's gitignored (`firmware/.gitignore`) and picked up
+automatically by `app/CMakeLists.txt` as an extra Kconfig fragment, no extra `west` flag
+needed:
+
+```bash
+cp firmware/app/wifi_credentials.conf.example firmware/app/wifi_credentials.conf
+```
+
+Pick **one** mode and fill in real values (see the file's own comments):
+
+```kconfig
+# Access point - the board creates its own Wi-Fi network:
+CONFIG_WIFI_USAGE_MODE_AP=y
+CONFIG_QC_WIFI_AP_SSID="QCRemote"
+CONFIG_QC_WIFI_AP_PSK="pick-a-real-wpa2-passphrase"
+
+# Station - the board joins your existing Wi-Fi network:
+CONFIG_WIFI_USAGE_MODE_STA=y
+CONFIG_QC_WIFI_STA_SSID="YourNetworkName"
+CONFIG_QC_WIFI_STA_PSK="YourNetworkPassword"
+```
+
+**Never commit `wifi_credentials.conf`** - only the `.example` file is tracked. Leaving
+`CONFIG_QC_WIFI_AP_PSK` empty starts an *open* access point - the owner's decision for this
+issue is to set a real WPA2 passphrase whenever that's easy rather than defaulting to open; the
+firmware logs a warning if it starts open anyway.
+
+The RW612's own Wi-Fi/BLE radio firmware is a licensed binary blob, fetched the same way ADR
+0002 already documents for BLE - if not already done:
+
+```bash
+west blobs fetch hal_nxp
+```
+
+### Build
+
+Same as the plain build above, once `wifi_credentials.conf` is in place:
+
+```bash
+west build -b frdm_rw612 firmware/app --pristine
+```
+
+Both modes build clean; see ADR 0009 for the measured RAM/flash cost (a real, large jump - the
+single biggest of any issue so far in this project, from bringing in Zephyr's networking
+stack, Wi-Fi driver, HTTP server, and mbedTLS).
+
+### Hardware test - access point mode
+
+1. Set `CONFIG_WIFI_USAGE_MODE_AP=y` in `wifi_credentials.conf` with a real SSID/passphrase,
+   build, and flash.
+2. Watch the serial console: `Wi-Fi AP "<SSID>" starting`, then
+   `Wi-Fi AP enabled - waiting for a station to join`, then (once something joins)
+   `AP static IP 192.168.4.1, DHCPv4 server pool starting at 192.168.4.11` and a
+   `Wi-Fi AP: station <MAC> joined` line.
+3. On an iPhone and separately on a Mac: open Wi-Fi settings, join the board's SSID with its
+   passphrase, confirm the device gets an IP in the `192.168.4.x` range (Settings > Wi-Fi > (i)
+   on iPhone; System Settings > Wi-Fi > Details on Mac).
+4. Open `http://192.168.4.1/` in a browser on each device. Expect the folder/preset listing
+   from the catalog (same content the serial console already prints, per issue #10) and a
+   `presets: N (generation G)` status line.
+5. With the page open, change the active preset or folder on the Quad Cortex Mini itself.
+   Expect the page to update within a couple of seconds, without a manual reload - the
+   WebSocket push (issue #61's preset-change signal).
+6. Leave it running for at least 10-15 minutes with the Quad Cortex Mini connected over USB
+   (handshake complete) and the web page open: watch for KeepAlive/File-stream behavior
+   unaffected by the AP running (`qc_heartbeat`'s usual ~200ms cadence, no new
+   `File stream limits:`/`Traffic drop/overflow:` lines), and for the Wi-Fi link itself
+   staying up (no repeated `Wi-Fi AP: station ... left` and `joined` for the same device,
+   which would mean it's dropping and reconnecting).
+
+**What each outcome means**: a page that loads once but never pushes updates points at the
+WebSocket path (`QcWifiWebTransport::publishPresetChange()`/`broadcast()`); an IP that never
+shows in the `192.168.4.x` range, or a client stuck with no IP, points at the DHCPv4 server
+startup (`startAccessPointDhcp()`) rather than the web server itself; any
+`qc_heartbeat`/`qc_dispatch`/USB-side regression while Wi-Fi is active (vs. a build with Wi-Fi
+disabled) would be the coexistence requirement failing, not just a Wi-Fi bug.
+
+### Hardware test - station mode
+
+1. Set `CONFIG_WIFI_USAGE_MODE_STA=y` with the real network's SSID/passphrase, build, and
+   flash.
+2. Watch the serial console: `Joining Wi-Fi network "<SSID>"`, then
+   `Wi-Fi station connected` (Zephyr's own DHCPv4 client then assigns an IP automatically -
+   `CONFIG_WIFI_STA_AUTO_DHCPV4`, no extra log line from this firmware for that step).
+3. Find the board's IP address - easiest from the router's own client list (DHCP leases),
+   since nothing here advertises it. (A follow-up issue could add mDNS/`.local` advertising if
+   this test succeeds; out of scope for this one.)
+4. From an iPhone and a Mac already on the **same** network, open `http://<that IP>/` in a
+   browser. Same expectations as the AP-mode steps above: listing loads, status line shows
+   preset/generation counts, and a preset change on the unit pushes a live update over the
+   WebSocket within a couple of seconds.
+5. Same 10-15 minute soak as AP mode: confirm KeepAlive/File-stream/USB behavior is unaffected,
+   and the station stays connected (no repeated `Wi-Fi station connected`/implicit
+   disconnect-reconnect cycling - watch for an unexpected `Wi-Fi station disconnected` line).
+
+**What each outcome means**: same as AP mode above, plus - a station that never shows
+`Wi-Fi station connected` points at the join itself (wrong passphrase, unsupported security
+type, or the router's own client limit/band settings - 2.4 GHz only, per the owner's decision);
+a station that connects but the board never gets a reachable IP from the router's own DHCP
+pool is a network-side problem to check from the router, not this firmware.
+
+### Known limitations of this test build
+
+- **No authentication** on the HTTP/WebSocket endpoints - the owner's explicit decision for
+  this test (home use, not gigging; security can come later).
+- **Plain HTTP, not HTTPS** - also the owner's decision; `CONFIG_HTTP_SERVER`'s TLS support
+  isn't enabled.
+- **2.4 GHz only** - `WIFI_FREQ_BAND_2_4_GHZ` is hardcoded in `QcWifiWebTransport.hpp`, per the
+  owner's decision (reliability over 5 GHz range/throughput for this use case).
+- **The page is deliberately minimal** - a folder/preset listing and a status line, nothing
+  resembling the real Quad Cortex's own UI yet (issue #71's own scope: prove the transport,
+  not design the product).
+- **AP and STA are build-time exclusive here** - Zephyr's own `apsta_mode` sample shows running
+  both at once is possible on this chip, but issue #71 only asks for build-time mode choice;
+  simultaneous AP+STA is a possible future enhancement, not built now.
+
 ## Not yet done
 
 - ETL is wired in via CMake `FetchContent` (see `app/CMakeLists.txt`) but not yet used by
