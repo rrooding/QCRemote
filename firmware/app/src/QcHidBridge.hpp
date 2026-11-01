@@ -28,7 +28,16 @@ inline constexpr uint8_t kUsbBaseClassHid = 0x03;
 // Placeholder pending issue #33's actual sizing exercise - generous enough
 // for any MVP1 message (Version, Connection, ResetCommsBuffers, KeepAlive,
 // ModelRepo, SetlistPosition) without having measured them yet.
-inline constexpr size_t kReassemblyCapacity = 4096;
+//
+// Temporarily raised 4096 -> 16384 for issue #33's `short_listing` variant
+// experiment (QcFileReadExperiment.hpp): the first hardware run on this
+// experiment (commit 147fb48) found a `short_listing=true` File message up
+// to at least 10193 bytes true size, which overflowed the 4096-byte
+// capacity and was dropped before it could be decoded - exactly the
+// measurement this experiment needs. This is NOT #33's final answer (that
+// still needs a real sizing pass over every command, not just File) -
+// revert to whatever #33 step 2 picks once the variant experiment is done.
+inline constexpr size_t kReassemblyCapacity = 16384;
 
 // Claims the Quad Cortex Mini's vendor HID interface (interface 5), rejects
 // every other interface the composite device exposes, and reassembles

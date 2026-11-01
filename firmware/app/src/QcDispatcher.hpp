@@ -96,13 +96,20 @@ private:
     // than an inflate.
     static constexpr int kThreadPriority = 6;
 
-    // Mirrors QcGzip.hpp's kMaxCompressedInputSize, which itself mirrors
-    // QcHidBridge.hpp's kReassemblyCapacity (today's #33 placeholder, 4096
-    // bytes) - a message's protobuf payload can never be bigger than the
-    // whole reassembled HID message it came from. Not shared as one
-    // constant for the same reason QcGzip.hpp's comment gives: including
-    // QcHidBridge.hpp back here would be circular. Keep in sync by hand.
-    static constexpr size_t kMailboxCapacity = 4096;
+    // Mirrors QcHidBridge.hpp's kReassemblyCapacity - a message's protobuf
+    // payload can never be bigger than the whole reassembled HID message it
+    // came from. Not shared as one constant for the same reason QcGzip.hpp's
+    // comment gives about kMaxCompressedInputSize: including QcHidBridge.hpp
+    // back here would be circular. Keep in sync by hand.
+    //
+    // Temporarily raised 4096 -> 16384 alongside kReassemblyCapacity for
+    // issue #33's `short_listing` variant experiment - see that constant's
+    // comment. Uncompressed `File` messages (confirmed on every hardware
+    // run so far: 0 compressed) go through this mailbox, not
+    // QcGzipInflater's, so this is the one that needs to grow for
+    // `short_listing`'s larger messages; QcGzip.hpp's
+    // kMaxCompressedInputSize/kMaxInflatedSize are untouched.
+    static constexpr size_t kMailboxCapacity = 16384;
 
     static void threadEntryTrampoline(void* p1, void*, void*) { static_cast<QcDispatcher*>(p1)->run(); }
 

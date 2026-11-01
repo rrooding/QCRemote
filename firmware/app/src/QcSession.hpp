@@ -144,20 +144,34 @@ public:
         messageTally_.record(command, wireSize, inflatedSize);
         postStreamTally_.record(command, wireSize, inflatedSize);
         if (command == kCommandFile) {
-            fileStream_.onMessage(k_uptime_get(), wireSize, inflatedSize, compressed);
-
-            // issue #33 variant experiment: decode this message's content
-            // right here, on this same worker thread (never usbh - see
-            // handleMessage()'s comment, and QcFileReadExperiment.hpp's own
-            // comment on why this is stack-safe). `protoBytes` is only
-            // valid for a message that fit (reached onMessage() at all);
-            // onInflateFailed() below has no decoded bytes to offer it.
-            fileReadExperiment_.onFileMessage(
-                protoBytes, [](std::string_view folderName, std::string_view presetName) {
-                    LOG_INF("File content sample: folder=\"%.*s\" preset=\"%.*s\"",
-                            static_cast<int>(folderName.size()), folderName.data(),
-                            static_cast<int>(presetName.size()), presetName.data());
-                });
+            // issue #33 variant experiment: a real hardware run found a
+            // single 14-byte reply with no `folder` field arriving alone
+            // for `short_listing=true`, 1552ms after the request - QcFileStream
+            // read that as "the whole reply," finished the stream, and the
+            // real listing (which started after QcFileStream had already
+            // moved on) got miscounted into the *next* variant. A genuine
+            // catalog entry always carries a folder - this one didn't - so
+            // only messages with one are allowed to feed fileStream_'s
+            // quiet-window tracking at all; see QcFileReadExperiment::
+            // hasFolder()'s own comment for what's (not) known about what
+            // this reply actually is. lastFileMessageAtMs_ still updates
+            // either way - the inter-variant drain gap below cares about
+            // *any* File traffic, foldered or not.
+            lastFileMessageAtMs_ = k_uptime_get();
+            if (fileStream_.isActive()) {
+                if (QcFileReadExperiment::hasFolder(protoBytes)) {
+                    fileStream_.onMessage(k_uptime_get(), wireSize, inflatedSize, compressed);
+                }
+                // Decode/accumulate only - no logging here (dispatcherDropped
+                // turned nonzero for the first time, on real hardware, the
+                // moment this used to log a sample inline on this thread;
+                // see QcFileReadExperiment::onFileMessage()'s own comment).
+                // Gated on isActive() so a straggler arriving after this
+                // variant's own stream already finished - but before the
+                // next variant's beginVariant() resets this state - can't
+                // get folded into either variant's content.
+                fileReadExperiment_.onFileMessage(protoBytes);
+            }
         }
     }
 
@@ -171,7 +185,10 @@ public:
         messageTally_.record(command, wireSize, trueInflatedSize.value_or(0));
         postStreamTally_.record(command, wireSize, trueInflatedSize.value_or(0));
         if (command == kCommandFile) {
-            fileStream_.onInflateFailed(k_uptime_get(), wireSize, trueInflatedSize);
+            lastFileMessageAtMs_ = k_uptime_get();
+            if (fileStream_.isActive()) {
+                fileStream_.onInflateFailed(k_uptime_get(), wireSize, trueInflatedSize);
+            }
         }
     }
 
@@ -225,6 +242,26 @@ private:
     // Still below the main LED-blink loop's priority.
     static constexpr int kHeartbeatThreadPriority = 5;
     static constexpr k_timeout_t kHeartbeatInterval = K_MSEC(200);
+
+    // issue #33 variant experiment. A first hardware run (commit 147fb48)
+    // sent variants back-to-back the moment each one's own QcFileStream
+    // (1500ms quiet window) reported finished, and found that window too
+    // short: a genuine pause mid-reply looked like the reply ending, so
+    // the real tail arrived after the next variant's request had already
+    // gone out and got counted against the wrong variant. Two separate
+    // fixes, per the owner's own diagnosis:
+    //   - kExperimentQuietWindowMs: QcFileStream's own per-variant window,
+    //     overridden via its start() parameter - longer than the 1500ms
+    //     default so a mid-reply pause doesn't look like the end.
+    //   - kVariantDrainGapMs: a second gap *between* variants, checked by
+    //     checkDrainAndSendNextVariant() every heartbeat tick against
+    //     lastFileMessageAtMs_ (updated on *any* File traffic, foldered or
+    //     not, even once a variant's own stream is no longer active) -
+    //     the next variant's request isn't sent until this much real
+    //     silence has passed since the last File message of any kind, not
+    //     just since QcFileStream itself called the variant finished.
+    static constexpr int64_t kExperimentQuietWindowMs = 5000;
+    static constexpr int64_t kVariantDrainGapMs = 10000;
 
     // Single device, single session at a time - a fixed id is enough (no
     // need for qc-mcp's Python client's random per-run UUID-style value).
@@ -342,14 +379,21 @@ private:
         //
         // issue #33 variant experiment: instead of always the same bare
         // READ, this cycles through QcFileReadExperiment::kVariants - one
-        // at a time, each to its own stream finish (runHeartbeat() sends
-        // the next one once the current one goes quiet/times out) - to
-        // test whether short_listing/omit_factory_content shrink the
-        // listing. Variant 0 ("default") has both options false, which
-        // encodeFileRead() always omits entirely, so it reproduces the
-        // original bare File READ byte-for-byte - this must match the
-        // a1c25b6 hardware numbers quoted in firmware/README.md's issue
-        // #33 section.
+        // at a time, each to its own stream finish plus a drain gap
+        // (runHeartbeat()/checkDrainAndSendNextVariant() send the next one
+        // only once the current one goes quiet/times out AND then stays
+        // quiet for kVariantDrainGapMs more) - to test whether
+        // short_listing/omit_factory_content shrink the listing.
+        // `default` (both options false, last in kVariants - see its own
+        // comment on why) reproduces the original bare File READ
+        // byte-for-byte, so its numbers should match a1c25b6's hardware
+        // measurement in firmware/README.md's issue #33 section.
+        //
+        // kExperimentQuietWindowMs (longer than QcFileStream's own 1500ms
+        // default) and the drain gap both exist because a first hardware
+        // run (commit 147fb48, sending `default` first) found its reply
+        // still arriving when the next variant's request went out - see
+        // runHeartbeat()'s own comment on checkDrainAndSendNextVariant().
         FileReadOptions variantOptions;
         std::string_view variantLabel;
         size_t variantNumber = 0;
@@ -358,8 +402,10 @@ private:
             fileReadExperiment_.reset();
             fileReadExperiment_.beginVariant();
             reassemblyOverflowByCommand_.reset();
-            fileStream_.start(k_uptime_get());
+            fileStream_.start(k_uptime_get(), kExperimentQuietWindowMs);
             messageTally_.start();
+            lastFileMessageAtMs_ = k_uptime_get();
+            draining_ = false;  // in case of a reconnect mid-experiment
             dispatcherDroppedAtStart_ = dispatcher_.droppedCount();
             gzipDroppedAtStart_ = gzipInflater_.droppedCount();
             reassemblyOverflowAtStart_ = reassemblyOverflowCount_.load(std::memory_order_relaxed);
@@ -437,13 +483,6 @@ private:
             std::array<QcMessageTally::Entry, QcMessageTally::kMaxDistinctCommands> postStreamEntries{};
             size_t postStreamEntryCount = 0;
             uint32_t postStreamOtherCount = 0;
-            // issue #33 variant experiment: which variant this summary (if
-            // any) belongs to, its content-decode counters, and whether it
-            // was the last variant - captured here, before anything below
-            // resets them for the next one.
-            std::string_view finishedVariantLabel;
-            QcFileReadExperiment::ContentSummary contentSummary{};
-            bool experimentDone = false;
             {
                 ScopedKMutex lock(fileStreamMutex_);
                 summary = fileStream_.checkTimeout(k_uptime_get());
@@ -471,41 +510,6 @@ private:
                     }
                     tallyOtherCount = messageTally_.otherCount();
                     messageTally_.stop();
-
-                    // issue #33 variant experiment: same "copy out before
-                    // anything resets it" reasoning as messageTally_ above.
-                    finishedVariantLabel = fileReadExperiment_.currentVariant().label;
-                    contentSummary = fileReadExperiment_.contentSummary();
-                    experimentDone = fileReadExperiment_.isLastVariant();
-
-                    // Only start watching for post-connect preset-change
-                    // pushes (issue #61) once every variant has had its own
-                    // turn - the code below (outside this lock) sends the
-                    // next variant's File READ otherwise, which must not be
-                    // mistaken by postStreamTally_ for a preset change.
-                    if (experimentDone) {
-                        fileReadExperiment_.advanceVariant();
-
-                        // issue #61's preset-change check needs visibility
-                        // into whatever arrives *after* the File stream,
-                        // too (a preset recall on the unit pushing
-                        // RecallPreset/Scene/SetlistPosition or similar) -
-                        // messageTally_ above is scoped to the stream and
-                        // goes silent the moment it stops. postStreamTally_
-                        // picks up right here and keeps running for the
-                        // rest of the session; see the "changed since last
-                        // logged" check below for how it's reported without
-                        // flooding the log if the device turns out to
-                        // stream something continuously (qc-mcp's own
-                        // comment: GlobalTempo/CPULoad stream ~3/s under an
-                        // active heartbeat, with or without a preset
-                        // change).
-                        postStreamTally_.start();
-                        postStreamLoggedEntries_ = {};
-                        postStreamLoggedEntryCount_ = 0;
-                        postStreamLoggedOtherCount_ = 0;
-                        postStreamLastLoggedAtMs_ = k_uptime_get();
-                    }
                 }
 
                 if (postStreamTally_.isActive()) {
@@ -565,9 +569,13 @@ private:
                 // actually executing - a few times total across the whole
                 // experiment, not every ~200ms tick.
                 logFileStreamSummaryAndAdvance(*summary, {tallyEntries.data(), tallyEntryCount},
-                                               tallyOtherCount, totalInTransfersThisStream,
-                                               finishedVariantLabel, contentSummary, experimentDone);
+                                               tallyOtherCount, totalInTransfersThisStream);
             }
+            // issue #33 variant experiment: checked every tick (cheap - a
+            // boolean short-circuit under the lock when not draining), not
+            // just the tick a stream finishes on, since what it's waiting
+            // for is further silence, not an event.
+            checkDrainAndSendNextVariant();
             if (postStreamChanged) {
                 for (size_t i = 0; i < postStreamEntryCount; ++i) {
                     LOG_INF("Post-connect tally: command=%u count=%u", postStreamEntries[i].command,
@@ -583,21 +591,35 @@ private:
     }
 
     // issue #33 variant experiment: logs one variant's finished-stream
-    // summary and either sends the next variant's File READ or (on the
-    // last variant) hands off to issue #61's post-connect watch. Called
-    // from runHeartbeat() only when a stream just finished - see that call
-    // site's comment for why this is a separate function rather than
-    // inlined there (a real hardware stack overflow on qc_heartbeat).
-    // `tallyEntries` points into runHeartbeat()'s own already-copied-out
-    // array, valid for the duration of this call.
+    // summary and either starts draining before the next variant's File
+    // READ, or (on the last variant) hands off to issue #61's post-connect
+    // watch. Called from runHeartbeat() only when a stream just finished -
+    // see that call site's comment for why this is a separate function
+    // rather than inlined there (a real hardware stack overflow on
+    // qc_heartbeat). `tallyEntries` points into runHeartbeat()'s own
+    // already-copied-out array, valid for the duration of this call.
+    //
+    // Reads fileReadExperiment_'s variant/content state directly, without
+    // fileStreamMutex_, rather than runHeartbeat() snapshotting it into
+    // locals first (as an earlier version of this did, contributing to the
+    // stack overflow above): by the time checkTimeout() has returned a
+    // summary, fileStream_.isActive() is already false, and onMessage()/
+    // onInflateFailed() only ever write to fileReadExperiment_ while
+    // isActive() is true (see their own comments) - so nothing writes to
+    // it again until this same function's own beginVariant()/advanceVariant()
+    // calls below, both sequenced after every read here, in this same
+    // thread. No concurrent writer exists in between, so no lock is needed
+    // for the reads.
     void logFileStreamSummaryAndAdvance(const QcFileStream::Summary& summary,
                                         std::span<const QcMessageTally::Entry> tallyEntries,
-                                        uint32_t tallyOtherCount, uint32_t totalInTransfersThisStream,
-                                        std::string_view variantLabel,
-                                        const QcFileReadExperiment::ContentSummary& contentSummary,
-                                        bool experimentDone) {
-        const int labelLen = static_cast<int>(variantLabel.size());
-        const char* const label = variantLabel.data();
+                                        uint32_t tallyOtherCount, uint32_t totalInTransfersThisStream) {
+        const auto variant = fileReadExperiment_.currentVariant();
+        const auto contentSummary = fileReadExperiment_.contentSummary();
+        const bool isLast = fileReadExperiment_.isLastVariant();
+        const bool isShortListing = variant.options.shortListing;
+        const int labelLen = static_cast<int>(variant.label.size());
+        const char* const label = variant.label.data();
+
         LOG_INF("File stream [variant=%.*s] finished (%s): %u messages (%u compressed, %u "
                 "failed), %zu wire bytes, %zu inflated bytes, %d ms",
                 labelLen, label, summary.timedOut ? "timeout" : "quiet", summary.messageCount,
@@ -681,14 +703,19 @@ private:
 
         // issue #33 variant experiment: content actually decoded from this
         // variant's messages that fit (QcFileMessage.hpp's decodeFile(),
-        // called from onMessage() as each message arrived - see
-        // QcFileReadExperiment.hpp). A handful of folder/preset name
-        // samples were already logged live, during the stream, at a
-        // bounded low rate - not batched here, to keep this a summary
-        // rather than a second per-message log.
-        LOG_INF("File content [variant=%.*s]: preset folders=%u presets=%u empty-named=%u", labelLen,
-                label, contentSummary.presetFolderCount, contentSummary.totalPresetCount,
-                contentSummary.emptyNamePresetCount);
+        // called from onFileMessage() as each message arrived, off this
+        // thread entirely - see QcFileReadExperiment.hpp). "named" below
+        // excludes empty-slot entries (a blank name - confirmed on real
+        // hardware, 2026-11-01, to mean an unused slot, not a preset, same
+        // as qc-mcp's directory.py documents for SetlistPosition's own
+        // fixed-size table) - they're counted but not reported as presets.
+        const uint32_t namedPresetCount =
+            contentSummary.totalPresetCount - contentSummary.emptyNamePresetCount;
+        LOG_INF("File content [variant=%.*s]: preset folders=%u (factory=%u user=%u) named "
+                "presets=%u (factory=%u user=%u) empty slots=%u",
+                labelLen, label, contentSummary.presetFolderCount, contentSummary.factoryFolderCount,
+                contentSummary.userFolderCount, namedPresetCount, contentSummary.namedFactoryPresetCount,
+                contentSummary.namedUserPresetCount, contentSummary.emptyNamePresetCount);
         if (contentSummary.typeCountEntries == 0 && contentSummary.otherTypeCount == 0) {
             LOG_INF("File content [variant=%.*s]: no File messages of any type seen this variant",
                     labelLen, label);
@@ -696,8 +723,8 @@ private:
             // decodeFile() only ever reports presets (type 0) - this is
             // every File message's `type` field, independent of
             // decodeFile(), so a message dropped from the decoded preset
-            // count above (e.g. an IRs/Captures folder) still shows up
-            // here.
+            // count above (e.g. an IRs/Captures folder, or the no-folder
+            // reply discussed above - type=-1) still shows up here.
             for (size_t i = 0; i < contentSummary.typeCountEntries; ++i) {
                 LOG_INF("File content [variant=%.*s]: type=%d count=%u", labelLen, label,
                         static_cast<int>(contentSummary.typeCounts[i].type),
@@ -711,25 +738,102 @@ private:
             }
         }
 
-        if (experimentDone) {
+        // issue #33 variant experiment: the full per-folder breakdown -
+        // only for the two short_listing=true variants, where the catalog
+        // shrinks to a handful of folders (confirmed on real hardware: 13)
+        // and this is genuinely readable; the other two variants have a
+        // few hundred (confirmed: 376/390), for which only the totals
+        // above are logged, by design (see QcFileReadExperiment::kMaxFolders).
+        if (isShortListing) {
+            const auto folders = fileReadExperiment_.folderDetails();
+            if (folders.empty() && contentSummary.otherFolderCount == 0) {
+                LOG_INF("File content [variant=%.*s]: no preset folders decoded", labelLen, label);
+            }
+            for (const auto& folder : folders) {
+                LOG_INF("File content [variant=%.*s] folder: key=\"%s\" name=\"%s\" "
+                        "parent_key=\"%s\" is_factory=%d is_downloads=%d named=%u empty=%u",
+                        labelLen, label, folder.key.c_str(), folder.name.c_str(),
+                        folder.parentKey.c_str(), folder.isFactory, folder.isDownloads, folder.namedCount,
+                        folder.emptyCount);
+                for (size_t i = 0; i < folder.sampleCount; ++i) {
+                    LOG_INF("File content [variant=%.*s] folder \"%s\" sample: \"%s\"", labelLen, label,
+                            folder.name.c_str(), folder.samples[i].c_str());
+                }
+            }
+            if (contentSummary.otherFolderCount > 0) {
+                LOG_INF("File content [variant=%.*s]: %u folders from other distinct keys "
+                        "(> %zu tracked) - unexpected for a short_listing variant, worth a "
+                        "comment on #33",
+                        labelLen, label, contentSummary.otherFolderCount, QcFileReadExperiment::kMaxFolders);
+            }
+        }
+
+        if (isLast) {
             LOG_INF("Post-connect tally started: watching for preset-change pushes "
                     "(RecallPreset/Scene/SetlistPosition/...) - issue #61");
+            ScopedKMutex lock(fileStreamMutex_);
+            fileReadExperiment_.advanceVariant();
+            // issue #61's preset-change check needs visibility into
+            // whatever arrives *after* the File stream, too (a preset
+            // recall on the unit pushing RecallPreset/Scene/
+            // SetlistPosition or similar) - messageTally_ above is scoped
+            // to the stream and goes silent the moment it stops.
+            // postStreamTally_ picks up right here and keeps running for
+            // the rest of the session; see the "changed since last
+            // logged" check in runHeartbeat() for how it's reported
+            // without flooding the log if the device turns out to stream
+            // something continuously (qc-mcp's own comment: GlobalTempo/
+            // CPULoad stream ~3/s under an active heartbeat, with or
+            // without a preset change).
+            postStreamTally_.start();
+            postStreamLoggedEntries_ = {};
+            postStreamLoggedEntryCount_ = 0;
+            postStreamLoggedOtherCount_ = 0;
+            postStreamLastLoggedAtMs_ = k_uptime_get();
             return;
         }
 
-        // issue #33 variant experiment: move on to the next variant -
-        // reusing the same send path the heartbeat already uses for
-        // KeepAlive, rather than a new thread.
+        // issue #33 variant experiment: don't send the next variant yet -
+        // checkDrainAndSendNextVariant() (called every heartbeat tick)
+        // waits for kVariantDrainGapMs of real silence first. See that
+        // method and kVariantDrainGapMs's own comment for why.
+        LOG_INF("File READ variant experiment: variant [%.*s] finished - waiting up to %lldms "
+                "quiet before the next one",
+                labelLen, label, static_cast<long long>(kVariantDrainGapMs));
+        ScopedKMutex lock(fileStreamMutex_);
+        draining_ = true;
+    }
+
+    // issue #33 variant experiment: called every heartbeat tick. Once
+    // logFileStreamSummaryAndAdvance() has set draining_ (a variant just
+    // finished and it wasn't the last one), waits for kVariantDrainGapMs
+    // of silence on lastFileMessageAtMs_ - updated on *any* File message,
+    // foldered or not, whether or not a stream is currently active (see
+    // onMessage()'s comment) - before actually sending the next variant's
+    // request. A first hardware run (commit 147fb48) sent the next
+    // request immediately on the current one finishing and found its
+    // predecessor's reply still arriving, contaminating the new variant's
+    // count; this is the fix.
+    void checkDrainAndSendNextVariant() {
         FileReadOptions nextOptions;
         std::string_view nextLabel;
         size_t nextVariantNumber = 0;
+        bool shouldSend = false;
         {
             ScopedKMutex lock(fileStreamMutex_);
+            if (!draining_) {
+                return;
+            }
+            if (k_uptime_get() - lastFileMessageAtMs_ < kVariantDrainGapMs) {
+                return;
+            }
+            draining_ = false;
             fileReadExperiment_.advanceVariant();
             fileReadExperiment_.beginVariant();
             reassemblyOverflowByCommand_.reset();
-            fileStream_.start(k_uptime_get());
+            fileStream_.start(k_uptime_get(), kExperimentQuietWindowMs);
             messageTally_.start();
+            lastFileMessageAtMs_ = k_uptime_get();
             dispatcherDroppedAtStart_ = dispatcher_.droppedCount();
             gzipDroppedAtStart_ = gzipInflater_.droppedCount();
             reassemblyOverflowAtStart_ = reassemblyOverflowCount_.load(std::memory_order_relaxed);
@@ -738,6 +842,10 @@ private:
             nextOptions = fileReadExperiment_.currentVariant().options;
             nextLabel = fileReadExperiment_.currentVariant().label;
             nextVariantNumber = fileReadExperiment_.variantNumber();
+            shouldSend = true;
+        }
+        if (!shouldSend) {
+            return;
         }
         HandshakeMessageBuffer fileReadMsg;
         encodeFileRead(fileReadMsg, nextRequestId(), nextOptions);
@@ -856,6 +964,18 @@ private:
     uint32_t reassemblyOverflowAtStart_ = 0;
     uint32_t reassemblyMalformedAtStart_ = 0;
     uint32_t totalInTransfersAtStart_ = 0;
+
+    // issue #33 variant experiment: timestamp of the most recent File
+    // message of any kind (onMessage()/onInflateFailed(), command ==
+    // kCommandFile) - updated whether or not fileStream_ is currently
+    // active, and whether or not the message had a folder (see onMessage()'s
+    // comment). checkDrainAndSendNextVariant() compares this against
+    // kVariantDrainGapMs to decide the next variant's request can finally
+    // go out. draining_ is true from the moment one variant's stream
+    // finishes (logFileStreamSummaryAndAdvance()) until that gap has
+    // elapsed and the next request has been sent.
+    int64_t lastFileMessageAtMs_ = 0;
+    bool draining_ = false;
 
     // A new command id is always logged the moment it's first seen; a
     // count bump on an already-logged command is throttled to at most

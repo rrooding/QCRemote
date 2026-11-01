@@ -58,13 +58,17 @@ inline const char* toString(InflateError error) {
 }
 
 // Upper bound on the *compressed* gzip member this module will accept.
-// Matches QcHidBridge.hpp's kReassemblyCapacity (today's issue #33
-// placeholder, 4096 bytes) - a message's protobuf blob can never be
-// larger than the whole reassembled HID message it came from, so this
-// can't usefully be bigger than that without #33 changing first. Not an
-// #include of that header: QcHidBridge.hpp already includes QcSession.hpp
-// (which pulls this one in), so including it back would be circular.
-// Keep the two values in sync by hand if #33 revisits kReassemblyCapacity.
+// Originally matched QcHidBridge.hpp's kReassemblyCapacity (a message's
+// protobuf blob can never be larger than the whole reassembled HID message
+// it came from) - deliberately left at 4096 rather than following
+// kReassemblyCapacity's temporary bump to 16384 for issue #33's
+// `short_listing` variant experiment (QcHidBridge.hpp's comment): every
+// hardware run so far shows `File` messages are never gzip-compressed (0
+// compressed every time), so this module isn't on the path that
+// experiment needs to grow. Not an #include of QcHidBridge.hpp: it already
+// includes QcSession.hpp (which pulls this one in), so including it back
+// would be circular. Keep the two values in sync by hand if #33 step 2
+// revisits kReassemblyCapacity for real.
 inline constexpr size_t kMaxCompressedInputSize = 4096;
 
 // Upper bound on the *decompressed* output this module will produce.
