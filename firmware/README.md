@@ -817,6 +817,160 @@ Ztest suites still pass (86/86, one new) on `qemu_cortex_m3`, and a clean `frdm_
 succeeds with unchanged RAM (97816 B, 9.95%). **Not verified on real hardware** - commit to
 flash for that is the fix on top of `872c898`, still branch `firmware/reassembly-memory-budget`.
 
+**Hardware measurement (commit `a1c25b6`): no crash, full by-command breakdown.** Handshake
+`4.1.1`. `File` stream:
+
+```
+File stream finished (quiet): 551 messages (0 compressed, 0 failed), ... ms
+File stream tally: command=4 count=551 max_wire=3946 ...
+File stream overflow by command: command=4 count=29 max_true_size=113180
+File stream overflow by command: command=51 count=1 max_true_size=59219
+File stream overflow by command: command=35 count=1 max_true_size=28354
+```
+
+551 `File` messages fit under `kReassemblyCapacity` (largest 3946 bytes, none compressed), and
+29 overflowed it - the largest of those 113180 bytes. `ModelRepo` (51, 59219 bytes) and
+`ModuleStats` (35, 28354 bytes) each overflowed once. A compressed `RecallPreset` (15) later
+inflated to 22667 bytes for one preset - past `kMaxInflatedSize` (16384) - a second preset
+that same run inflated to 13235 bytes, under the limit. `malformed=0`, confirming the
+`872c898`/fix-commit theory above: once overflow no longer desyncs the reassembler, spurious
+`Malformed` counts disappear entirely. **The 29 lost `File` messages' contents are unknown** -
+HidReassembler drops an overflowing message's body, keeping only its trailer (see
+`overflowTrailer()` above), so whether any of them were preset folders - and therefore whether
+this stream's preset list is missing folders - can't be answered from this run alone. That
+question is exactly what the variant experiment below exists to answer.
+
+## FileMessage READ options experiment, step 1.5 (issue #33)
+
+Before sizing `kReassemblyCapacity`/`kMaxInflatedSize` for real, the owner asked for one more
+measurement: does `FileMessage` READ's `short_listing` (field 6) or `omit_factory_content`
+(field 11) option shrink the device's listing enough to avoid the overflow above - and if so,
+does the shrunken listing still name every *user* preset? A third field,
+`user_content_estimate` (field 12), exists on the same message but wasn't tested (it's an
+estimate the device reports, not a request option - setting it on a READ has no documented
+effect). All three field numbers were verified directly against qc-mcp's own descriptor set
+(`qc_descriptors-4.1.pb`, field-by-field, same method issue #5's Tier 2 messages used), not
+guessed - see `FileReadOptions` in
+[`QcFileRequest.hpp`](app/src/QcFileRequest.hpp). **Nobody knows what either option does**:
+neither qc-mcp's protocol code nor its CLI/MCP tool surface ever sets either field (checked
+directly against its source), so this is genuinely untested territory until a real device
+answers it.
+
+[`QcFileReadExperiment.hpp`](app/src/QcFileReadExperiment.hpp) is a **self-contained, isolated
+diagnostic** - not a permanent feature, and not step 2's actual sizing pass. It's meant to be
+deleted (the file itself, plus its few call sites in `QcSession.hpp` - grep `issue #33 variant
+experiment`) once the owner has an answer. It changes neither `kReassemblyCapacity` nor
+`kMaxInflatedSize`.
+
+**The test.** After the handshake and issue #61's twelve post-connect state READs, instead of
+one bare `File` READ this build sends four variants, one at a time, each to its own stream
+finish (quiet window or 30s cap, same as every other `File` stream) before the next is sent -
+so a reply to one variant is never counted against another:
+
+1. **default** - both options false (byte-identical to the original bare READ; must reproduce
+   the `a1c25b6` numbers above).
+2. **`short_listing=true`**
+3. **`omit_factory_content=true`**
+4. **both set**
+
+Flash this build once; all four variants run automatically in one connect, back to back, over
+roughly the same ~12s-per-variant the baseline stream took (so up to about a minute or two for
+all four, well inside the existing 30s-per-variant cap). A variant that gets no reply, or a
+shorter stream than expected, is reported as such (a `0`-message summary, same as any other
+quiet/timeout finish) and the sequence still moves on to the next variant rather than stopping.
+
+**What gets logged per variant**, each line tagged `[variant=<name>]` so the four runs can't be
+confused with each other:
+
+```
+File stream [variant=<name>] finished (quiet|timeout): N messages (C compressed, F failed), W wire bytes, I inflated bytes, E ms
+File stream [variant=<name>] limits: max wire=MW max inflated=MI, dropped (dispatch=DD gzip=DG), reassembly (overflow=RO malformed=RM)
+File stream [variant=<name>] tally: T total IN transfers
+File stream [variant=<name>] tally: command=CMD count=CNT max_wire=... max_inflated=...   (per distinct command seen)
+File stream [variant=<name>] overflow by command: command=CMD count=CNT max_true_size=MTS   (or "none")
+File content [variant=<name>]: preset folders=PF presets=PC empty-named=EN
+File content [variant=<name>]: type=T count=C   (per distinct File `type` value seen, or "no File messages of any type seen this variant")
+```
+
+Unlike the single-run measurement above, `overflow by command` here is **reset at the start of
+each variant** (`QcReassemblyOverflowTally::reset()`), so it reports only that variant's
+overflows, not a running lifetime total.
+
+The **content** lines come from actually decoding each fitting message with
+[`QcFileMessage.hpp`](app/src/QcFileMessage.hpp)'s `decodeFile()` - the same merged decoder
+issue #59 wrote and issue #10 will eventually wire into the real session - called live, per
+message, from `onMessage()` (the `qc_dispatch`/`qc_gzip_inflate` worker thread that message
+arrived on, never `usbh`; see `QcFileReadExperiment::onFileMessage()`'s own comment on why
+that's stack-safe: no recursion, no heap, no local bigger than a handful of
+pointers/ints/bools). `preset folders`/`presets`/`empty-named` come from `decodeFile()` itself
+(folders with `type == 0`, and the presets inside them); the `type=` lines come from reading
+each message's own `type` field directly, independent of `decodeFile()`'s presets-only
+filtering, specifically so an IRs/Captures folder a variant drops (or keeps) still shows up
+somewhere even though `decodeFile()` itself never calls back for one.
+
+A handful of `folder`/`preset` name pairs are also logged live, during the stream, at a bounded
+low rate (`File content sample: folder="..." preset="..."` - at most 8 per variant, roughly one
+every 47th preset seen) - enough to eyeball whether names survive an option, without a second
+per-message log competing with the existing File-stream traffic. This intentionally does not
+print the whole preset list - that's issue #10's job, not this experiment's.
+
+**What each outcome means:**
+
+- **A variant has zero `File` overflows (`overflow by command: none`, and every per-command
+  `max_wire` comfortably under `kReassemblyCapacity`) *and* its preset folder/preset counts
+  match (or exceed) the default variant's, with no new empty-named presets** - this is
+  **success**: that option (or combination) makes the whole catalog fit without losing
+  anything, and step 2 can size `kReassemblyCapacity` to that variant's real peak instead of
+  buffering (or excluding) a message as large as `a1c25b6`'s 113180-byte one.
+- **A variant has fewer messages or fewer overflows than default, but also fewer presets, fewer
+  preset folders, more empty-named presets, or visibly different names in the sampled lines -
+  this is *not* useful**, even though it looks smaller: the option is dropping user content
+  (names and/or whole folders), not just shrinking factory bulk. Prefer the default variant's
+  real sizes over a smaller-but-lossy one.
+- **`omit_factory_content=true` loses exactly the factory presets/folders** (every surviving
+  folder's `is_factory` would need checking against the default run's own folders, not just a
+  smaller total) **but keeps every user folder and preset name intact** - also success, and the
+  more useful of the two single-option variants if so, since factory content is the device's
+  own bulk, not something a user would notice missing from a *listing* request (it's still on
+  the device either way).
+- **`short_listing=true` shrinks messages but strips preset names** (e.g. `presets` count
+  unchanged but every sampled `preset=""`, or `empty-named` jumps to match `presets`) - not
+  useful on its own: a shorter listing with no names defeats the point of listing at all.
+- **Neither option changes anything measurable** (same message count, same overflows, same
+  content, byte-for-byte) - a real, useful negative result: it means qc-mcp's own choice to
+  never set these fields isn't an oversight, and step 2 has to size for the full, unfiltered
+  catalog (or explicitly exclude very large messages like `ModelRepo`, per the issue's own
+  framing) rather than relying on a request-side shortcut.
+- **A variant's stream never starts (0 messages, 0 total IN transfers, times out at 30s)** -
+  worth a comment on #33 before assuming the option itself broke something: check whether the
+  *previous* variant's stream actually went quiet (its own finish line) rather than hitting the
+  30s cap itself, since back-to-back variants only make sense once each one's quiet window has
+  genuinely elapsed.
+
+**Hardware result (a work-in-progress build before this commit): stack overflow, fixed.** An
+early build of this experiment crashed `qc_heartbeat` with a USAGE FAULT ("Stack overflow,
+context area not valid") on its very first tick - before the handshake even finished, let
+alone any `File` stream starting. Cause: the per-variant logging and next-variant-send logic
+was inline in `runHeartbeat()` itself; at this build's optimization level, a function's stack
+frame reserves space for every local declared anywhere in its body, including inside a branch
+that's almost never taken (`if (summary)`) - so `qc_heartbeat`'s 2048-byte stack (measured peak
+1052 B on `a1c25b6`, before this experiment existed) was oversubscribed on *every* tick, not
+just the few where that code actually ran. Fixed by moving that logic into its own method,
+[`logFileStreamSummaryAndAdvance()`](app/src/QcSession.hpp) - its locals (the overflow-by-command
+array, the next variant's send buffer) are now a separate call frame, paid for only while that
+function actually executes (a handful of times across the whole four-variant run), not on
+every ~200ms heartbeat tick. `heartbeatStack_` was also doubled to 4096 B for margin, since this
+thread now does real new work (encoding and sending each next variant's `File` READ) that
+`a1c25b6` never asked of it, and that can't be re-verified on hardware from here.
+
+**Verified:** `west twister -p qemu_cortex_m3 -K`, all 6 suites, 94/94 cases pass (8 new,
+covering the new `FileReadOptions` encoding and `QcFileReadExperiment`'s variant
+cycling/content counting/sample bounding). Clean `frdm_rw612` build succeeds, RAM
+99960/983040 bytes (10.17%, +2144 B over `a1c25b6`'s 97816 B - mostly the doubled
+`heartbeatStack_`, plus the experiment's own state). **Not verified on real hardware past the
+stack-overflow fix above** - commit to flash for that is this PR's tip, still branch
+`firmware/reassembly-memory-budget`.
+
 ## Not yet done
 
 - ETL is wired in via CMake `FetchContent` (see `app/CMakeLists.txt`) but not yet used by

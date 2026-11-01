@@ -1,9 +1,13 @@
 #include <array>
 #include <cstdint>
+#include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <zephyr/ztest.h>
 
+#include "QcFileReadExperiment.hpp"
 #include "QcFileRequest.hpp"
 #include "QcFileStream.hpp"
 #include "QcMessageTally.hpp"
@@ -24,6 +28,56 @@ ZTEST(dispatch_messages, test_encode_file_read)
     const std::vector<uint8_t> expected = {
         0x08, 0x03,              // action = READ (3)
         0x10, 0x07,              // request_id = 7
+        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // trailer: command=4 (File)
+    };
+    zassert_equal(out.size(), expected.size(), "size");
+    zassert_mem_equal(out.data(), expected.data(), expected.size(), "bytes");
+}
+
+ZTEST(dispatch_messages, test_encode_file_read_short_listing)
+{
+    // issue #33 variant experiment: field 6, verified against qc-mcp's own
+    // descriptor set (qc_descriptors-4.1.pb).
+    HandshakeMessageBuffer out;
+    encodeFileRead(out, 7, FileReadOptions{.shortListing = true});
+
+    const std::vector<uint8_t> expected = {
+        0x08, 0x03,              // action = READ (3)
+        0x10, 0x07,              // request_id = 7
+        0x30, 0x01,              // short_listing = true (field 6)
+        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // trailer: command=4 (File)
+    };
+    zassert_equal(out.size(), expected.size(), "size");
+    zassert_mem_equal(out.data(), expected.data(), expected.size(), "bytes");
+}
+
+ZTEST(dispatch_messages, test_encode_file_read_omit_factory_content)
+{
+    // issue #33 variant experiment: field 11, verified against qc-mcp's own
+    // descriptor set (qc_descriptors-4.1.pb).
+    HandshakeMessageBuffer out;
+    encodeFileRead(out, 7, FileReadOptions{.omitFactoryContent = true});
+
+    const std::vector<uint8_t> expected = {
+        0x08, 0x03,              // action = READ (3)
+        0x10, 0x07,              // request_id = 7
+        0x58, 0x01,              // omit_factory_content = true (field 11)
+        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // trailer: command=4 (File)
+    };
+    zassert_equal(out.size(), expected.size(), "size");
+    zassert_mem_equal(out.data(), expected.data(), expected.size(), "bytes");
+}
+
+ZTEST(dispatch_messages, test_encode_file_read_both_options)
+{
+    HandshakeMessageBuffer out;
+    encodeFileRead(out, 7, FileReadOptions{.shortListing = true, .omitFactoryContent = true});
+
+    const std::vector<uint8_t> expected = {
+        0x08, 0x03,              // action = READ (3)
+        0x10, 0x07,              // request_id = 7
+        0x30, 0x01,              // short_listing = true (field 6)
+        0x58, 0x01,              // omit_factory_content = true (field 11)
         0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // trailer: command=4 (File)
     };
     zassert_equal(out.size(), expected.size(), "size");
@@ -402,4 +456,184 @@ ZTEST(dispatch_messages, test_message_tally_stop_blocks_further_records_until_re
     tally.start();
     zassert_equal(tally.entries().size(), 0u, "expected a clean slate after restart");
     zassert_equal(tally.otherCount(), 0u, "otherCount must reset on restart too");
+}
+
+// --- QcFileReadExperiment.hpp (issue #33 variant experiment) ---------------
+
+namespace {
+
+template <typename Container>
+std::string_view asStringView(const Container& bytes) {
+    return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+}
+
+// Same shape as tests/file_messages's own helpers: a FolderInfo (1=key,
+// 3=name, 4=is_factory, 7=files repeated) wrapping ProductData entries
+// (3=name only - this experiment, like issue #59's decoder, never reads a
+// product's other fields). Deliberately not wrapped in a second
+// by-value-returning helper for "the whole File message" - nesting two
+// etl::vector<uint8_t, 2048>-returning functions overflowed the ztest
+// thread's stack on qemu_cortex_m3 at low optimization (each frame reserves
+// its own 2KB-plus locals regardless of NRVO); building the top-level
+// `type`/`folder` proto directly in each test, one level of nesting only,
+// mirrors file_messages's own tests, which are verified to fit.
+etl::vector<uint8_t, 2048> buildFolder(std::string_view key, std::string_view name, bool isFactory,
+                                       const std::vector<std::string_view>& presetNames) {
+    etl::vector<uint8_t, 2048> out;
+    writeString(out, 1, key);
+    writeString(out, 3, name);
+    writeBool(out, 4, isFactory);
+    for (const auto& presetName : presetNames) {
+        etl::vector<uint8_t, 512> product;
+        writeString(product, 3, presetName);
+        writeString(out, 7, asStringView(product));
+    }
+    return out;
+}
+
+}  // namespace
+
+ZTEST(dispatch_messages, test_file_read_experiment_variant_table)
+{
+    zassert_equal(QcFileReadExperiment::kVariants.size(), 4u, "expected four variants");
+    zassert_equal(QcFileReadExperiment::kVariants[0].label, "default", "variant 0 label");
+    zassert_false(QcFileReadExperiment::kVariants[0].options.shortListing, "variant 0 shortListing");
+    zassert_false(QcFileReadExperiment::kVariants[0].options.omitFactoryContent,
+                  "variant 0 omitFactoryContent");
+    zassert_true(QcFileReadExperiment::kVariants[1].options.shortListing, "variant 1 shortListing");
+    zassert_false(QcFileReadExperiment::kVariants[1].options.omitFactoryContent,
+                  "variant 1 omitFactoryContent");
+    zassert_false(QcFileReadExperiment::kVariants[2].options.shortListing, "variant 2 shortListing");
+    zassert_true(QcFileReadExperiment::kVariants[2].options.omitFactoryContent,
+                 "variant 2 omitFactoryContent");
+    zassert_true(QcFileReadExperiment::kVariants[3].options.shortListing, "variant 3 shortListing");
+    zassert_true(QcFileReadExperiment::kVariants[3].options.omitFactoryContent,
+                 "variant 3 omitFactoryContent");
+}
+
+ZTEST(dispatch_messages, test_file_read_experiment_cycles_through_every_variant)
+{
+    QcFileReadExperiment experiment;
+    experiment.reset();
+
+    zassert_equal(experiment.variantNumber(), 1u, "expected to start at variant 1");
+    zassert_false(experiment.isLastVariant(), "variant 1 of 4 is not last");
+
+    experiment.advanceVariant();
+    zassert_equal(experiment.variantNumber(), 2u, "variant 2");
+    zassert_false(experiment.isLastVariant(), "variant 2 of 4 is not last");
+
+    experiment.advanceVariant();
+    zassert_equal(experiment.variantNumber(), 3u, "variant 3");
+    zassert_false(experiment.isLastVariant(), "variant 3 of 4 is not last");
+
+    experiment.advanceVariant();
+    zassert_equal(experiment.variantNumber(), 4u, "variant 4");
+    zassert_true(experiment.isLastVariant(), "variant 4 of 4 is last");
+    zassert_true(experiment.hasCurrentVariant(), "variant 4 is still a valid current variant");
+
+    experiment.advanceVariant();
+    zassert_false(experiment.hasCurrentVariant(), "past the last variant, none is current");
+}
+
+ZTEST(dispatch_messages, test_file_read_experiment_counts_preset_folders_and_names)
+{
+    QcFileReadExperiment experiment;
+    experiment.beginVariant();
+
+    std::vector<std::pair<std::string, std::string>> samples;
+    auto onSample = [&](std::string_view folder, std::string_view preset) {
+        samples.emplace_back(std::string(folder), std::string(preset));
+    };
+
+    {
+        const auto folder = buildFolder("1_q", "My Presets", false,
+                                        {"Lead Tone", ""});  // one preset has an empty name
+        etl::vector<uint8_t, 2048> proto;
+        writeUInt64(proto, 3, kFileTypePresets);
+        writeString(proto, 4, asStringView(folder));
+        experiment.onFileMessage({proto.data(), proto.size()}, onSample);
+    }
+    {
+        const auto folder = buildFolder("/opt/neuraldsp/factory", "Factory Library", true,
+                                        {"Default Clean"});
+        etl::vector<uint8_t, 2048> proto;
+        writeUInt64(proto, 3, kFileTypePresets);
+        writeString(proto, 4, asStringView(folder));
+        experiment.onFileMessage({proto.data(), proto.size()}, onSample);
+    }
+    {
+        const auto folder = buildFolder("CIR_abc", "My IRs", false, {"Cab IR"});
+        etl::vector<uint8_t, 2048> proto;
+        writeUInt64(proto, 3, 1);  // type = 1 (IRs)
+        writeString(proto, 4, asStringView(folder));
+        experiment.onFileMessage({proto.data(), proto.size()}, onSample);
+    }
+
+    const auto summary = experiment.contentSummary();
+    zassert_equal(summary.presetFolderCount, 2u, "two type=0 folders (IRs folder doesn't count)");
+    zassert_equal(summary.totalPresetCount, 3u, "three presets total across both preset folders");
+    zassert_equal(summary.emptyNamePresetCount, 1u, "one preset had an empty name");
+
+    // File messages by type, independent of decodeFile()'s presets-only
+    // filtering - the IRs folder (type=1) must still show up here.
+    zassert_equal(summary.typeCountEntries, 2u, "two distinct types seen");
+    zassert_equal(summary.typeCounts[0].type, kFileTypePresets, "first type seen");
+    zassert_equal(summary.typeCounts[0].count, 2u, "two type=0 messages");
+    zassert_equal(summary.typeCounts[1].type, 1, "second type seen");
+    zassert_equal(summary.typeCounts[1].count, 1u, "one type=1 message");
+}
+
+ZTEST(dispatch_messages, test_file_read_experiment_begin_variant_resets_counters)
+{
+    QcFileReadExperiment experiment;
+    experiment.beginVariant();
+
+    const auto folder = buildFolder("1_q", "My Presets", false, {"Lead Tone"});
+    etl::vector<uint8_t, 2048> proto;
+    writeUInt64(proto, 3, kFileTypePresets);
+    writeString(proto, 4, asStringView(folder));
+    auto noopSample = [](std::string_view, std::string_view) {};
+    experiment.onFileMessage({proto.data(), proto.size()}, noopSample);
+
+    zassert_equal(experiment.contentSummary().totalPresetCount, 1u, "one preset before reset");
+
+    experiment.beginVariant();
+    const auto summary = experiment.contentSummary();
+    zassert_equal(summary.presetFolderCount, 0u, "presetFolderCount reset");
+    zassert_equal(summary.totalPresetCount, 0u, "totalPresetCount reset");
+    zassert_equal(summary.emptyNamePresetCount, 0u, "emptyNamePresetCount reset");
+    zassert_equal(summary.typeCountEntries, 0u, "typeCountEntries reset");
+    zassert_equal(summary.otherTypeCount, 0u, "otherTypeCount reset");
+}
+
+ZTEST(dispatch_messages, test_file_read_experiment_samples_are_bounded_and_low_rate)
+{
+    QcFileReadExperiment experiment;
+    experiment.beginVariant();
+
+    std::vector<std::string> sampledPresets;
+    auto onSample = [&](std::string_view, std::string_view preset) {
+        sampledPresets.emplace_back(preset);
+    };
+
+    // Many more presets than kMaxSamples, fed in one at a time (one small
+    // folder/File message per preset, like the real device stream - and
+    // like file_messages's own tests, reusing a small fixed-capacity buffer
+    // per iteration rather than one huge folder keeps this within the
+    // ztest thread's stack).
+    const uint32_t totalPresets =
+        QcFileReadExperiment::kSampleInterval * QcFileReadExperiment::kMaxSamples + 5;
+    for (uint32_t i = 0; i < totalPresets; ++i) {
+        const std::string name = "Preset " + std::to_string(i);
+        const auto folder = buildFolder("1_q", "My Presets", false, {name});
+        etl::vector<uint8_t, 256> proto;
+        writeUInt64(proto, 3, kFileTypePresets);
+        writeString(proto, 4, asStringView(folder));
+        experiment.onFileMessage({proto.data(), proto.size()}, onSample);
+    }
+
+    zassert_true(sampledPresets.size() <= QcFileReadExperiment::kMaxSamples,
+                "samples must stay bounded at kMaxSamples even with far more presets than that");
+    zassert_true(sampledPresets.size() > 0, "expected at least one sample from this many presets");
 }
