@@ -14,6 +14,7 @@
 
 #include "HidChunker.hpp"
 #include "HidReassembler.hpp"
+#include "QcCatalogSnapshot.hpp"
 #include "QcDispatcher.hpp"
 #include "QcFileMessage.hpp"
 #include "QcFileRequest.hpp"
@@ -26,6 +27,7 @@
 #include "QcMessageTally.hpp"
 #include "QcPresetCatalog.hpp"
 #include "QcPresetPrinter.hpp"
+#include "QcPresetTransport.hpp"
 #include "QcStateReads.hpp"
 #include "ScopedKMutex.hpp"
 #include "UsbHostClass.hpp"
@@ -218,6 +220,20 @@ public:
     // "it sent reports that just never turned into a counted message").
     // Same atomic-increment-only contract as the two above.
     void recordInTransfer() { totalInTransfers_.fetch_add(1, std::memory_order_relaxed); }
+
+    // Issue #71: registers a generic transport (QcPresetTransport.hpp) to
+    // receive catalog/preset-change updates - Wi-Fi today
+    // (QcWifiWebTransport.hpp), BLE later, either or both at once. Must be
+    // called before deviceConnected() (Main.cpp wires this up once, at
+    // startup) - not synchronized against a concurrent runHeartbeat()/
+    // logFileStreamSummary() call, same as every other one-time setup call
+    // in this class (setCatalogMutex() on presetPrinter_, the constructor's
+    // setSink() calls).
+    void addTransport(QcPresetTransport& transport) {
+        if (!transports_.full()) {
+            transports_.push_back(&transport);
+        }
+    }
 
 private:
     // Below the main LED-blink loop's priority; documented since nothing
@@ -510,6 +526,17 @@ private:
                 for (size_t i = 0; i < postStreamEntryCount; ++i) {
                     LOG_INF("Post-connect tally: command=%u count=%u", postStreamEntries[i].command,
                             postStreamEntries[i].count);
+                    // Issue #71: the same new-or-bumped tally entry that
+                    // just got logged is what a transport's client needs
+                    // to know a preset may have changed on the unit - see
+                    // QcPresetTransport.hpp's own comment on why this
+                    // already-throttled signal is forwarded as-is rather
+                    // than re-deriving a separate "did a preset change"
+                    // check.
+                    for (auto* transport : transports_) {
+                        transport->publishPresetChange(QcPresetChangeEvent{
+                            .command = postStreamEntries[i].command, .count = postStreamEntries[i].count});
+                    }
                 }
                 if (postStreamOtherCount > 0) {
                     LOG_INF("Post-connect tally: %u messages from other distinct commands "
@@ -549,6 +576,21 @@ private:
         // lost that way.
         const bool incomplete = QcFileStream::isListingIncomplete(summary, presetCatalog_.overflowed());
         presetPrinter_.requestPrint(presetCatalog_, incomplete);
+
+        // Issue #71: hands the same finished listing to every registered
+        // transport (QcPresetTransport.hpp) - copied out under
+        // fileStreamMutex_ (the same lock every catalog write already
+        // goes through, see presetCatalog_'s own comment) into member
+        // storage, then published with the lock released, same split as
+        // presetPrinter_'s own copy-then-print above. publishCatalog()
+        // itself must not block (see QcPresetTransport.hpp's contract).
+        {
+            ScopedKMutex lock(fileStreamMutex_);
+            copyCatalogSnapshot(presetCatalog_, incomplete, catalogSnapshot_);
+        }
+        for (auto* transport : transports_) {
+            transport->publishCatalog(catalogSnapshot_);
+        }
 
         LOG_INF("Post-connect tally started: watching for preset-change pushes "
                 "(RecallPreset/Scene/SetlistPosition/...) - issue #61");
@@ -674,6 +716,16 @@ private:
     // full thread-safety reasoning.
     QcPresetCatalog presetCatalog_;
     QcPresetPrinter presetPrinter_;
+
+    // Issue #71: at most one Wi-Fi transport and one future BLE transport
+    // registered at once - see addTransport()/kMaxTransports' own comment.
+    // catalogSnapshot_ is this class's copy-out scratch for
+    // copyCatalogSnapshot() (QcCatalogSnapshot.hpp) - member storage, not a
+    // stack local, same "big objects never go on a thread's stack"
+    // discipline as presetCatalog_ itself (ADR 0008).
+    static constexpr size_t kMaxTransports = 2;
+    etl::vector<QcPresetTransport*, kMaxTransports> transports_;
+    QcCatalogSnapshot catalogSnapshot_;
 
     // Written from QcHidBridge::onReportIn() on the `usbh` thread (atomic
     // increment only - see recordReassemblyOverflow()/recordReassemblyMalformed()

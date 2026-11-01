@@ -45,6 +45,12 @@ public:
         return UsbHostClass::start(kQuadCortexVid, kQuadCortexMiniPid, kQuadCortexHidInterface);
     }
 
+    // Issue #71: lets Main.cpp register a transport (QcPresetTransport.hpp)
+    // with the session before any device connects - the only reason this
+    // accessor exists, since every other session access stays internal to
+    // this class.
+    QcSession& session() { return session_; }
+
 protected:
     bool onProbe(uint8_t iface, uint8_t ifaceClass, uint8_t ifaceSub, uint8_t ifaceProto) override {
         // iface is always kQuadCortexHidInterface here - the shim looks up
