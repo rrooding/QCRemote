@@ -129,6 +129,26 @@ public:
     // Resets the per-variant content counters - call once right before
     // sending that variant's File READ, mirrors QcFileStream::start()'s
     // "fresh window" contract.
+    //
+    // Deliberately does NOT reset `folders_` itself (a real hardware
+    // crash, confirmed via addr2line against this exact line: a stack
+    // overflow on qc_session's 2048-byte stack, right after the
+    // handshake, before the first variant's File READ even went out).
+    // `folders_ = {}` assigns a freshly-constructed std::array<FolderDetail,
+    // kMaxFolders> - 16 non-trivial objects, each holding several
+    // etl::string members - and at this build's optimization level that
+    // materializes the whole ~7KB temporary on the calling thread's stack
+    // before the assignment, the same class of bug as the two earlier
+    // stack overflows this issue has already hit (HidReassembler::
+    // appendTail(), then the inline per-variant logging in
+    // runHeartbeat()). folderCount_ = 0 below is enough on its own:
+    // folderDetails() only ever returns {folders_.data(), folderCount_},
+    // and recordFolder()'s own key search is bounded by folderCount_ too,
+    // so stale bytes past it are never read by anything - and fillFolder()
+    // (called for every slot recordFolder() claims, new or reused) resets
+    // every field that selectively feeds a sum, including the counts and
+    // sample count, so a slot index reused from a previous variant can't
+    // leak that variant's counts into this one's.
     void beginVariant() {
         presetFolderCount_ = 0;
         factoryFolderCount_ = 0;
@@ -140,7 +160,6 @@ public:
         typeCounts_ = {};
         typeCountEntries_ = 0;
         otherTypeCount_ = 0;
-        folders_ = {};
         folderCount_ = 0;
         otherFolderCount_ = 0;
     }
@@ -340,10 +359,14 @@ private:
     }
 
     // Finds this folder key's existing slot, or claims a new one (up to
-    // kMaxFolders). Either way, resets that slot's counts/samples first -
-    // qc-mcp's own directory.py comment is explicit that "later messages
-    // for the same folder key replace earlier ones," not merge with them,
-    // so a resent folder's content shouldn't accumulate across messages.
+    // kMaxFolders). Either way, fillFolder() below resets that slot's
+    // counts/samples along with its metadata - qc-mcp's own directory.py
+    // comment is explicit that "later messages for the same folder key
+    // replace earlier ones," not merge with them, so a resent folder's
+    // content shouldn't accumulate across messages, and a brand-new slot
+    // reused from a previous *variant* (beginVariant() only resets
+    // folderCount_, not folders_ itself - see that function's comment)
+    // can't leak that variant's stale counts into this one's either.
     // Returns nullptr once kMaxFolders is exhausted (bumps
     // otherFolderCount_ instead) - expected only for the non-short-listing
     // variants, whose few-hundred folders this table was never sized for
@@ -351,7 +374,6 @@ private:
     FolderDetail* recordFolder(const FolderMeta& meta) {
         for (size_t i = 0; i < folderCount_; ++i) {
             if (std::string_view(folders_[i].key.c_str(), folders_[i].key.size()) == meta.key) {
-                folders_[i] = FolderDetail{};
                 fillFolder(folders_[i], meta);
                 return &folders_[i];
             }
@@ -365,12 +387,25 @@ private:
         return nullptr;
     }
 
+    // Resets every field of `slot` - not just the metadata assign() fills
+    // in, but also the counts/sample bookkeeping onFileMessage() goes on
+    // to update - so every caller (a resent key, or a slot index reused
+    // from an earlier variant) starts this folder completely fresh.
+    // Deliberately field-by-field, not `slot = FolderDetail{}`: the latter
+    // constructs a whole fresh FolderDetail as a temporary first, which is
+    // exactly the pattern that overflowed qc_session's stack when done
+    // for all 16 slots at once in beginVariant() (see that function's
+    // comment) - one slot's worth is small enough not to matter here, but
+    // there's no reason to take the chance twice in the same class.
     static void fillFolder(FolderDetail& slot, const FolderMeta& meta) {
         slot.key.assign(meta.key.data(), meta.key.size());
         slot.name.assign(meta.name.data(), meta.name.size());
         slot.parentKey.assign(meta.parentKey.data(), meta.parentKey.size());
         slot.isFactory = meta.isFactory;
         slot.isDownloads = meta.isDownloads;
+        slot.namedCount = 0;
+        slot.emptyCount = 0;
+        slot.sampleCount = 0;
     }
 
     size_t variantIndex_ = 0;

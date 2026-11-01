@@ -1090,24 +1090,69 @@ sampled/decoded names above:
   If `My Presets` is still missing even with the 16 KiB buffer and properly separated variants,
   that means `short_listing` is not usable as-is, and should be reported exactly that plainly.
 
-### Hardware stack overflow (pre-`147fb48` WIP build): fixed
+### Hardware stack overflows: three so far, all fixed
 
-An early build of this experiment crashed `qc_heartbeat` with a USAGE FAULT ("Stack overflow,
-context area not valid") on its very first tick - before the handshake even finished, let alone
-any `File` stream starting. Cause: the per-variant logging and next-variant-send logic was
-inline in `runHeartbeat()` itself; at this build's optimization level, a function's stack frame
-reserves space for every local declared anywhere in its body, including inside a branch that's
-almost never taken (`if (summary)`) - so `qc_heartbeat`'s 2048-byte stack (measured peak 1052 B
-on `a1c25b6`, before this experiment existed) was oversubscribed on *every* tick, not just the
-few where that code actually ran. Fixed by moving that logic into its own method,
-[`logFileStreamSummaryAndAdvance()`](app/src/QcSession.hpp) - its locals are now a separate call
-frame, paid for only while that function actually executes, not on every ~200ms heartbeat tick.
-That method also reads `QcFileReadExperiment`'s state (including its per-folder table) directly
-rather than copying it into `runHeartbeat()`'s own locals first - see its header comment for the
-happens-before argument for why that's safe without a lock. `heartbeatStack_` was also doubled
-to 4096 B for margin, since this thread now does real new work (encoding and sending each next
-variant's `File` READ, and - as of this commit - waiting out the drain gap) that `a1c25b6` never
-asked of it, and that can't be re-verified on hardware from here.
+This experiment has now overflowed a thread's stack on real hardware three separate times -
+each only found via a crash, then resolving the fault PC/LR with `arm-zephyr-eabi-addr2line`
+against that commit's `zephyr.elf`, the same method issue #8's original `usbh` overflow used:
+
+1. **`usbh`** (fixed before `147fb48`) - see the earlier `872c898` section above
+   (`HidReassembler::appendTail()`'s unbounded scratch buffer).
+2. **`qc_heartbeat`** (fixed before `147fb48`) - USAGE FAULT, "Stack overflow, context area not
+   valid", on its very first tick, before the handshake even finished. Cause: the per-variant
+   logging and next-variant-send logic was inline in `runHeartbeat()` itself; at this build's
+   optimization level, a function's stack frame reserves space for every local declared
+   anywhere in its body, including inside a branch that's almost never taken (`if (summary)`) -
+   so `qc_heartbeat`'s 2048-byte stack (measured peak 1052 B on `a1c25b6`, before this
+   experiment existed) was oversubscribed on *every* tick, not just the few where that code
+   actually ran. Fixed by moving that logic into its own method,
+   [`logFileStreamSummaryAndAdvance()`](app/src/QcSession.hpp) - its locals are now a separate
+   call frame, paid for only while that function actually executes. `heartbeatStack_` was also
+   doubled to 4096 B for margin.
+3. **`qc_session`** (fixed in this commit) - same fault signature, on `f803e75`, immediately
+   after `Session handshake complete`, before the first variant's own log line. `addr2line`
+   against `f803e75`'s `zephyr.elf` resolved the fault PC/LR to
+   [`QcFileReadExperiment::beginVariant()`](app/src/QcFileReadExperiment.hpp), called from
+   `QcSession::runHandshake()`. Cause: `beginVariant()` reset the per-folder table with
+   `folders_ = {}` - assigning a freshly-constructed `std::array<FolderDetail, kMaxFolders>` (16
+   non-trivial objects, each holding several `etl::string` members, roughly 7 KiB total). At
+   this build's optimization level that materializes the whole temporary on the calling thread's
+   stack before the assignment completes - the same class of bug as the two faults above, just a
+   third distinct place it showed up. `qc_session`'s 2048-byte stack (used for the one-time
+   handshake, never bumped because nothing on it looked expensive) had no margin for a 7 KiB
+   spike. **Fixed by not resetting `folders_` itself at all**: `folderCount_ = 0` is sufficient on
+   its own (every reader is already bounded by `folderCount_`, so stale bytes past it are never
+   read), and `fillFolder()` - called for every slot `recordFolder()` claims, new or reused - now
+   resets a slot's counts/sample-count along with its metadata, so a slot index reused from an
+   earlier variant can't leak that variant's stale counts into the new one. This also fixed a
+   related correctness bug: the "claim a brand-new slot" path previously never reset
+   `namedCount`/`emptyCount`/`sampleCount` at all (only the "found an existing key" path did),
+   so a slot reused across variants could have silently carried over a previous variant's counts
+   even before this crash surfaced the issue.
+
+**Stack-usage audit, after fix 3** (`-fstack-usage`, `Main.cpp.su`, worst sequential call chain
+per thread - `logFileStreamSummaryAndAdvance()`/`checkDrainAndSendNextVariant()` run one at a
+time per heartbeat tick, never nested, so their frames don't add together):
+
+| Thread | Entry point | Budget | Worst-case depth found | Margin |
+| --- | --- | --- | --- | --- |
+| `usbh` | `onReportIn()` -> `appendTail()` | 1536 B | ~104 B (unchanged this round; real hardware previously measured 736 B peak) | ~93% free |
+| `qc_session` | `runHandshake()` -> `sendMessage()`/`encodeFileRead()` | 2048 B | ~640 B | ~69% free |
+| `qc_heartbeat` | `runHeartbeat()` -> `logFileStreamSummaryAndAdvance()` | 4096 B | ~1608 B | ~61% free |
+| `qc_dispatch` | `onMessage()` -> `onFileMessage()` -> `peekFolderMeta()` -> `ProtoFieldReader::next()` | 2048 B | ~760 B | ~63% free |
+| `qc_gzip_inflate` | `run()` -> `onMessage()` -> ... (same tail as `qc_dispatch`) | 4096 B | ~848 B | ~79% free |
+
+`runHeartbeat()`'s own frame (1136 B, the single largest in the app) is almost entirely two
+pre-existing `std::array<QcMessageTally::Entry, 24>` locals (`tallyEntries`/`postStreamEntries`)
+that predate this experiment (issue #60/#61) - not a new regression, and still comfortably
+within the doubled 4096-byte budget. Nothing else found needed a fix; the table above is a
+point-in-time static check, not a replacement for a real hardware run (compiler inlining
+decisions, and anything genuinely data-dependent, can't be fully captured this way).
+
+**`CONFIG_THREAD_ANALYZER` is now on** for this diagnostic build (`CONFIG_THREAD_ANALYZER_AUTO`,
+printing every thread's real stack high-water mark every 15s) specifically so a tight margin
+shows up in the log on the very first run, rather than needing a fourth crash-and-addr2line
+round trip to find one. Revert alongside the rest of this experiment.
 
 ### RAM cost
 
@@ -1118,9 +1163,10 @@ to the firmware's flat RAM footprint, not any thread's margin:
 - `kReassemblyCapacity`/dispatcher mailbox, 4096 -> 16384 each: +12288 B apiece (+24576 B total).
 - `QcFileReadExperiment::folders_` (16 x `FolderDetail`, each three `etl::string<64>` plus three
   `etl::string<48>` samples and a handful of counters): roughly +7 KiB.
+- `CONFIG_THREAD_ANALYZER`'s own bookkeeping plus its periodic analysis thread's stack: a few KB.
 
-Clean `frdm_rw612` build: RAM 132128/983040 bytes (**13.44%**, up from `a1c25b6`'s 97816 B /
-9.95% - the roughly 32 KiB above, comfortably inside this board's 960 KiB). None of this is
+Clean `frdm_rw612` build: RAM 134776/983040 bytes (**13.71%**, up from `a1c25b6`'s 97816 B /
+9.95% - the roughly 37 KiB above, comfortably inside this board's 960 KiB). None of this is
 step 2's final sizing; it's what this measurement run costs.
 
 ### Verified
@@ -1128,10 +1174,11 @@ step 2's final sizing; it's what this measurement run costs.
 `west twister -p qemu_cortex_m3 -K`, all 6 suites, 101/101 cases pass (15 new over `a1c25b6`:
 the reordered variant table, the no-folder/`hasFolder()` path, per-folder detail capture/replace/
 bounding, `QcFileStream`'s overridable quiet window, and the existing `FileReadOptions`
-encoding tests). Clean `frdm_rw612` build succeeds (RAM above). **Not verified on real hardware
-past the stack-overflow fix (hardware result 1, above)** - this commit's own variant-separation/
-ack-handling/buffer-size/logging changes have not yet had a hardware run; commit to flash for
-that is this PR's tip, still branch `firmware/reassembly-memory-budget`.
+encoding tests - all still pass after this commit's `fillFolder()`/`beginVariant()` fix). Clean
+`frdm_rw612` build succeeds (RAM above). **Not verified on real hardware** - this commit's own
+variant-separation/ack-handling/buffer-size/logging/stack-overflow changes have not yet had a
+hardware run; commit to flash for that is this PR's tip, still branch
+`firmware/reassembly-memory-budget`.
 
 ## Not yet done
 
