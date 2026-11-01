@@ -45,3 +45,7 @@ Ideas, bug reports and test results from other units are very welcome. Please [o
 QCRemote builds on the protocol research in [qc-mcp](https://github.com/lexasoft123/qc-mcp).
 
 This is an unofficial community project, not affiliated with or endorsed by Neural DSP. Quad Cortex is a trademark of its owner. The protocol is reverse-engineered and may change with any CorOS update, so use it at your own risk and keep your presets backed up.
+
+## License
+
+[MIT](LICENSE)
