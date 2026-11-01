@@ -676,509 +676,68 @@ What a few of the summary fields mean, for issue #33's sizing work:
   thread's name appears in the dump (`qc_dispatch`, `qc_gzip_inflate`, `qc_session`,
   `qc_heartbeat`, or `usbh` itself).
 
-## Reassembly/inflate overflow sizing, step 1: measurement (issue #33)
-
-Issue #33 predates ADR 0003/0004 and issue #6: there are no nanopb buffers to size (this
-project uses a hand-written codec - see the issue's latest comment), and the real placeholders
-needing real numbers are `kReassemblyCapacity` (4096, `QcHidBridge.hpp`) and `kMaxInflatedSize`
-(16384, `QcGzip.hpp`). The #60/#61 hardware run above measured both as too small for real
-traffic - `reassembly (overflow=31 malformed=2850)` out of 8843 IN transfers, and a later run
-(commit `f0a4939`) hit `kMaxInflatedSize` too: a compressed `RecallPreset` (command 15, 2408
-compressed bytes) failed with `OutputTooLarge`. Which command(s) were involved, and how big
-they really are, was unknown either time - **this is step 1: measure that, by command, without
-choosing new sizes yet.** Step 2 (picking real sizes from that data, and deciding whether a very
-large message type like `ModelRepo` should be ignored outright rather than buffered) is a
-separate, later change - `kReassemblyCapacity`/`kMaxInflatedSize` are unchanged by this one.
-
-**`HidReassembler::Status::Overflow` no longer aborts the moment Capacity is exceeded.** Before
-this change, the first report that pushed a message over Capacity reset the reassembler
-immediately and returned `Overflow`, discarding all knowledge of the message - every later
-MIDDLE/LAST report belonging to it then had no preceding FIRST and miscounted as a *second,
-unrelated* `Malformed`. This is almost certainly the real explanation for `malformed=2850`
-above (2850 is close to what a handful of these ~4000-byte-overflowing messages' remaining
-reports would add up to). Now `HidReassembler` keeps consuming reports for an overflowing
-message - without growing the stored body past `Capacity` - until its LAST/SINGLE report
-arrives, tracking the message's true total size (`overflowSize()`) and retaining only its last
-8 bytes (`overflowTrailer()`). Those last 8 bytes are always `QcMessage.hpp`'s message trailer
-(`[command][reserved][hash]`, always the final bytes of a message), so
-`decodeTrailerCommand()` (`QcMessage.hpp`) can still say which command overflowed even though
-its body was dropped. New Ztest cases in `tests/hid_framing` cover the overflow-then-complete
-sequence, the true size/trailer it reports, resync on the next FIRST, a malformed report
-arriving mid-overflow, and that continuation reports after an overflow are no longer
-`Malformed`.
-
-**Per-command reporting, added to the File stream's summary:**
-
-- `QcHidBridge::onReportIn()`'s `Overflow` case now decodes the command from `overflowTrailer()`
-  and calls `QcSession::recordReassemblyOverflow(command, trueSize)` - still atomic-increment-only,
-  no logging, same `usbh`-thread safety contract as before (see that function's comment: this
-  thread's 1536-byte stack with `CONFIG_LOG_MODE_IMMEDIATE` means an enabled log level really
-  does run `cbprintf` formatting synchronously on it - the exact pattern that crashed real
-  hardware once already, issue #8). The per-command breakdown lands in a new, lock-free
-  `QcReassemblyOverflowTally` (`QcReassemblyOverflowTally.hpp`) - plain C++23, `std::atomic`
-  only, no mutex, since `usbh` is the sole writer and the only safety requirement is that the
-  heartbeat thread's read doesn't race it.
-- `QcMessageTally.hpp`'s `Entry` gained `maxWireBytes`/`maxInflatedBytes`, and `record()` takes
-  optional wire/inflated sizes - so the existing per-command tally (`messageTally_`, scoped to
-  one File stream) now also reports each command's own peak sizes, not just its count.
-- A message that fails to inflate because it's too big for `kMaxInflatedSize`
-  (`gzip::InflateError::OutputTooLarge`) still has a real, known decompressed size: gzip's own
-  trailer carries it (the ISIZE field, RFC 1952) at a fixed offset from the *end* of the
-  compressed bytes, readable without finishing - or even attempting - decompression. New
-  `gzip::peekDecompressedSize()` (`QcGzip.hpp`) reads it directly; `QcGzipInflater.hpp` calls it
-  on every inflate failure and passes the result through `QcMessageSink::onInflateFailed()`'s
-  new `trueInflatedSize` parameter, which `QcSession` folds into both `messageTally_`'s
-  per-command `maxInflatedBytes` and `QcFileStream`'s own summary-wide `maxInflatedBytes` - so a
-  `RecallPreset` that was too big to actually inflate still shows its true size in both places,
-  not just a `failedCount` bump with no size attached.
-
-**What the stream-finish log block now looks like** (new lines in **bold**, relative to the
-#60/#61 section above):
-
-```
-File stream finished (quiet): N messages (C compressed, F failed), W wire bytes, I inflated bytes, E ms
-File stream limits: max wire=MW max inflated=MI, dropped (dispatch=DD gzip=DG), reassembly (overflow=RO malformed=RM)
-File stream tally: T total IN transfers
-File stream tally: command=CMD count=CNT max_wire=MWC max_inflated=MIC   (one line per distinct command, or "no messages of any command seen in this window")
-File stream overflow by command: command=CMD count=CNT max_true_size=MTS   (one line per command that ever overflowed, or "none")
-Post-connect tally started: watching for preset-change pushes (RecallPreset/Scene/SetlistPosition/...) - issue #61
-```
-
-`max_wire`/`max_inflated` on the per-command tally line are that *specific* command's own peak
-sizes (`MW`/`MI` on the line above remain the peak across every command, unchanged). The new
-overflow-by-command line(s) are lifetime counts, not diffed to this one stream's window the way
-`RO`/`RM` are - this firmware does one connect per boot, so since-boot and since-this-stream are
-the same thing in practice, and it wasn't worth a second, atomics-only snapshot-and-diff scheme
-for a count this rare (31 across a whole connect's ~8800 IN transfers). If `File stream overflow
-by command` ever shows `> 16 tracked` falling into "other distinct commands", that's worth a
-comment on #33 before trusting the per-command numbers - 16 is sized for "a handful of large
-commands overflow," not an arbitrary count.
-
-**Hardware test - run this on the next flash:**
-
-1. Flash this build and let the handshake, state READs, and File stream run exactly as the
-   #60/#61 smoke test above describes.
-2. Paste back the full stream-finish log block above, including the new `File stream overflow
-   by command: ...` line(s).
-3. If a preset change pushes a compressed message that's too big to inflate (the `f0a4939`
-   hardware run's `RecallPreset` case), paste the `Inflate failed for command ...` line too - it
-   now includes `true inflated size NNNN` when the trailer was readable.
-
-**What each outcome means:**
-
-- **`File stream overflow by command` lists one or more real commands (e.g. `command=51
-  count=1 max_true_size=XXXXX`)**: that command's true size is now known - #33's step 2 can size
-  `kReassemblyCapacity` to it directly (or decide to deliberately exclude that command instead,
-  if its true size is large enough that buffering it outright isn't worth the RAM - the
-  `ModelRepo` case the issue flags).
-- **`File stream overflow by command: none` but `RO` (reassembly overflow count) above is still
-  > 0**: a real discrepancy - the per-command tracking missed something the plain counter saw.
-  Worth a comment on #33 rather than trusting either number blindly; likely a bug in this PR's
-  bookkeeping, not a hardware fluke.
-- **Every per-command `max_wire`/`max_inflated` line this run is comfortably under
-  `kReassemblyCapacity`/`kMaxInflatedSize`, and `File stream overflow by command: none`**: the
-  31/2850 result from the `0d1edcc` hardware run didn't reproduce on this build. Worth noting
-  explicitly either way (don't assume it was fixed by this PR - this PR doesn't change
-  `kReassemblyCapacity`, so a disappearance would be a hardware/timing difference between runs,
-  not this change).
-- **`Inflate failed for command ... true inflated size NNNN`**: that command's real decompressed
-  size, even though decompression itself failed - directly feeds `kMaxInflatedSize`'s step-2
-  sizing the same way an overflow's `max_true_size` feeds `kReassemblyCapacity`'s.
-- **No `Inflate failed` line at all this run**: either nothing this run needed decompression
-  past `kMaxInflatedSize`, or (less likely, given the `f0a4939` result) that result doesn't
-  reproduce - note which, don't assume silence means fixed.
-
-**Not verified on real hardware** - this PR adds measurement only; no hardware run has been
-done against this build. The `0d1edcc`/`f0a4939` numbers quoted above are from the owner's
-prior runs, documented in issue #33 and the #60/#61 section above, not reproduced here.
-
-**Hardware result (commit `872c898`): MPU fault, root cause found and fixed.** The owner's
-hardware run on that commit halted with an MPU fault (Instruction Access Violation) on the
-`usbh` thread about 4 seconds after the handshake, mid-`File`-stream - right around when the
-first overflowing message would arrive. The faulting PC wasn't a valid code address, and the
-saved LR (`0x1800d2f5`) resolved via `arm-zephyr-eabi-addr2line` against a from-source
-`frdm_rw612` rebuild of `872c898` to `HidReassembler::appendTail()` (`HidReassembler.hpp:178`)
-- confirming a stack smash rather than a logic bug. `appendTail()`'s stack `scratch` buffer
-was sized for a chunk of at most `kHidMaxPayloadPerReport` (126) bytes, on the assumption
-that's all a caller would ever pass - true for the per-report `chunk` argument, but not for
-the overflow-transition call in `feed()`, which passes the *entire* accumulated `buffer_`
-(up to `Capacity`, 4096 in `QcHidBridge.hpp`) in one shot once a message both overflows and
-has already buffered more than one report's worth of bytes. Writing that into a
-134-byte (`kTrailerTailSize + kHidMaxPayloadPerReport`) stack array smashed the stack and
-corrupted the return address, producing exactly this symptom. Fixed by rewriting
-`appendTail()` to need only `kTrailerTailSize` (8) bytes of stack regardless of its argument's
-length - it only ever needs the last 8 bytes of (old tail ++ chunk), so a chunk already that
-long or longer makes the old tail irrelevant instead of needing to hold both at once. Added
-`test_overflow_with_large_buffered_body_before_transition` to `tests/hid_framing` (now 11
-cases), reproducing the same shape at `Capacity=300`: two full 126-byte reports (252 buffered
-bytes) land normally, so the third report's overflow-transition call passes a 252-byte
-`buffer_` into `appendTail()` - already well past the old 134-byte scratch buffer. All 6
-Ztest suites still pass (86/86, one new) on `qemu_cortex_m3`, and a clean `frdm_rw612` build
-succeeds with unchanged RAM (97816 B, 9.95%). **Not verified on real hardware** - commit to
-flash for that is the fix on top of `872c898`, still branch `firmware/reassembly-memory-budget`.
-
-**Hardware measurement (commit `a1c25b6`): no crash, full by-command breakdown.** Handshake
-`4.1.1`. `File` stream:
-
-```
-File stream finished (quiet): 551 messages (0 compressed, 0 failed), ... ms
-File stream tally: command=4 count=551 max_wire=3946 ...
-File stream overflow by command: command=4 count=29 max_true_size=113180
-File stream overflow by command: command=51 count=1 max_true_size=59219
-File stream overflow by command: command=35 count=1 max_true_size=28354
-```
-
-551 `File` messages fit under `kReassemblyCapacity` (largest 3946 bytes, none compressed), and
-29 overflowed it - the largest of those 113180 bytes. `ModelRepo` (51, 59219 bytes) and
-`ModuleStats` (35, 28354 bytes) each overflowed once. A compressed `RecallPreset` (15) later
-inflated to 22667 bytes for one preset - past `kMaxInflatedSize` (16384) - a second preset
-that same run inflated to 13235 bytes, under the limit. `malformed=0`, confirming the
-`872c898`/fix-commit theory above: once overflow no longer desyncs the reassembler, spurious
-`Malformed` counts disappear entirely. **The 29 lost `File` messages' contents are unknown** -
-HidReassembler drops an overflowing message's body, keeping only its trailer (see
-`overflowTrailer()` above), so whether any of them were preset folders - and therefore whether
-this stream's preset list is missing folders - can't be answered from this run alone. That
-question is exactly what the variant experiment below exists to answer.
-
-## FileMessage READ options experiment, step 1.5 (issue #33)
-
-Before sizing `kReassemblyCapacity`/`kMaxInflatedSize` for real, the owner asked for one more
-measurement: does `FileMessage` READ's `short_listing` (field 6) or `omit_factory_content`
-(field 11) option shrink the device's listing enough to avoid the overflow above - and if so,
-does the shrunken listing still name every *user* preset? A third field,
-`user_content_estimate` (field 12), exists on the same message but wasn't tested (it's an
-estimate the device reports, not a request option - setting it on a READ has no documented
-effect). All three field numbers were verified directly against qc-mcp's own descriptor set
-(`qc_descriptors-4.1.pb`, field-by-field, same method issue #5's Tier 2 messages used), not
-guessed - see `FileReadOptions` in
-[`QcFileRequest.hpp`](app/src/QcFileRequest.hpp). **Nobody knows what either option does**:
-neither qc-mcp's protocol code nor its CLI/MCP tool surface ever sets either field (checked
-directly against its source), so this was genuinely untested territory until a real device
-answered it below.
-
-[`QcFileReadExperiment.hpp`](app/src/QcFileReadExperiment.hpp) is a **self-contained, isolated
-diagnostic** - not a permanent feature, and not step 2's actual sizing pass. It's meant to be
-deleted (the file itself, plus its few call sites in `QcSession.hpp` - grep `issue #33 variant
-experiment`) once the owner has an answer. The two buffer sizes it temporarily raises
-(`kReassemblyCapacity`, `QcDispatcher`'s mailbox - see "Buffer sizes" below) are also meant to
-be revisited, not kept as-is; `kMaxInflatedSize` is untouched throughout.
-
-### The test
-
-After the handshake and issue #61's twelve post-connect state READs, instead of one bare
-`File` READ this build sends four variants, one at a time, each to its own stream finish plus
-a drain gap (see "Separating variants cleanly" below) before the next is sent - so a reply to
-one variant is never counted against another:
-
-1. **`short_listing=true`**
-2. **`omit_factory_content=true`**
-3. **both set**
-4. **default** - both options false (byte-identical to the original bare READ; must reproduce
-   the `a1c25b6` numbers above, re-confirming them under this run's conditions).
-
-`default` moved to last deliberately, after a first hardware run (below) sending it first found
-its own reply still trickling in when the next variant's request went out - ordering it last
-means any contamination lands on the one variant whose real numbers are already known, not on
-one this experiment is actually trying to measure.
-
-Flash this build once; all four variants run automatically in one connect, back to back. A
-variant that gets no reply, or a shorter stream than expected, is reported as such (a
-`0`-message summary, same as any other quiet/timeout finish) and the sequence still moves on to
-the next variant rather than stopping.
-
-### Separating variants cleanly
-
-A first hardware run (commit `147fb48`, "Hardware result 1" below) sent each next variant the
-moment `QcFileStream`'s 1500ms quiet window reported the current one finished, and found that
-too short: a genuine pause mid-reply looked like the reply ending, so the real tail arrived
-*after* the next variant's request had already gone out and got counted against the wrong
-variant. Two fixes, on top of each other:
-
-- **`QcFileStream`'s own quiet window is now longer for this experiment** - 5000ms
-  (`QcSession::kExperimentQuietWindowMs`), via a new optional parameter on `start()` (default
-  argument keeps every existing caller/test unchanged). Long enough that a mid-reply pause
-  doesn't look like the end.
-- **A second gap between variants** - `QcSession::kVariantDrainGapMs`, 10000ms, checked every
-  heartbeat tick (`checkDrainAndSendNextVariant()`) against `lastFileMessageAtMs_`, a timestamp
-  updated on *any* `File` traffic, foldered or not, whether or not a stream is currently active.
-  The next variant's request isn't sent until 10 full seconds of real silence have passed since
-  the *last* `File` message of any kind - not just since `QcFileStream` itself called the
-  current variant finished. A straggler arriving mid-gap resets the 10s countdown.
-
-Also on the first hardware run, a single 14-byte reply with **no `type` and no `folder` field**
-arrived alone for `short_listing=true`, 1552ms after the request, and `QcFileStream` read that
-as the whole reply. **What this reply actually is isn't confirmed** - qc-mcp never sets
-`short_listing`, so there's no existing code path that explains its shape; it might be an
-estimate/ack the device sends before a `short_listing` stream specifically (consistent with
-`user_content_estimate`, field 12, being device-reported rather than request-set - a guess, not
-a confirmed reading of the bytes). Whatever it is, it isn't a catalog entry, so
-`QcFileReadExperiment::hasFolder()` now gates it out: only a message that actually carries a
-`folder` field feeds `QcFileStream`'s quiet-window tracking at all (see `QcSession::onMessage()`'s
-comment). It still updates `lastFileMessageAtMs_` for the drain gap above, and still shows up in
-the per-variant type tally as `type=-1`, so it stays visible rather than silently vanishing.
-
-### Buffer sizes (temporary, for this measurement only)
-
-Hardware result 1 found a `short_listing=true` message up to at least 10193 bytes true size -
-over the 4096-byte `kReassemblyCapacity`/dispatcher-mailbox limits, so it was dropped before it
-could ever be decoded. For this experiment only, both are temporarily raised to 16384 bytes:
-
-- `QcHidBridge.hpp`'s `kReassemblyCapacity`: 4096 -> 16384.
-- `QcDispatcher.hpp`'s `kMailboxCapacity`: 4096 -> 16384 (mirrors the above - a message's
-  protobuf payload can never be bigger than the whole reassembled HID message it came from).
-
-`QcGzip.hpp`'s `kMaxCompressedInputSize`/`kMaxInflatedSize` are **not** touched: every hardware
-run so far shows `File` messages are never gzip-compressed, so gzip's own buffers aren't on the
-path this needs to grow, and `kMaxInflatedSize` is explicitly out of scope for this issue
-regardless. **This is not #33's final answer** - it's sized to let `short_listing`'s messages
-through so they can be measured at all, not a considered sizing choice; step 2 still needs to
-pick real numbers from whatever this run shows (see "RAM cost" below for what carrying 16 KiB
-costs today).
-
-### What gets logged per variant
-
-Each line tagged `[variant=<name>]` so the four runs can't be confused with each other:
-
-```
-File stream [variant=<name>] finished (quiet|timeout): N messages (C compressed, F failed), W wire bytes, I inflated bytes, E ms
-File stream [variant=<name>] limits: max wire=MW max inflated=MI, dropped (dispatch=DD gzip=DG), reassembly (overflow=RO malformed=RM)
-File stream [variant=<name>] tally: T total IN transfers
-File stream [variant=<name>] tally: command=CMD count=CNT max_wire=... max_inflated=...   (per distinct command seen)
-File stream [variant=<name>] overflow by command: command=CMD count=CNT max_true_size=MTS   (or "none")
-File content [variant=<name>]: preset folders=PF (factory=FF user=UF) named presets=NP (factory=FP user=UP) empty slots=ES
-File content [variant=<name>]: type=T count=C   (per distinct File `type` value seen, or "no File messages of any type seen this variant")
-```
-
-`overflow by command` is **reset at the start of each variant** (`QcReassemblyOverflowTally::reset()`),
-so it reports only that variant's overflows, not a running lifetime total - unlike the single-run
-measurement earlier in this section.
-
-The **content** line's counts come from actually decoding each fitting message with
-[`QcFileMessage.hpp`](app/src/QcFileMessage.hpp)'s `decodeFile()` - the same merged decoder
-issue #59 wrote and issue #10 will eventually wire into the real session - called as each
-message arrives, off `usbh`, on whichever worker thread (`qc_dispatch`/`qc_gzip_inflate`)
-dispatched it; see `QcFileReadExperiment::onFileMessage()`'s own comment for why that's
-stack-safe. **"Named" excludes empty-slot entries**: a blank preset name is an unused slot, not
-a preset - confirmed on real hardware (2026-11-01, see "Hardware result 2" below: the owner's
-device really does have exactly two named presets in a 256-entry folder, matching 254 reported
-as empty) - same pattern qc-mcp's `directory.py` documents for `SetlistPosition`'s own
-fixed-size table. `factory`/`user` splits use each folder's `is_factory` flag. The `type=` lines
-come from reading each message's own `type` field directly, independent of `decodeFile()`'s
-presets-only filtering, so an IRs/Captures folder, or the no-folder reply discussed above
-(`type=-1`), still shows up somewhere even though `decodeFile()` itself never calls back for
-either.
-
-**No live per-message logging during the stream anymore** - see "Dispatcher drops" below for
-why. Everything above is only *accumulated* while the stream runs and printed afterward, from
-the heartbeat thread, once the whole variant has gone quiet.
-
-### Per-folder detail for the `short_listing` variants
-
-For the two variants with `short_listing=true` (1 and 3 above), the catalog is expected to
-shrink to a handful of folders (confirmed on hardware: 13), small enough to dump in full rather
-than just totals:
-
-```
-File content [variant=<name>] folder: key="..." name="..." parent_key="..." is_factory=0/1 is_downloads=0/1 named=N empty=E
-File content [variant=<name>] folder "<name>" sample: "<preset name>"   (up to 3 per folder, named presets only)
-```
-
-`QcFileReadExperiment::FolderDetail` holds up to `kMaxFolders` (16) folders' key/name/
-parent_key/is_factory/is_downloads/named-and-empty counts/up to 3 sample names - sized for the
-13 folders `short_listing` actually produces, not for `default`/`omit_factory_content` alone's
-few hundred (confirmed: 376/390), for which only the totals above are logged. A folder key seen
-again replaces that slot's content rather than accumulating into it, matching qc-mcp's own
-`directory.py` comment ("later messages for the same folder key replace earlier ones"). This
-table is populated for every variant (cheap, and harmless for the ones that overflow it into
-`otherFolderCount`) but only *printed* for the short-listing ones.
-
-### What each outcome means
-
-- **A variant has zero `File` overflows (`overflow by command: none`, and every per-command
-  `max_wire` comfortably under `kReassemblyCapacity`) *and* its named-preset/folder counts match
-  (or exceed) `default`'s, with no new empty slots** - this is **success**: that option (or
-  combination) makes the whole catalog fit without losing anything, and step 2 can size
-  `kReassemblyCapacity` to that variant's real peak instead of buffering (or excluding) a
-  message as large as `a1c25b6`'s 113180-byte one.
-- **A variant has fewer messages or fewer overflows than `default`, but also fewer named
-  presets, fewer preset folders, or a folder present in `default` missing by name from the
-  short-listing dump - this is *not* useful**, even though it looks smaller: the option is
-  dropping user content, not just shrinking factory bulk. Say so plainly rather than treating a
-  smaller number as automatically better - see "Hardware result 2" below for a concrete example
-  of checking this (`My Presets`).
-- **`omit_factory_content=true` loses exactly the factory presets/folders** (check surviving
-  folders' `is_factory` against `default`'s own folders, not just a smaller total) **but keeps
-  every user folder and preset name intact** - also success, and the more useful of the two
-  single-option variants if so, since factory content is the device's own bulk, not something a
-  user would notice missing from a *listing* request (it's still on the device either way).
-- **`short_listing=true` shrinks messages but strips preset names** (named-preset count drops
-  relative to `default`, or every sampled name is a real one but whole user folders are simply
-  absent from the dump) - not useful on its own.
-- **Neither option changes anything measurable** (same message count, same overflows, same
-  content, byte-for-byte) - a real, useful negative result: it means qc-mcp's own choice to
-  never set these fields isn't an oversight, and step 2 has to size for the full, unfiltered
-  catalog (or explicitly exclude very large messages like `ModelRepo`, per the issue's own
-  framing) rather than relying on a request-side shortcut.
-- **A variant's stream never starts** (0 messages, 0 total IN transfers, times out at 30s) -
-  worth a comment on #33 before assuming the option itself broke something.
-
-### Hardware result 1 (commit `147fb48`): no crash, but variants overlapped
-
-Handshake `4.1.1`, no crash (the stack-overflow fix below held). Summarized (full detail in the
-issue):
-
-- **default** (sent first that run): 547 `File` counted, `dispatcherDropped=4`, overflow=29
-  (max 113180), 376 preset folders, 2810 presets, 254 empty-named.
-- **`short_listing=true`**: 1 `File` message, 14 bytes, type=-1, finished in 1552ms.
-- **`omit_factory_content=true`**: 565 `File`, dropped=3, overflow=32 (max 113181), 390 folders,
-  3071 presets, 508 empty-named, 9106ms.
-- **both**: 18 `File`, 6625 wire bytes, max 2230, overflow=3 (max 10193), 13 preset folders, 256
-  presets, 254 empty-named.
-- Samples: "Practice 1" (folder "Practice"), then empty names in "Practice"; "The Pop Rig" in
-  "02 Session Sounds"; "Shy Lead" in "Jack Gardiner".
-
-**Diagnosis - variant 4 ("both") was contaminated**: 565 = 547 + 18, overflow 32 = 29 + 3,
-empty-named 508 = 254 x 2. `short_listing`'s real reply almost certainly arrived *after* the
-1500ms quiet window had already closed its variant, and got counted into the next one
-(`omit_factory_content`'s 565/32/508 each look exactly like `default`'s own number plus
-`short_listing`'s). So **neither `short_listing` alone nor `omit_factory_content` alone was
-actually proven by this run** - this is why "Separating variants cleanly" above exists, and why
-this needs to be re-run.
-
-**Dispatcher drops, confirmed cause.** `dispatcherDropped=4` was new - every prior `File` stream
-measurement (including `a1c25b6`'s, on the exact same codepath otherwise) showed 0. 547 = 551
-(`a1c25b6`'s own count) - 4, lining up exactly. The only change on the dispatcher thread's path
-between those two runs was this experiment's `decodeFile()` call plus an inline `LOG_INF` for
-each sample. `CONFIG_LOG_MODE_IMMEDIATE` runs a log call's `cbprintf` formatting - and the UART
-write - synchronously on the calling thread; during that write, `QcDispatcher`'s single mailbox
-slot can't accept the device's next message. The arithmetic lining up exactly is strong evidence
-this is the cause, though it wasn't isolated further (e.g. by measuring `decodeFile()` alone
-without logging) before fixing it. **Fix applied**: all per-message logging moved off the
-dispatcher/gzip-inflate threads entirely - `onFileMessage()` now only accumulates (into the
-per-variant totals and the per-folder table), with zero `LOG_*` calls; every log line for a
-variant is produced afterward, from the heartbeat thread, once that variant's stream has gone
-quiet. **Implication for issue #10**: `decodeFile()` itself appears cheap enough to run inline
-on the dispatch path (0 drops before logging was added), but logging/forwarding decoded content
-must not happen there - #10's real wiring should defer that to a separate thread or a batched
-step, not the dispatcher's hot path. Whether drops are now fully gone, or `decodeFile()`'s own
-cost was also a (smaller) contributor, isn't confirmed - the next hardware run's `dropped=`
-figures will show which.
-
-### Hardware result 2: ground truth from the owner
-
-The owner's unit has exactly two user folders: `My Presets` and `Practice`. Checked against the
-sampled/decoded names above:
-
-- **Confirmed**: `Practice` holds exactly `Practice 1` and `Dark Jazz` - matching the "both"
-  variant's decode exactly (256 presets, 254 empty leaves 2 named; every decoded preset in that
-  run was `Practice`'s). The other 12 preset folders in that run decoded with zero presets each,
-  or (more likely, given the contamination above) their content is among the 3 overflowed
-  messages (up to 10193 bytes) that run never got to see with the old 4096-byte buffer - the
-  16 KiB buffer above exists specifically so a re-run can.
-  - The owner switched from `Practice 1` to `Dark Jazz` during this run, matching the single
-    `RecallPreset` (1223 -> 13235 bytes) seen in the log - so `Dark Jazz` is ~13 KiB inflated.
-    `Practice 1` is the larger of the two (more effects/rows per the owner) and is **inferred,
-    not confirmed**, to be the 22667-byte preset from an earlier run.
-- **Unconfirmed, worth checking on the next run**: `The Pop Rig` (folder "02 Session Sounds")
-  and `Shy Lead` (folder "Jack Gardiner") aren't presets the owner recognizes - they may be
-  factory or cloud-downloaded content rather than a decode error. The per-folder dump now
-  reports `is_factory`/`is_downloads` for every folder specifically so this can be checked
-  directly against those flags rather than guessed from the name.
-- **Open question for the next run**: is `My Presets` visible by name, with its real presets,
-  in the `short_listing` dump? Earlier hardware debugging saw recall positions 12 and 13 active
-  in it, so it has at least 14 addressable slots - its real named-preset count isn't known yet.
-  If `My Presets` is still missing even with the 16 KiB buffer and properly separated variants,
-  that means `short_listing` is not usable as-is, and should be reported exactly that plainly.
-
-### Hardware stack overflows: three so far, all fixed
-
-This experiment has now overflowed a thread's stack on real hardware three separate times -
-each only found via a crash, then resolving the fault PC/LR with `arm-zephyr-eabi-addr2line`
-against that commit's `zephyr.elf`, the same method issue #8's original `usbh` overflow used:
-
-1. **`usbh`** (fixed before `147fb48`) - see the earlier `872c898` section above
-   (`HidReassembler::appendTail()`'s unbounded scratch buffer).
-2. **`qc_heartbeat`** (fixed before `147fb48`) - USAGE FAULT, "Stack overflow, context area not
-   valid", on its very first tick, before the handshake even finished. Cause: the per-variant
-   logging and next-variant-send logic was inline in `runHeartbeat()` itself; at this build's
-   optimization level, a function's stack frame reserves space for every local declared
-   anywhere in its body, including inside a branch that's almost never taken (`if (summary)`) -
-   so `qc_heartbeat`'s 2048-byte stack (measured peak 1052 B on `a1c25b6`, before this
-   experiment existed) was oversubscribed on *every* tick, not just the few where that code
-   actually ran. Fixed by moving that logic into its own method,
-   [`logFileStreamSummaryAndAdvance()`](app/src/QcSession.hpp) - its locals are now a separate
-   call frame, paid for only while that function actually executes. `heartbeatStack_` was also
-   doubled to 4096 B for margin.
-3. **`qc_session`** (fixed in this commit) - same fault signature, on `f803e75`, immediately
-   after `Session handshake complete`, before the first variant's own log line. `addr2line`
-   against `f803e75`'s `zephyr.elf` resolved the fault PC/LR to
-   [`QcFileReadExperiment::beginVariant()`](app/src/QcFileReadExperiment.hpp), called from
-   `QcSession::runHandshake()`. Cause: `beginVariant()` reset the per-folder table with
-   `folders_ = {}` - assigning a freshly-constructed `std::array<FolderDetail, kMaxFolders>` (16
-   non-trivial objects, each holding several `etl::string` members, roughly 7 KiB total). At
-   this build's optimization level that materializes the whole temporary on the calling thread's
-   stack before the assignment completes - the same class of bug as the two faults above, just a
-   third distinct place it showed up. `qc_session`'s 2048-byte stack (used for the one-time
-   handshake, never bumped because nothing on it looked expensive) had no margin for a 7 KiB
-   spike. **Fixed by not resetting `folders_` itself at all**: `folderCount_ = 0` is sufficient on
-   its own (every reader is already bounded by `folderCount_`, so stale bytes past it are never
-   read), and `fillFolder()` - called for every slot `recordFolder()` claims, new or reused - now
-   resets a slot's counts/sample-count along with its metadata, so a slot index reused from an
-   earlier variant can't leak that variant's stale counts into the new one. This also fixed a
-   related correctness bug: the "claim a brand-new slot" path previously never reset
-   `namedCount`/`emptyCount`/`sampleCount` at all (only the "found an existing key" path did),
-   so a slot reused across variants could have silently carried over a previous variant's counts
-   even before this crash surfaced the issue.
-
-**Stack-usage audit, after fix 3** (`-fstack-usage`, `Main.cpp.su`, worst sequential call chain
-per thread - `logFileStreamSummaryAndAdvance()`/`checkDrainAndSendNextVariant()` run one at a
-time per heartbeat tick, never nested, so their frames don't add together):
-
-| Thread | Entry point | Budget | Worst-case depth found | Margin |
-| --- | --- | --- | --- | --- |
-| `usbh` | `onReportIn()` -> `appendTail()` | 1536 B | ~104 B (unchanged this round; real hardware previously measured 736 B peak) | ~93% free |
-| `qc_session` | `runHandshake()` -> `sendMessage()`/`encodeFileRead()` | 2048 B | ~640 B | ~69% free |
-| `qc_heartbeat` | `runHeartbeat()` -> `logFileStreamSummaryAndAdvance()` | 4096 B | ~1608 B | ~61% free |
-| `qc_dispatch` | `onMessage()` -> `onFileMessage()` -> `peekFolderMeta()` -> `ProtoFieldReader::next()` | 2048 B | ~760 B | ~63% free |
-| `qc_gzip_inflate` | `run()` -> `onMessage()` -> ... (same tail as `qc_dispatch`) | 4096 B | ~848 B | ~79% free |
-
-`runHeartbeat()`'s own frame (1136 B, the single largest in the app) is almost entirely two
-pre-existing `std::array<QcMessageTally::Entry, 24>` locals (`tallyEntries`/`postStreamEntries`)
-that predate this experiment (issue #60/#61) - not a new regression, and still comfortably
-within the doubled 4096-byte budget. Nothing else found needed a fix; the table above is a
-point-in-time static check, not a replacement for a real hardware run (compiler inlining
-decisions, and anything genuinely data-dependent, can't be fully captured this way).
-
-**`CONFIG_THREAD_ANALYZER` is now on** for this diagnostic build (`CONFIG_THREAD_ANALYZER_AUTO`,
-printing every thread's real stack high-water mark every 15s) specifically so a tight margin
-shows up in the log on the very first run, rather than needing a fourth crash-and-addr2line
-round trip to find one. Revert alongside the rest of this experiment.
-
-### RAM cost
-
-The 16 KiB reassembly/dispatcher buffers (temporary, see "Buffer sizes" above) and
-`QcFileReadExperiment`'s per-folder table are each one static instance - not stack, so they add
-to the firmware's flat RAM footprint, not any thread's margin:
-
-- `kReassemblyCapacity`/dispatcher mailbox, 4096 -> 16384 each: +12288 B apiece (+24576 B total).
-- `QcFileReadExperiment::folders_` (16 x `FolderDetail`, each three `etl::string<64>` plus three
-  `etl::string<48>` samples and a handful of counters): roughly +7 KiB.
-- `CONFIG_THREAD_ANALYZER`'s own bookkeeping plus its periodic analysis thread's stack: a few KB.
-
-Clean `frdm_rw612` build: RAM 134776/983040 bytes (**13.71%**, up from `a1c25b6`'s 97816 B /
-9.95% - the roughly 37 KiB above, comfortably inside this board's 960 KiB). None of this is
-step 2's final sizing; it's what this measurement run costs.
-
-### Verified
-
-`west twister -p qemu_cortex_m3 -K`, all 6 suites, 101/101 cases pass (15 new over `a1c25b6`:
-the reordered variant table, the no-folder/`hasFolder()` path, per-folder detail capture/replace/
-bounding, `QcFileStream`'s overridable quiet window, and the existing `FileReadOptions`
-encoding tests - all still pass after this commit's `fillFolder()`/`beginVariant()` fix). Clean
-`frdm_rw612` build succeeds (RAM above). **Not verified on real hardware** - this commit's own
-variant-separation/ack-handling/buffer-size/logging/stack-overflow changes have not yet had a
-hardware run; commit to flash for that is this PR's tip, still branch
-`firmware/reassembly-memory-budget`.
+## File reassembly/inflate buffer sizing (issue #33)
+
+Issue #33 asked for real sizes for `kReassemblyCapacity` (`QcHidBridge.hpp`), the dispatcher
+mailbox (`QcDispatcher.hpp`), and `kMaxCompressedInputSize`/`kMaxInflatedSize` (`QcGzip.hpp`) -
+all originally 4096/4096/4096/16384, placeholders with no real traffic measured against them.
+Getting there took several hardware rounds (measuring the original placeholders' overflow by
+command, then testing whether `FileMessage` READ's `short_listing`/`omit_factory_content`
+options could shrink the listing before sizing anything) - that measurement history, the
+hardware evidence it produced, and the final sizing decision are all in
+[ADR 0007](../docs/adr/0007-file-reassembly-buffer-sizing.md). This section covers only the
+**final, shipped behavior** and what's confirmed on hardware for it.
+
+**Decision**: `FileMessage` READ always sends `omit_factory_content=true` (confirmed on
+hardware to shrink the owner's listing from ~550 messages/~716KB to 20 messages/~30KB while
+still naming every user/cloud preset - `short_listing` measured no effect and is no longer
+sent). `kReassemblyCapacity`/the dispatcher mailbox are 131072 bytes (128 KiB, sized for a
+worst-case fully-named 256-preset folder, not just the owner's own mostly-empty one).
+`kMaxInflatedSize` is 32768 bytes (32 KiB); `kMaxCompressedInputSize` is 8192 bytes. The
+measurement-only variant experiment, its per-folder tables, `CONFIG_THREAD_ANALYZER`, and the
+per-command overflow/size tallies that existed only to gather sizing evidence are all removed.
+`ModelRepo`/`ModuleStats` replies are now ignored outright (counted, not buffered) rather than
+dispatched - the preset listing doesn't need either, and both are large enough (59219/28354
+bytes, measured) that buffering them cost real RAM and gzip-inflater contention for no benefit.
+See ADR 0007 for the full reasoning, including the RAM cost this carries (measured: 371272 /
+983040 bytes, 37.77%, up from the pre-#33 baseline's 9.95% - a real, deliberate tradeoff worth
+weighing against issue #34's note that a smaller board is a possible later move) and the
+stack-margin re-check for every thread that touches these buffers.
+
+**What's confirmed on hardware, and what isn't.** Every hardware number ADR 0007 cites (the
+~550-message default listing, the 20-message `omit_factory_content` listing, the 10193-byte
+largest message, the 22667-byte `RecallPreset`, the `ModelRepo`/`ModuleStats` overflow sizes,
+the three stack overflows this issue found and fixed along the way) came from real runs against
+*earlier* commits of this PR - each one a smaller, targeted change, individually verified on
+hardware before the next step. **This PR's final tip - the cleaned-up build with the sizes
+above, the ModelRepo/ModuleStats ignore change, the always-5000ms quiet window, and the
+simplified `HidReassembler`/`QcSession` this ADR describes - has not itself been run on real
+hardware.** It differs from every commit that was actually flashed: smaller (the whole
+measurement scaffold is gone) but also different in a few real ways (no more per-variant
+sending, `ModelRepo`/`ModuleStats` no longer reach the dispatcher at all, the reassembly/gzip
+buffers are bigger than any previously-tested build used). Treat it as "built from
+hardware-verified pieces," not "hardware-verified as a whole," until the smoke test below runs
+on a real unit.
+
+### Smoke test for the next hardware run
+
+1. Flash this build. Handshake should complete and mirror firmware version `4.1.1`, same as
+   every prior run on this unit.
+2. The `File` stream should finish **quiet** (not timeout) with **about 20 messages**, no
+   `File stream limits:` line showing a nonzero `dropped`/`reassembly overflow`/`malformed`
+   count - a nonzero count there means the listing is incomplete. `My Presets` (21 presets),
+   `Practice` (2 presets), and `cloud-0-1` should all be present in that count (not printed by
+   this firmware - printing the decoded list is issue #10's job, not this one's).
+3. Changing the active preset, **including to "Practice 1"** (the ~22667-byte `RecallPreset`
+   this issue sized `kMaxInflatedSize` against), should inflate successfully - no
+   `Inflate failed ... OutputTooLarge` line for it.
+4. No crash, and no `Traffic drop/overflow:` log line, over a couple of minutes of normal use
+   (idle plus at least one preset change) after the stream finishes.
+
+Any deviation from the above - a `File stream limits:` line with a nonzero count, an
+`OutputTooLarge` on a real preset recall, or a crash - is worth a comment on #33 with the full
+log before assuming the sizing is wrong; it may instead be a bug in this cleanup pass itself
+(this build hasn't run on hardware at all yet, per the note above).
 
 ## Not yet done
 
