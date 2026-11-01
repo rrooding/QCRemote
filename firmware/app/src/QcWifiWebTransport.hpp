@@ -5,9 +5,11 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/net/dhcpv4_server.h>
 #include <zephyr/net/http/server.h>
 #include <zephyr/net/http/service.h>
 #include <zephyr/net/net_if.h>
+#include <zephyr/net/net_ip.h>
 #include <zephyr/net/net_mgmt.h>
 #include <zephyr/net/socket.h>
 #include <zephyr/net/websocket.h>
@@ -19,8 +21,6 @@
 #include "QcCatalogSnapshot.hpp"
 #include "QcPresetTransport.hpp"
 #include "ScopedKMutex.hpp"
-
-LOG_MODULE_REGISTER(qc_wifi_web, LOG_LEVEL_INF);
 
 namespace qcbridge {
 
@@ -109,7 +109,7 @@ public:
             return 0;
         }
         ScopedKMutex lock(instance_->dataMutex_);
-        response_ctx->body = instance_->catalogJson_.data();
+        response_ctx->body = reinterpret_cast<const uint8_t*>(instance_->catalogJson_.data());
         response_ctx->body_len = instance_->catalogJson_.size();
         response_ctx->final_chunk = true;
         return 0;
@@ -194,6 +194,50 @@ private:
         }
     }
 
+    // The NXP Wi-Fi driver never auto-starts a DHCPv4 server for AP mode
+    // (confirmed against its source, drivers/wifi/nxp/src/nxp_wifi_net.c -
+    // only CONFIG_WIFI_STA_AUTO_DHCPV4's *client* path exists) - without
+    // this, a joining phone/laptop has no way to get an IP address other
+    // than unreliable link-local/APIPA fallback. Static IP + pool start
+    // address modeled directly on Zephyr's own samples/net/wifi/apsta_mode
+    // sample's enable_dhcpv4_server(), the one confirmed-working reference
+    // for this exact driver/board combination. kApAddressPool's last
+    // octet (.11) leaves .1-.10 free for the AP's own static address and
+    // any future static reservations, same convention as that sample.
+    static constexpr const char* kApIpAddress = "192.168.4.1";
+    static constexpr const char* kApNetmask = "255.255.255.0";
+
+    void startAccessPointDhcp(net_if* iface) {
+        net_in_addr address{};
+        net_in_addr netmask{};
+        if (net_addr_pton(NET_AF_INET, kApIpAddress, &address) != 0) {
+            LOG_ERR("Invalid AP IP address %s", kApIpAddress);
+            return;
+        }
+        if (net_addr_pton(NET_AF_INET, kApNetmask, &netmask) != 0) {
+            LOG_ERR("Invalid AP netmask %s", kApNetmask);
+            return;
+        }
+
+        net_if_ipv4_set_gw(iface, &address);
+        if (net_if_ipv4_addr_add(iface, &address, NET_ADDR_MANUAL, 0) == nullptr) {
+            LOG_ERR("Unable to set static IP on the AP interface");
+            return;
+        }
+        if (!net_if_ipv4_set_netmask_by_addr(iface, &address, &netmask)) {
+            LOG_ERR("Unable to set netmask on the AP interface");
+        }
+
+        net_in_addr poolStart = address;
+        poolStart.s4_addr[3] += 10;
+        if (net_dhcpv4_server_start(iface, &poolStart) != 0) {
+            LOG_ERR("Failed to start DHCPv4 server for the AP interface");
+            return;
+        }
+        LOG_INF("AP static IP %s, DHCPv4 server pool starting at %u.%u.%u.%u", kApIpAddress,
+                poolStart.s4_addr[0], poolStart.s4_addr[1], poolStart.s4_addr[2], poolStart.s4_addr[3]);
+    }
+
     void startAccessPoint() {
 #if defined(CONFIG_WIFI_USAGE_MODE_AP)
         net_if* iface = net_if_get_wifi_sap();
@@ -201,6 +245,8 @@ private:
             LOG_ERR("Wi-Fi AP interface not available");
             return;
         }
+
+        startAccessPointDhcp(iface);
 
         static const uint8_t kSsid[] = CONFIG_QC_WIFI_AP_SSID;
         static const uint8_t kPsk[] = CONFIG_QC_WIFI_AP_PSK;
@@ -411,10 +457,24 @@ inline http_resource_detail_websocket g_qcWsResourceDetail{
 
 inline uint16_t g_qcWebPort = 80;
 
+// HTTP_SERVICE_DEFINE/HTTP_RESOURCE_DEFINE's per-service iterable-section
+// start/end symbols (STRUCT_SECTION_ITERABLE_ALTERNATE, zephyr/sys/
+// iterable_sections.h) are produced by GNU ld's automatic section-boundary
+// symbols - plain, unmangled names, regardless of what namespace the
+// defining translation unit used. Declared/defined inside namespace
+// qcbridge with ordinary C++ linkage, the compiler looks for/emits a
+// mangled qcbridge::_http_resource_desc_qcWebService_list_start instead
+// of the plain name ld actually provides - confirmed as a real link
+// failure ("undefined reference"), not a hypothetical one. extern "C"
+// gives these specific declarations C linkage (their *lookup* still
+// resolves normally through this namespace) so the names match what the
+// linker generates.
+extern "C" {
 HTTP_SERVICE_DEFINE(qcWebService, nullptr, &g_qcWebPort, CONFIG_HTTP_SERVER_MAX_CLIENTS, 4, nullptr,
                     nullptr, nullptr);
 HTTP_RESOURCE_DEFINE(qcIndexResource, qcWebService, "/", &g_qcIndexResourceDetail);
 HTTP_RESOURCE_DEFINE(qcPresetsResource, qcWebService, "/api/presets.json", &g_qcPresetsResourceDetail);
 HTTP_RESOURCE_DEFINE(qcWsResource, qcWebService, "/ws", &g_qcWsResourceDetail);
+}
 
 }  // namespace qcbridge
