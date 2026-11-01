@@ -64,10 +64,14 @@ flagged inline where it matters.
 
 ## `File` READ (directory listing)
 
-- **`omit_factory_content=true` is the option that shrinks the listing; `short_listing`
-  has no visible effect.** An earlier hardware run read it the other way around, but that
-  run had unseparated variants (`short_listing`'s reply landed late and was counted into
-  the next variant's window); a cleanly-separated re-run corrected it. On this unit:
+- **Final behavior: `File` READ always sends `omit_factory_content=true`; `short_listing`
+  is no longer sent at all.** Measured no effect once variants were cleanly separated (see
+  below), so there's nothing it buys over `omit_factory_content` alone. Decision and full
+  reasoning in [ADR 0007](adr/0007-file-reassembly-buffer-sizing.md).
+- **`omit_factory_content=true` is the option that shrinks the listing.** An earlier
+  hardware run read this the other way around (crediting `short_listing`), but that run had
+  unseparated variants (`short_listing`'s reply landed late and was counted into the next
+  variant's window); a cleanly-separated re-run corrected it. On this unit:
   `omit_factory_content` → 20 messages, ~30 KB (15 folders: user folders, downloads, and
   empty plugin-`User` placeholders); default → ~570 messages, ~716 KB, with single
   messages of at least 113 KB (#33).
@@ -80,17 +84,21 @@ flagged inline where it matters.
 - **A downloads folder (key `cloud-0-1`) has no name.** Seen in the `omit_factory_content`
   listing alongside 25 named presets inside it (#33).
 - **`File` replies can start arriving more than 1.5s after the request** — variants in the
-  #33 experiment needed quiet-window and inter-variant separation (5000ms quiet window,
-  10s drain gap) to avoid one variant's late reply contaminating the next's count. Final
-  buffer sizes for the reassembly/inflate path are still being decided in #33 — refer
-  there rather than to a specific number here.
+  #33 experiment needed quiet-window and inter-variant separation; the stream's quiet
+  window is now permanently 5000ms for this reason. Final buffer sizes for the
+  reassembly/inflate path are decided in ADR 0007 — refer there rather than to a specific
+  number here.
 
 ## Message sizes observed
 
-(All from the same unit; buffer sizing based on these is #33's job, not restated here.)
+(All from the same unit; final buffer sizing based on these is ADR 0007, not restated here.)
 
-- `ModelRepo`: ~59 KB uncompressed wire size (#33).
-- `ModuleStats`: ~28 KB (#33).
+- `ModelRepo`: ~59 KB uncompressed wire size (#33). In the final build this reply is
+  ignored outright in `QcSession::handleMessage()` (counted, not buffered) — neither it nor
+  `ModuleStats` is needed for the preset listing, and both are large enough that routing
+  them through the dispatcher/gzip-inflater mailboxes would cost real RAM for no benefit
+  (ADR 0007).
+- `ModuleStats`: ~28 KB (#33). Ignored outright for the same reason, see above.
 - `RecallPreset`: inflates to roughly 13–23 KB depending on the preset (one preset at
   ~13235 bytes, another inferred at ~22667 bytes) — the first gzip-compressed message
   confirmed decompressing correctly on real hardware (#33, #61).
@@ -124,6 +132,24 @@ flagged inline where it matters.
   Local testing on macOS uses `qemu_cortex_m3` instead (`firmware/README.md`, "HID report
   framing").
 
+## End-to-end hardware result (#11)
+
+MVP1's full chain — enumerate, handshake, heartbeat, `File` READ, preset listing, and
+preset-change pushes — ran together on the owner's unit (commit `8d080f5`, PR #68):
+
+- **Full catalog printed and confirmed by the owner**: 3 folders, 48 presets (`My Presets`:
+  21, `Practice`: 2, `cloud-0-1`/Downloads: 25), matching the device exactly — the same
+  listing already confirmed on an earlier commit of the same run (#10, #11).
+- **Preset pushes visible during the run**: `RecallPreset` inflated successfully with no
+  error, including one case landing at 13235 bytes (`RecallPreset` count reaching 2 by the
+  end) — consistent with the 22667-byte case already confirmed safe on this same unit
+  (ADR 0007, #33), though this particular run's log only names the smaller one.
+- **Ran about 4 minutes with no fault** and no `Traffic drop/overflow:` line; `GlobalTempo`
+  kept arriving throughout — consistent with the continuous rate noted above — so the
+  session stayed live for the whole run (#11).
+- One unit only (Quad Cortex Mini, CorOS 4.1.1); no heartbeat-off comparison was run during
+  this test (see "Handshake and heartbeat" above).
+
 ## Boot ordering (#65, open)
 
 If the board powers on before the Quad Cortex has finished booting, the device enumerates
@@ -135,11 +161,10 @@ the first). Unconfirmed: how long a late-booting unit actually takes between enu
 and answering, and whether it needs anything beyond a repeated `Version` READ. Not fixed
 yet — tracked in #65.
 
-## To revisit once #33, #10, #11 land
+## Open follow-ups
 
-- The `File`/message-size figures above are a snapshot from #33's measurement passes, not
-  final sizing — #33 is still deciding real buffer sizes.
-- No heartbeat-off A/B test has been run; if #10/#11 touch the session lifecycle, that gap
-  is worth closing then.
+- No heartbeat-off A/B test has been run; "reads require the heartbeat" is still only
+  qc-mcp's documented claim for this firmware, not a verified result (see "Handshake and
+  heartbeat" above).
 - Plugin-library preset listing (#66) and the boot-ordering retry (#65) are both still
   open — this doc describes the evidence gathered, not a resolution.
