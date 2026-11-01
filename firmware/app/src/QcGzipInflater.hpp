@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 
 #include <zephyr/kernel.h>
@@ -135,30 +136,45 @@ private:
                     sink_->onMessage(mailboxCommand_, *result, mailboxWireSize_, result->size(), true);
                 }
             } else {
-                // issue #33: the gzip trailer's ISIZE field gives the true
-                // decompressed size without needing to finish decompressing -
-                // in particular, always recoverable for OutputTooLarge, the
-                // exact case that needs it (a message too big for
-                // kMaxInflatedSize still has an intact trailer; only
-                // Truncated input can leave this std::nullopt).
-                const auto trueInflatedSize = gzip::peekDecompressedSize({mailbox_.data(), mailboxLen_});
+                // issue #33 / ADR 0007: the gzip trailer's ISIZE field can
+                // give the true decompressed size without finishing
+                // decompression - but only when inflate() got far enough to
+                // know the bytes at that fixed offset really are a trailer.
+                // That's true for OutputTooLarge only (a real deflate stream
+                // decoded far enough to overflow `output`); every other
+                // InflateError (Truncated, HeaderMalformed, DecompressFailed,
+                // CrcMismatch, NotGzipped) means the input past the header
+                // either isn't a real gzip member or never finished, so
+                // whatever sits at that offset is not a trustworthy size -
+                // see QcGzip.hpp's peekDecompressedSize() comment (fixed by
+                // a Copilot PR review: this used to call peekDecompressedSize()
+                // unconditionally, which reported a huge false size off the
+                // 15-byte kTruncatedGzip fixture). Leave the size unknown for
+                // every other error rather than guess.
+                const bool sizeIsTrustworthy = result.error() == gzip::InflateError::OutputTooLarge;
+                const auto advertisedInflatedSize =
+                    sizeIsTrustworthy ? gzip::peekDecompressedSize({mailbox_.data(), mailboxLen_})
+                                       : std::nullopt;
 
                 // Named, not just the raw enum value, so the first real
                 // compressed message that fails shows up in a log as
                 // e.g. "CrcMismatch" rather than an opaque "error 5" -
                 // see ADR 0005's note on qc-mcp's gunzip() fallback for
                 // why a failure here needs to be obvious, not silent.
-                if (trueInflatedSize) {
-                    LOG_WRN("Inflate failed for command %u (%zu compressed bytes, true inflated size "
-                            "%u): %s",
-                            mailboxCommand_, mailboxLen_, *trueInflatedSize, gzip::toString(result.error()));
+                // "advertised": this is the gzip trailer's own claim, read
+                // without decompressing - not a size this module verified.
+                if (advertisedInflatedSize) {
+                    LOG_WRN("Inflate failed for command %u (%zu compressed bytes, advertised inflated "
+                            "size %u): %s",
+                            mailboxCommand_, mailboxLen_, *advertisedInflatedSize,
+                            gzip::toString(result.error()));
                 } else {
                     LOG_WRN("Inflate failed for command %u (%zu compressed bytes): %s", mailboxCommand_,
                             mailboxLen_, gzip::toString(result.error()));
                 }
                 if (sink_ != nullptr) {
                     sink_->onInflateFailed(mailboxCommand_, mailboxWireSize_, gzip::toString(result.error()),
-                                           trueInflatedSize);
+                                           advertisedInflatedSize);
                 }
             }
 

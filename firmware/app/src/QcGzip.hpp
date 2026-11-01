@@ -58,35 +58,34 @@ inline const char* toString(InflateError error) {
 }
 
 // Upper bound on the *compressed* gzip member this module will accept.
-// Originally matched QcHidBridge.hpp's kReassemblyCapacity (a message's
-// protobuf blob can never be larger than the whole reassembled HID message
-// it came from) - deliberately left at 4096 rather than following
-// kReassemblyCapacity's temporary bump to 16384 for issue #33's
-// `short_listing` variant experiment (QcHidBridge.hpp's comment): every
-// hardware run so far shows `File` messages are never gzip-compressed (0
-// compressed every time), so this module isn't on the path that
-// experiment needs to grow. Not an #include of QcHidBridge.hpp: it already
+// issue #33's final sizing: kept at 4x smaller than kMaxInflatedSize below,
+// same ratio this module has always used (generous headroom for the 3-6x
+// gzip ratios typical of this protocol's text/protobuf payloads - see that
+// constant's comment). Not an #include of QcHidBridge.hpp: it already
 // includes QcSession.hpp (which pulls this one in), so including it back
-// would be circular. Keep the two values in sync by hand if #33 step 2
-// revisits kReassemblyCapacity for real.
-inline constexpr size_t kMaxCompressedInputSize = 4096;
+// would be circular - kReassemblyCapacity and this constant are sized
+// independently (one message type's worst case each; see ADR 0007), not
+// kept in lockstep.
+inline constexpr size_t kMaxCompressedInputSize = 8192;
 
 // Upper bound on the *decompressed* output this module will produce.
-// 16 KiB = 4x kMaxCompressedInputSize above: generous headroom for the
-// gzip ratios (commonly 3-6x) typical of the text/protobuf payloads this
-// protocol carries over HID, while still bounding a maliciously-crafted
-// "zip bomb" style input (DEFLATE can in principle expand a small
-// compressed stream by orders of magnitude via back-reference abuse) to a
-// fixed, clean failure (OutputTooLarge) rather than an unbounded
-// allocation. This is independent of - and much smaller than -
-// ModelRepo's *internal* catalog payload (a separate gzip+tar of
+// issue #33's final sizing (ADR 0007): a real hardware `RecallPreset`
+// (command 15) inflated to 22667 bytes for one preset ("Practice 1",
+// inferred from the owner's own description of it as their larger preset -
+// see firmware/README.md). 32 KiB gives that ~44% headroom for a bigger
+// preset elsewhere on the unit, without just doubling blindly - still
+// bounding a maliciously-crafted "zip bomb" style input (DEFLATE can in
+// principle expand a small compressed stream by orders of magnitude via
+// back-reference abuse) to a fixed, clean failure (OutputTooLarge) rather
+// than an unbounded allocation. This is independent of - and much smaller
+// than - ModelRepo's *internal* catalog payload (a separate gzip+tar of
 // ModelRepo.xml inside a protobuf bytes field, confirmed ~675KB
-// uncompressed from qc-mcp's own fixture): this module does not attempt
-// to hold that. Untarring/decompressing the catalog itself is explicitly
-// out of scope for this issue (see the issue's scope notes) and would
-// need #33's broader memory-budget exercise - and probably streaming
-// decompression - to support regardless of this constant.
-inline constexpr size_t kMaxInflatedSize = 16384;
+// uncompressed from qc-mcp's own fixture): this module does not attempt to
+// hold that, and ModelRepo's reply is no longer even routed here at all
+// (QcSession::handleMessage() now ignores it before the gzip-magic check -
+// see ADR 0007). Untarring/decompressing the catalog itself remains out of
+// scope for this issue.
+inline constexpr size_t kMaxInflatedSize = 32768;
 
 namespace detail {
 
@@ -270,13 +269,20 @@ inline std::expected<std::span<const uint8_t>, InflateError> inflate(std::span<c
 // member's last 8 bytes, little-endian, the uncompressed size modulo 2^32)
 // directly from the compressed bytes, without running tinfl at all. The
 // trailer sits at a fixed offset from the *end* of a gzip member
-// regardless of header length (FEXTRA/FNAME/FCOMMENT don't move it), so
-// this works even when inflate() above fails with OutputTooLarge - issue
-// #33's measurement needs the true decompressed size of a message that's
-// too big for `output` to size a buffer for real, and this is the cheap
-// way to get it without decompressing anything. Real hardware hit exactly
-// this case: a `RecallPreset` whose compressed size (2408 bytes) implied
-// an inflated size past kMaxInflatedSize.
+// regardless of header length (FEXTRA/FNAME/FCOMMENT don't move it).
+//
+// This is an ADVERTISED size, not a validated one: it's whatever bytes
+// happen to sit at that fixed offset, read before any of inflate()'s own
+// checks (CRC32, length-vs-trailer) run. It is only trustworthy when
+// inflate() got far enough to know those really are a real gzip member's
+// final 8 bytes - in practice, only InflateError::OutputTooLarge (a real
+// deflate stream decoded far enough to overflow `output`, so its trailer
+// position is known-good) - see QcGzipInflater.hpp, the only caller, which
+// restricts its use to exactly that case. For Truncated/HeaderMalformed/
+// DecompressFailed/CrcMismatch/NotGzipped input, the bytes at this offset
+// may not be a trailer at all (e.g. the 15-byte kTruncatedGzip fixture in
+// tests/gzip_inflate has no trailer whatsoever), so a caller must not treat
+// this function's result as a real size for those cases.
 //
 // std::nullopt if `gzipped` is too short to even hold a trailer - callers
 // already holding a hasMagic()'d, reassembled message (the only way

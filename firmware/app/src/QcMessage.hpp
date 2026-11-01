@@ -59,20 +59,4 @@ inline std::optional<DecodedMessage> decodeMessage(std::span<const uint8_t> full
     };
 }
 
-// Decodes just the command id out of a message trailer, for a message
-// whose body is otherwise unavailable - issue #33: HidReassembler drops
-// the body of a message that overflows its reassembly capacity, but
-// retains the trailing kMessageTrailerSize bytes (HidReassembler::
-// overflowTrailer()), which are always this same trailer. `trailer` may be
-// exactly the 8 bytes themselves, or a longer span ending in them (the
-// last kMessageTrailerSize bytes are read either way, same as
-// decodeMessage() above).
-inline std::optional<uint16_t> decodeTrailerCommand(std::span<const uint8_t> trailer) {
-    if (trailer.size() < kMessageTrailerSize) {
-        return std::nullopt;
-    }
-    const size_t start = trailer.size() - kMessageTrailerSize;
-    return static_cast<uint16_t>(trailer[start] | (trailer[start + 1] << 8));
-}
-
 }  // namespace qcbridge

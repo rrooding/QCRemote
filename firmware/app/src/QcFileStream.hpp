@@ -23,7 +23,14 @@ namespace qcbridge {
 // heartbeat thread.
 class QcFileStream {
 public:
-    static constexpr int64_t kQuietWindowMs = 1500;
+    // issue #33 (ADR 0007): was 1500ms. A hardware run (commit 147fb48)
+    // found that too short - a genuine pause mid-reply, more than 1500ms
+    // but still part of the same reply, looked like the stream ending, and
+    // the real tail that followed got miscounted as a separate request's
+    // reply. 5000ms (first used as this issue's own measurement window,
+    // then kept through every subsequent hardware run with no recurrence of
+    // that problem) is the value with actual evidence behind it.
+    static constexpr int64_t kQuietWindowMs = 5000;
     static constexpr int64_t kOverallTimeoutMs = 30000;
 
     struct Summary {
@@ -62,14 +69,8 @@ public:
         uint32_t reassemblyMalformedCount = 0;
     };
 
-    // Called once, right after the handshake completes (or, under issue
-    // #33's variant experiment, once per variant). `quietWindowMs` defaults
-    // to kQuietWindowMs but can be overridden - the variant experiment
-    // passes a longer one, having measured that the 1500ms default let a
-    // genuine pause in one variant's reply (not the end of it) look like
-    // the stream finishing, with the rest of that reply then miscounted
-    // into the *next* variant's window.
-    void start(int64_t nowMs, int64_t quietWindowMs = kQuietWindowMs) {
+    // Called once, right after the handshake completes.
+    void start(int64_t nowMs) {
         active_ = true;
         messageCount_ = 0;
         compressedCount_ = 0;
@@ -80,7 +81,6 @@ public:
         maxInflatedBytes_ = 0;
         startedAtMs_ = nowMs;
         lastMessageAtMs_ = nowMs;
-        quietWindowMs_ = quietWindowMs;
     }
 
     bool isActive() const { return active_; }
@@ -135,7 +135,7 @@ public:
         if (!active_) {
             return std::nullopt;
         }
-        const bool quiet = messageCount_ > 0 && (nowMs - lastMessageAtMs_) >= quietWindowMs_;
+        const bool quiet = messageCount_ > 0 && (nowMs - lastMessageAtMs_) >= kQuietWindowMs;
         const bool timedOut = (nowMs - startedAtMs_) >= kOverallTimeoutMs;
         if (!quiet && !timedOut) {
             return std::nullopt;
@@ -165,7 +165,6 @@ private:
     size_t maxInflatedBytes_ = 0;
     int64_t startedAtMs_ = 0;
     int64_t lastMessageAtMs_ = 0;
-    int64_t quietWindowMs_ = kQuietWindowMs;
 };
 
 }  // namespace qcbridge

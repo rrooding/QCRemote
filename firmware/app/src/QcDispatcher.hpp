@@ -100,16 +100,11 @@ private:
     // payload can never be bigger than the whole reassembled HID message it
     // came from. Not shared as one constant for the same reason QcGzip.hpp's
     // comment gives about kMaxCompressedInputSize: including QcHidBridge.hpp
-    // back here would be circular. Keep in sync by hand.
-    //
-    // Temporarily raised 4096 -> 16384 alongside kReassemblyCapacity for
-    // issue #33's `short_listing` variant experiment - see that constant's
-    // comment. Uncompressed `File` messages (confirmed on every hardware
-    // run so far: 0 compressed) go through this mailbox, not
-    // QcGzipInflater's, so this is the one that needs to grow for
-    // `short_listing`'s larger messages; QcGzip.hpp's
-    // kMaxCompressedInputSize/kMaxInflatedSize are untouched.
-    static constexpr size_t kMailboxCapacity = 16384;
+    // back here would be circular. Keep in sync by hand - issue #33's final
+    // sizing (ADR 0007) is 131072, matching kReassemblyCapacity: uncompressed
+    // `File` messages (confirmed on every hardware run so far: 0 compressed)
+    // go through this mailbox, not QcGzipInflater's.
+    static constexpr size_t kMailboxCapacity = 131072;
 
     static void threadEntryTrampoline(void* p1, void*, void*) { static_cast<QcDispatcher*>(p1)->run(); }
 

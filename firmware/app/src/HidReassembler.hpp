@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -48,12 +47,7 @@ enum class HidReportFlag : uint8_t {
 // malformed=2850, almost all of which were exactly this). Instead it keeps
 // consuming reports - without growing the stored body past Capacity - until
 // the LAST/SINGLE report completes it, tracking the message's true total
-// size and retaining only its last kTrailerTailSize bytes. Those last bytes
-// are always QcMessage.hpp's 8-byte trailer ([command][reserved][hash] -
-// always the final bytes of a message, appended after the protobuf body),
-// so the caller can still learn which command overflowed even though the
-// body itself was dropped - see overflowSize()/overflowTrailer() below and
-// QcHidBridge.hpp's use of them.
+// size via overflowSize() below.
 template <size_t Capacity>
 class HidReassembler {
 public:
@@ -65,13 +59,6 @@ public:
                      // NOT valid; overflowSize()/overflowTrailer() are instead
         Malformed,   // bad chunk length, or a MIDDLE/LAST with no preceding FIRST
     };
-
-    // Trailer bytes retained across an overflow - sized for QcMessage.hpp's
-    // kMessageTrailerSize (not included directly: this file has no
-    // dependency on QcMessage.hpp, by design - same reasoning as the rest of
-    // this class's plain-C++23, protocol-agnostic framing role). Keep in
-    // sync by hand if that trailer size ever changes.
-    static constexpr size_t kTrailerTailSize = 8;
 
     // Feeds one report, exactly kHidReportSize bytes.
     Status feed(std::span<const uint8_t> report) {
@@ -100,7 +87,6 @@ public:
             buffer_.clear();
             overflowing_ = false;
             overflowSize_ = 0;
-            tailLen_ = 0;
         } else if (buffer_.empty() && !overflowing_) {
             // A MIDDLE/LAST with no preceding FIRST, and not a continuation
             // of a message already overflowing (see below): out of order,
@@ -112,10 +98,9 @@ public:
 
         if (overflowing_) {
             // Already past Capacity for this message - keep tracking its
-            // true size and trailing bytes, but don't touch buffer_ (it was
-            // cleared, and stays empty, the moment overflow began below).
+            // true size, but don't touch buffer_ (it was cleared, and stays
+            // empty, the moment overflow began below).
             overflowSize_ += chunkLen;
-            appendTail(chunk);
             if (isLast) {
                 overflowing_ = false;
                 return Status::Overflow;
@@ -125,14 +110,10 @@ public:
 
         if (buffer_.size() + chunkLen > Capacity) {
             // Transition into overflow: the true size so far (whatever was
-            // already in buffer_, now folded into overflowSize_/the tail
-            // window, plus this chunk) is tracked from here on instead of
-            // the body itself.
+            // already in buffer_, plus this chunk) is tracked from here on
+            // instead of the body itself.
             overflowing_ = true;
             overflowSize_ = buffer_.size() + chunkLen;
-            tailLen_ = 0;
-            appendTail({buffer_.data(), buffer_.size()});
-            appendTail(chunk);
             buffer_.clear();
             if (isLast) {
                 overflowing_ = false;
@@ -153,65 +134,17 @@ public:
     // total size (report headers excluded), which Capacity could not hold.
     size_t overflowSize() const { return overflowSize_; }
 
-    // Valid only right after feed() returns Overflow: the last (up to)
-    // kTrailerTailSize bytes of the message - its trailer, per this class's
-    // header comment. Shorter than kTrailerTailSize only if overflowSize()
-    // itself is (defensive only - Capacity is always far larger than 8
-    // bytes in practice, so overflow never happens that early).
-    std::span<const uint8_t> overflowTrailer() const { return {tailBuf_.data(), tailLen_}; }
-
 private:
     Status fail() {
         buffer_.clear();
         overflowing_ = false;
         overflowSize_ = 0;
-        tailLen_ = 0;
         return Status::Malformed;
-    }
-
-    // Keeps tailBuf_/tailLen_ as a sliding window over the last (up to)
-    // kTrailerTailSize bytes fed so far, across however many feed() calls it
-    // takes to get there. `chunk` is NOT bounded by kHidMaxPayloadPerReport
-    // here: the overflow-transition call site below passes the whole
-    // buffer_ accumulated so far (up to Capacity bytes) in one shot, so this
-    // must stay correct - and bounded to kTrailerTailSize of stack, not
-    // Capacity - for a chunk of any length. It only ever needs the last
-    // kTrailerTailSize bytes of (old tail ++ chunk), so when chunk itself is
-    // already that long or longer, the old tail is irrelevant and dropped;
-    // otherwise just enough of the old tail survives to pad chunk out to the
-    // window size.
-    void appendTail(std::span<const uint8_t> chunk) {
-        if (chunk.size() >= kTrailerTailSize) {
-            const uint8_t* tail = chunk.data() + (chunk.size() - kTrailerTailSize);
-            for (size_t i = 0; i < kTrailerTailSize; ++i) {
-                tailBuf_[i] = tail[i];
-            }
-            tailLen_ = kTrailerTailSize;
-            return;
-        }
-
-        const size_t keepFromOld = kTrailerTailSize - chunk.size();
-        const size_t oldKeep = tailLen_ < keepFromOld ? tailLen_ : keepFromOld;
-        const size_t oldStart = tailLen_ - oldKeep;
-        std::array<uint8_t, kTrailerTailSize> next{};
-        size_t n = 0;
-        for (size_t i = oldStart; i < tailLen_; ++i) {
-            next[n++] = tailBuf_[i];
-        }
-        for (const uint8_t byte : chunk) {
-            next[n++] = byte;
-        }
-        for (size_t i = 0; i < n; ++i) {
-            tailBuf_[i] = next[i];
-        }
-        tailLen_ = n;
     }
 
     etl::vector<uint8_t, Capacity> buffer_;
     bool overflowing_ = false;
     size_t overflowSize_ = 0;
-    std::array<uint8_t, kTrailerTailSize> tailBuf_{};
-    size_t tailLen_ = 0;
 };
 
 }  // namespace qcbridge

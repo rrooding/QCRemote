@@ -7,8 +7,6 @@
 #include <zephyr/logging/log.h>
 
 #include "HidReassembler.hpp"
-#include "QcMessage.hpp"
-#include "QcReassemblyOverflowTally.hpp"
 #include "QcSession.hpp"
 #include "UsbHostClass.hpp"
 
@@ -25,19 +23,18 @@ inline constexpr uint8_t kQuadCortexHidInterface = 5;
 // header dependency at all.
 inline constexpr uint8_t kUsbBaseClassHid = 0x03;
 
-// Placeholder pending issue #33's actual sizing exercise - generous enough
-// for any MVP1 message (Version, Connection, ResetCommsBuffers, KeepAlive,
-// ModelRepo, SetlistPosition) without having measured them yet.
-//
-// Temporarily raised 4096 -> 16384 for issue #33's `short_listing` variant
-// experiment (QcFileReadExperiment.hpp): the first hardware run on this
-// experiment (commit 147fb48) found a `short_listing=true` File message up
-// to at least 10193 bytes true size, which overflowed the 4096-byte
-// capacity and was dropped before it could be decoded - exactly the
-// measurement this experiment needs. This is NOT #33's final answer (that
-// still needs a real sizing pass over every command, not just File) -
-// revert to whatever #33 step 2 picks once the variant experiment is done.
-inline constexpr size_t kReassemblyCapacity = 16384;
+// issue #33's final sizing (ADR 0007): must hold a worst-case File folder
+// message, not just the owner's own 10193-byte `My Presets` (21 named, 235
+// empty slots) under `omit_factory_content=true`. A folder maxes out at 256
+// slots (confirmed on hardware: My Presets and Practice are both 256), and
+// a fully-named one costs far more per slot than an empty one (qc-mcp's
+// ProductData has 21 fields - name, author, tags, dates, cloud/version ids,
+// dependencies, ... - vs. an empty slot's bare index). 131072 bytes
+// (128 KiB) budgets ~511 bytes/slot for 256 named presets, comfortably above
+// the ~414 bytes/named-slot the real 10193-byte message implies once the
+// 235 near-empty slots' own small cost is subtracted - see ADR 0007 for the
+// full arithmetic and the RAM cost this carries.
+inline constexpr size_t kReassemblyCapacity = 131072;
 
 // Claims the Quad Cortex Mini's vendor HID interface (interface 5), rejects
 // every other interface the composite device exposes, and reassembles
@@ -86,7 +83,7 @@ protected:
             session_.handleMessage(message);
             break;
         }
-        case Status::Overflow: {
+        case Status::Overflow:
             // No LOG_WRN here (issue #60's hardware-safety follow-up): this
             // runs on the `usbh` thread, where CONFIG_LOG_MODE_IMMEDIATE
             // means an *enabled* log level (unlike the LOG_DBG above, which
@@ -95,23 +92,11 @@ protected:
             // 1536-byte stack - the exact pattern that overflowed it once
             // already (see QcSession.hpp's handleMessage() comment). Atomic
             // counters cost nothing there; session_.recordReassemblyOverflow()
-            // surfaces them through QcFileStream's summary instead (the
-            // known gap documented in firmware/README.md's issue #60
-            // section).
-            //
-            // issue #33's measurement step: the message's body is gone,
-            // but HidReassembler kept its trailer (overflowTrailer()) -
-            // decoding just the command id out of that (decodeTrailerCommand(),
-            // a plain memory read, no heavier than the trailer decode
-            // handleMessage() already does for a message that fits) is
-            // what lets the by-command overflow report below say *which*
-            // command(s) are actually too big for kReassemblyCapacity,
-            // instead of only a lifetime total.
-            const auto decodedCommand = decodeTrailerCommand(reassembler_.overflowTrailer());
-            const uint16_t command = decodedCommand.value_or(QcReassemblyOverflowTally::kUnknownCommand);
-            session_.recordReassemblyOverflow(command, reassembler_.overflowSize());
+            // surfaces them (count + largest size seen) through the
+            // heartbeat thread instead - see QcSession.hpp's
+            // checkTrafficHealth().
+            session_.recordReassemblyOverflow(reassembler_.overflowSize());
             break;
-        }
         case Status::Malformed:
             session_.recordReassemblyMalformed();
             break;
