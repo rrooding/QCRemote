@@ -1,5 +1,15 @@
 cmake_minimum_required(VERSION 3.20.0)
 
+# Issue #71: pick up a local, untracked wifi_credentials.conf automatically
+# if present (copied from wifi_credentials.conf.example - see
+# firmware/README.md) - must happen before find_package(Zephyr ...) below,
+# since that's where Kconfig fragments get collected. Never committed (see
+# firmware/.gitignore); a clean checkout with no local file builds against
+# this app's plain Kconfig defaults instead.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/wifi_credentials.conf")
+  set(EXTRA_CONF_FILE "${CMAKE_CURRENT_SOURCE_DIR}/wifi_credentials.conf")
+endif()
+
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(qc_bridge_firmware)
 
@@ -60,3 +70,9 @@ target_compile_definitions(app PRIVATE
   MINIZ_NO_ZLIB_APIS
 )
 target_link_libraries(app PRIVATE etl::etl)
+
+# Issue #71: links QcWifiWebTransport.hpp's HTTP_SERVICE_DEFINE(qcWebService,
+# ...) to its own iterable-section linker fragment (sections-rom.ld) - see
+# that file's own comment for why this is required, not optional, wiring.
+zephyr_linker_sources(SECTIONS sections-rom.ld)
+zephyr_linker_section(NAME http_resource_desc_qcWebService KVMA RAM_REGION GROUP RODATA_REGION)

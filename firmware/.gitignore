@@ -1,5 +1,11 @@
 build/
+build-*/
+twister-out*/
 *.uf2
 *.elf
 *.hex
 *.bin
+
+# Issue #71: real Wi-Fi credentials - copy app/wifi_credentials.conf.example
+# to app/wifi_credentials.conf and never commit the result.
+app/wifi_credentials.conf

@@ -1,0 +1,50 @@
+# Issue #71: Wi-Fi mode/credentials, chosen at build time. Mode itself
+# reuses Zephyr's own generic choice (drivers/wifi/Kconfig,
+# WIFI_USAGE_MODE_AP/STA) rather than inventing a parallel one - that choice
+# is already what the NXP Wi-Fi driver keys its own SoftAP/DHCP-server
+# defaults off (see ADR 0009). Real credentials belong in a local,
+# untracked wifi_credentials.conf (see wifi_credentials.conf.example in
+# this directory and firmware/README.md) - never in this file or in
+# prj.conf, and never committed.
+
+mainmenu "QC Remote Bridge Firmware"
+
+config QC_WIFI_AP_SSID
+	string "Soft AP SSID (CONFIG_WIFI_USAGE_MODE_AP)"
+	default "QCRemote"
+	depends on WIFI_USAGE_MODE_AP
+	help
+	  SSID the board advertises when running as its own access point.
+	  Override in a local wifi_credentials.conf, not here.
+
+config QC_WIFI_AP_PSK
+	string "Soft AP WPA2 passphrase (CONFIG_WIFI_USAGE_MODE_AP)"
+	default ""
+	depends on WIFI_USAGE_MODE_AP
+	help
+	  WPA2-PSK passphrase for the board's own access point (8-63
+	  characters). Left empty, the AP starts open (no password) - the
+	  owner's decision for issue #71 is to set a real passphrase here via
+	  a local wifi_credentials.conf whenever that's easy, rather than
+	  defaulting to an open network. Never set a real passphrase in this
+	  file or in prj.conf.
+
+config QC_WIFI_STA_SSID
+	string "Network SSID to join (CONFIG_WIFI_USAGE_MODE_STA)"
+	default ""
+	depends on WIFI_USAGE_MODE_STA
+	help
+	  SSID of the existing Wi-Fi network the board should join. Left
+	  empty, the firmware logs a warning and skips connecting rather than
+	  attempting to join a blank network - set this in a local
+	  wifi_credentials.conf.
+
+config QC_WIFI_STA_PSK
+	string "Network WPA2 passphrase (CONFIG_WIFI_USAGE_MODE_STA)"
+	default ""
+	depends on WIFI_USAGE_MODE_STA
+	help
+	  WPA2-PSK passphrase for the network above. Set this in a local
+	  wifi_credentials.conf - never here or in prj.conf.
+
+source "Kconfig.zephyr"
