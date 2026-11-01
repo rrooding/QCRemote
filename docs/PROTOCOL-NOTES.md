@@ -38,12 +38,13 @@ flagged inline where it matters.
   earlier read of the hardware log. They are all command `10`, the (delayed) `Version`
   reply itself, decoded during #8's debugging. `firmware/README.md`'s handshake section
   has been corrected to say this plainly.
-- **The heartbeat must start before the handshake, not after.** qc-mcp's own
+- **The heartbeat now starts before the handshake, matching qc-mcp's order.** qc-mcp's own
   `transport.py::open()` does `_start_heartbeat()` then `_handshake()`, with a comment
   that the heartbeat is what "keep[s] session online (required for reads)." An earlier
-  firmware version started the heartbeat last, leaving a window with nothing keeping the
-  session alive before the first `Version` READ — found while diagnosing why that READ
-  never got a reply in time. Fixed to match qc-mcp's order (#8).
+  firmware version started the heartbeat after the handshake instead; the fix reordered it
+  to match qc-mcp (#8). That reorder landed in the same change as the widened Version
+  timeout above, so the successful hardware run doesn't isolate the ordering change by
+  itself — it doesn't show that starting the heartbeat after the handshake can't also work.
 - **"Reads require the heartbeat" is still only qc-mcp's documented claim, not an A/B
   result from this firmware.** Silence after the handshake proves nothing by itself unless
   a read was actually sent — our firmware's own silent run (#8, before #61) sent no reads
@@ -77,7 +78,7 @@ flagged inline where it matters.
   owner's own device content (e.g. the `Practice` folder's 254 empty names alongside its
   2 real presets, "Practice 1" and "Dark Jazz") (#33).
 - **A downloads folder (key `cloud-0-1`) has no name.** Seen in the `omit_factory_content`
-  listing alongside 24 named presets inside it (#33).
+  listing alongside 25 named presets inside it (#33).
 - **`File` replies can start arriving more than 1.5s after the request** — variants in the
   #33 experiment needed quiet-window and inter-variant separation (5000ms quiet window,
   10s drain gap) to avoid one variant's late reply contaminating the next's count. Final
@@ -102,10 +103,19 @@ flagged inline where it matters.
   builds with `CONFIG_LOG_MODE_IMMEDIATE=y`, so any enabled `LOG_*` call on that thread
   formats synchronously on its own stack. A diagnostic log call there caused a real
   stack-overflow crash; the fix is atomic counters instead of logging on that thread, with
-  real logging done from a thread with headroom (#8). The same class of bug recurred twice
-  more during #33's work — a large stack-allocated scratch buffer in a framing function,
-  and a ~7 KB `std::array` reset by value — both on different threads, both found via
-  `addr2line` against the crash PC/LR rather than guessed.
+  real logging done from a thread with headroom (#8). #33's work hit the same kind of
+  stack-capacity exhaustion twice more, on different threads: `qc_heartbeat`'s per-variant
+  logging locals were part of its permanently-reserved frame rather than a one-off cost,
+  fixed by moving them into their own method and doubling `heartbeatStack_` (2048 → 4096);
+  and `qc_session`'s handshake path materialized a ~7 KB `std::array` reset by value on its
+  2048-byte stack, fixed by dropping the reset (bounding reads by count instead). Both were
+  found via `addr2line` against the crash PC/LR rather than guessed.
+- **A separate #33 crash was an out-of-bounds write, not a capacity limit.** `appendTail()`
+  sized its scratch buffer for a single report's payload (126 bytes, 134 with the trailer),
+  but `feed()`'s overflow-transition path could hand it the entire accumulated buffer — up
+  to `kReassemblyCapacity`, 4096 bytes — in one call, writing past the 134-byte array and
+  corrupting the stack. More stack headroom would not have fixed this; the fix was
+  rewriting `appendTail()` to need only the trailer's 8 bytes regardless of input length.
 - **Zephyr 4.5's USB host API dropped `usbh_xfer_free()`** in favor of ref-counted
   `uhc_xfer_unref()` (no `dev` argument) — the one call site this project still had was
   updated; every other USB host API used here was unaffected (#54).
@@ -118,7 +128,7 @@ flagged inline where it matters.
 
 If the board powers on before the Quad Cortex has finished booting, the device enumerates
 over USB before it answers any protocol message. The handshake's `Version` READ then
-times out, mirrors the `4.0` fallback, and still reports the session as "complete" —
+times out, mirrors the `4.1.0` fallback, and still reports the session as "complete" —
 nothing retries, so the session is stuck on the wrong version until the board resets.
 Observed needing up to three power-cycles in one case (device took ~15.6s to enumerate on
 the first). Unconfirmed: how long a late-booting unit actually takes between enumerating
@@ -128,8 +138,7 @@ yet — tracked in #65.
 ## To revisit once #33, #10, #11 land
 
 - The `File`/message-size figures above are a snapshot from #33's measurement passes, not
-  final sizing — #33 is still deciding real buffer sizes (the owner's current direction is
-  roughly 128 KB / 32 KB fixed buffers, pending confirmation).
+  final sizing — #33 is still deciding real buffer sizes.
 - No heartbeat-off A/B test has been run; if #10/#11 touch the session lifecycle, that gap
   is worth closing then.
 - Plugin-library preset listing (#66) and the boot-ordering retry (#65) are both still
