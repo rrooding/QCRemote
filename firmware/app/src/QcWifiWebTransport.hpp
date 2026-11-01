@@ -1,11 +1,11 @@
 #pragma once
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/net/dhcpv4_server.h>
 #include <zephyr/net/http/server.h>
 #include <zephyr/net/http/service.h>
 #include <zephyr/net/net_if.h>
@@ -23,6 +23,13 @@
 #include "ScopedKMutex.hpp"
 
 namespace qcbridge {
+
+// HTTP_SERVICE_DEFINE (below, at namespace scope) needs a plain uint16_t*
+// for its port, and QcWifiWebTransport's own logStartupSummary()/
+// logReadySummary() want to log that same port - declared up here, before
+// the class, so both can see it (a member function body can't reference
+// a namespace-scope name declared later in the same file).
+inline uint16_t g_qcWebPort = 80;
 
 // Issue #71's concrete Wi-Fi/web transport: implements QcPresetTransport by
 // serving a small embedded page and a WebSocket over Zephyr's HTTP server
@@ -50,14 +57,38 @@ public:
         k_mutex_init(&dataMutex_);
         k_sem_init(&broadcastSem_, 0, 1);
         instance_ = this;
+
+        // PR #74 review: before the first File-stream listing finishes (or
+        // indefinitely without a Quad Cortex attached), there's nothing to
+        // serve yet. An empty HTTP body makes the page's `r.json()` reject
+        // and leaves it stuck at "loading..." - encode a real, valid,
+        // explicitly-incomplete catalog instead of leaving the buffer
+        // empty, through the same tested encoder every other catalog goes
+        // through (tests/preset_transport), not a hand-written literal.
+        catalogSnapshot_.incomplete = true;
+        encodeCatalogJson(catalogSnapshot_, catalogJson_);
     }
 
-    // Brings up Wi-Fi and starts the worker thread that pushes updates to
-    // connected websocket clients. Call once at startup (Main.cpp), before
-    // QcSession::addTransport(*this).
+    // Brings up Wi-Fi, starts Zephyr's HTTP server, and starts the worker
+    // thread that pushes updates to connected websocket clients. Call once
+    // at startup (Main.cpp), before QcSession::addTransport(*this).
     void start() {
         net_mgmt_init_event_callback(&netMgmtCb_, &onWifiEventTrampoline, kNetEventMask);
         net_mgmt_add_event_callback(&netMgmtCb_);
+
+        // PR #74 review: HTTP_SERVICE_DEFINE/HTTP_RESOURCE_DEFINE only
+        // register the resources - Zephyr's HTTP server thread waits for
+        // an explicit http_server_start() before it ever accepts a
+        // connection. Without this call neither AP nor station mode could
+        // ever serve the page or accept a WebSocket, regardless of Wi-Fi
+        // coming up correctly.
+        const int httpRet = http_server_start();
+        httpServerStarted_ = (httpRet == 0);
+        if (!httpServerStarted_) {
+            LOG_ERR("http_server_start() failed: %d - the page and WebSocket will be "
+                    "unreachable even if Wi-Fi comes up",
+                    httpRet);
+        }
 
 #if defined(CONFIG_WIFI_USAGE_MODE_AP)
         startAccessPoint();
@@ -71,29 +102,38 @@ public:
             k_thread_name_set(&thread_, "qc_wifi_web");
             threadStarted_ = true;
         }
+
+        logStartupSummary();
     }
 
     // QcPresetTransport overrides - called from QcSession's own heartbeat/
-    // dispatcher threads (see that header's contract). Both just update
-    // member storage and signal the worker thread; the actual socket I/O
-    // (which can block on a slow/absent Wi-Fi link) only ever happens on
-    // qc_wifi_web, never here - so a slow client can never delay the
-    // ~200ms KeepAlive.
+    // dispatcher threads (see that header's contract). Both just copy into
+    // member storage and signal the worker thread; the actual JSON
+    // encoding and socket I/O (either of which can take real time - PR #74
+    // review flagged encoding running on qc_heartbeat as a KeepAlive-path
+    // regression) only ever happens on qc_wifi_web, never here.
     void publishCatalog(const QcCatalogSnapshot& snapshot) override {
         {
             ScopedKMutex lock(dataMutex_);
-            encodeCatalogJson(snapshot, catalogJson_);
+            catalogSnapshot_ = snapshot;
+            catalogDirty_ = true;
         }
         k_sem_give(&broadcastSem_);
     }
 
-    void publishPresetChange(const QcPresetChangeEvent& /*event*/) override {
-        // The client's own job is to re-render from the latest catalog
-        // JSON (QcPresetTransport.hpp's own comment on why this event
-        // carries no protocol detail) - rebroadcasting the same stored
-        // catalogJson_ again covers "a preset changed but no full
-        // re-listing happened" with the one message shape the page
-        // already understands, rather than inventing a second one.
+    void publishPresetChange(const QcPresetChangeEvent& event) override {
+        // PR #74 review: silently rebroadcasting the stored catalog JSON
+        // verbatim made a preset switch invisible on the page whenever it
+        // didn't also change the folder/preset list (render() would show
+        // the same names/count/generation as before). broadcast() now
+        // folds this event's command/count into the next message it sends
+        // as a "lastChange" field alongside the catalog, so the page can
+        // show something changed even when the listing itself didn't.
+        {
+            ScopedKMutex lock(dataMutex_);
+            lastChangeEvent_ = event;
+            changePending_ = true;
+        }
         k_sem_give(&broadcastSem_);
     }
 
@@ -108,9 +148,23 @@ public:
         if (instance_ == nullptr || status != HTTP_SERVER_REQUEST_DATA_FINAL) {
             return 0;
         }
-        ScopedKMutex lock(instance_->dataMutex_);
-        response_ctx->body = reinterpret_cast<const uint8_t*>(instance_->catalogJson_.data());
-        response_ctx->body_len = instance_->catalogJson_.size();
+        // PR #74 review: Zephyr sends response_ctx->body after this
+        // callback returns, by which point dataMutex_ has already been
+        // released - a concurrent publishCatalog() re-encoding catalogJson_
+        // mid-send would otherwise corrupt this response. responseJson_ is
+        // this class's own copy, touched only from the single-threaded
+        // Zephyr HTTP server thread (K_THREAD_DEFINE(http_server_tid, ...),
+        // confirmed against subsys/net/lib/http/http_server_core.c - one
+        // resource callback runs at a time), so it stays stable for the
+        // duration of this response without holding dataMutex_ across the
+        // actual socket send.
+        {
+            ScopedKMutex lock(instance_->dataMutex_);
+            instance_->responseJson_.assign(instance_->catalogJson_.begin(),
+                                            instance_->catalogJson_.end());
+        }
+        response_ctx->body = reinterpret_cast<const uint8_t*>(instance_->responseJson_.data());
+        response_ctx->body_len = instance_->responseJson_.size();
         response_ctx->final_chunk = true;
         return 0;
     }
@@ -127,6 +181,12 @@ private:
     static constexpr int kThreadPriority = 10;
     static constexpr size_t kJsonCapacity = 16384;
     static constexpr size_t kMaxWsClients = 2;
+    // How often run() wakes even without a publish, to poll connected
+    // sockets for control frames/EOF (PR #74 review: the worker only ever
+    // woke on a broadcast, so a closed browser tab's socket was never
+    // drained or unregistered until the next unrelated publish happened to
+    // fail a send to it).
+    static constexpr int kPollIntervalMs = 1000;
 
     static constexpr uint64_t kNetEventMask =
         (NET_EVENT_WIFI_CONNECT_RESULT | NET_EVENT_WIFI_DISCONNECT_RESULT |
@@ -139,23 +199,43 @@ private:
 
     void run() {
         while (true) {
-            k_sem_take(&broadcastSem_, K_FOREVER);
-            broadcast();
+            const int took = k_sem_take(&broadcastSem_, K_MSEC(kPollIntervalMs));
+            if (took == 0) {
+                broadcast();
+            }
+            pollWsClients();
         }
     }
 
-    // Copies the latest catalog JSON out under dataMutex_ (a plain
-    // byte-copy, never blocking) before sending it to every connected
-    // client - same split as QcPresetPrinter::printCatalog()'s own
-    // copy-then-print, for the same reason: publishCatalog() above must
-    // never wait on a slow socket send.
+    // Encodes the latest snapshot (if publishCatalog() ran since the last
+    // broadcast) into catalogJson_ - moved here from publishCatalog() per
+    // PR #74 review, so the variable-length formatting work never runs on
+    // qc_heartbeat. Then copies into broadcastJson_ (never holding
+    // dataMutex_ across the actual socket sends below - same split as
+    // before) and pushes it to every connected client, folding in a
+    // pending preset-change event as a "lastChange" field when one hasn't
+    // been delivered yet.
     void broadcast() {
+        QcPresetChangeEvent change{};
+        bool includeChange = false;
         size_t length = 0;
         etl::vector<int, kMaxWsClients> sockets;
         {
             ScopedKMutex lock(dataMutex_);
-            length = catalogJson_.size();
+            if (catalogDirty_) {
+                encodeCatalogJson(catalogSnapshot_, catalogJson_);
+                catalogDirty_ = false;
+            }
+            if (changePending_) {
+                change = lastChangeEvent_;
+                includeChange = true;
+                changePending_ = false;
+            }
             broadcastJson_.assign(catalogJson_.begin(), catalogJson_.end());
+            if (includeChange) {
+                appendLastChange(change, broadcastJson_);
+            }
+            length = broadcastJson_.size();
             sockets = wsSockets_;
         }
 
@@ -177,6 +257,69 @@ private:
         }
     }
 
+    // Rewrites broadcastJson_'s trailing "}" into
+    // ,"lastChange":{"command":N,"count":M}} - broadcastJson_ is always a
+    // complete, non-empty JSON object at this point (encodeCatalogJson()'s
+    // own guarantee), so it always ends in "}".
+    template <size_t N>
+    static void appendLastChange(const QcPresetChangeEvent& event, etl::vector<char, N>& out) {
+        if (!out.empty()) {
+            out.pop_back();
+        }
+        detail::appendLiteral(",\"lastChange\":{\"command\":", out);
+        detail::appendUInt(event.command, out);
+        detail::appendLiteral(",\"count\":", out);
+        detail::appendUInt(event.count, out);
+        detail::appendLiteral("}}", out);
+    }
+
+    // PR #74 review: this worker previously only ever woke to broadcast,
+    // so Zephyr handed it an upgraded socket (handleWsSetup()) that was
+    // then never read from again - a closed browser tab left its slot
+    // occupied (both of kMaxWsClients' worth) until an unrelated broadcast
+    // happened to fail a send to it. Runs every run() wake (see
+    // kPollIntervalMs), draining any pending frame per connected socket
+    // without blocking, replying to pings, and unregistering anything
+    // closed or erroring.
+    void pollWsClients() {
+        etl::vector<int, kMaxWsClients> sockets;
+        {
+            ScopedKMutex lock(dataMutex_);
+            sockets = wsSockets_;
+        }
+
+        for (const int sock : sockets) {
+            uint32_t messageType = 0;
+            uint64_t remaining = 0;
+            // websocket_recv_msg()'s timeout is a plain millisecond count
+            // (int32_t), not a k_timeout_t - 0 means "don't block" (it
+            // becomes K_MSEC(0) internally), same as every other call
+            // below that passes a millisecond literal.
+            const int received = websocket_recv_msg(sock, wsRecvBuffer_, sizeof(wsRecvBuffer_),
+                                                     &messageType, &remaining, 0);
+            if (received == -EAGAIN) {
+                continue;  // Nothing pending - the common case.
+            }
+            if (received < 0) {
+                LOG_INF("Websocket client %d closed (err=%d), dropping", sock, received);
+                removeWsClient(sock);
+                (void)websocket_unregister(sock);
+                continue;
+            }
+            if (messageType & WEBSOCKET_FLAG_CLOSE) {
+                LOG_INF("Websocket client %d sent close, dropping", sock);
+                removeWsClient(sock);
+                (void)websocket_unregister(sock);
+            } else if (messageType & WEBSOCKET_FLAG_PING) {
+                (void)websocket_send_msg(sock, wsRecvBuffer_, static_cast<size_t>(received),
+                                         WEBSOCKET_OPCODE_PONG, /*mask=*/false, /*final=*/true,
+                                         2000);
+            }
+            // Any other inbound frame (the page never sends data messages
+            // today) is simply drained above and otherwise ignored.
+        }
+    }
+
     void addWsClient(int sock) {
         ScopedKMutex lock(dataMutex_);
         if (wsSockets_.full()) {
@@ -194,50 +337,43 @@ private:
         }
     }
 
-    // The NXP Wi-Fi driver never auto-starts a DHCPv4 server for AP mode
-    // (confirmed against its source, drivers/wifi/nxp/src/nxp_wifi_net.c -
-    // only CONFIG_WIFI_STA_AUTO_DHCPV4's *client* path exists) - without
-    // this, a joining phone/laptop has no way to get an IP address other
-    // than unreliable link-local/APIPA fallback. Static IP + pool start
-    // address modeled directly on Zephyr's own samples/net/wifi/apsta_mode
-    // sample's enable_dhcpv4_server(), the one confirmed-working reference
-    // for this exact driver/board combination. kApAddressPool's last
-    // octet (.11) leaves .1-.10 free for the AP's own static address and
-    // any future static reservations, same convention as that sample.
-    static constexpr const char* kApIpAddress = "192.168.4.1";
-    static constexpr const char* kApNetmask = "255.255.255.0";
-
-    void startAccessPointDhcp(net_if* iface) {
-        net_in_addr address{};
-        net_in_addr netmask{};
-        if (net_addr_pton(NET_AF_INET, kApIpAddress, &address) != 0) {
-            LOG_ERR("Invalid AP IP address %s", kApIpAddress);
-            return;
-        }
-        if (net_addr_pton(NET_AF_INET, kApNetmask, &netmask) != 0) {
-            LOG_ERR("Invalid AP netmask %s", kApNetmask);
-            return;
-        }
-
-        net_if_ipv4_set_gw(iface, &address);
-        if (net_if_ipv4_addr_add(iface, &address, NET_ADDR_MANUAL, 0) == nullptr) {
-            LOG_ERR("Unable to set static IP on the AP interface");
-            return;
-        }
-        if (!net_if_ipv4_set_netmask_by_addr(iface, &address, &netmask)) {
-            LOG_ERR("Unable to set netmask on the AP interface");
-        }
-
-        net_in_addr poolStart = address;
-        poolStart.s4_addr[3] += 10;
-        if (net_dhcpv4_server_start(iface, &poolStart) != 0) {
-            LOG_ERR("Failed to start DHCPv4 server for the AP interface");
-            return;
-        }
-        LOG_INF("AP static IP %s, DHCPv4 server pool starting at %u.%u.%u.%u", kApIpAddress,
-                poolStart.s4_addr[0], poolStart.s4_addr[1], poolStart.s4_addr[2], poolStart.s4_addr[3]);
-    }
-
+    // Hardware finding (ac601b2): the NXP Wi-Fi driver DOES auto-start its
+    // own DHCPv4 server for SoftAP - CONFIG_NXP_WIFI_SOFTAP_DHCP_SERVER
+    // defaults to y whenever CONFIG_NXP_WIFI_SOFTAP_SUPPORT is on (which
+    // itself defaults to y under CONFIG_WIFI_USAGE_MODE_AP), confirmed at
+    // drivers/wifi/nxp/src/nxp_wifi_drv.c's WLAN_REASON_UAP_SUCCESS case
+    // (net_dhcpv4_server_start(g_uap.netif, &base_addr), gated by that
+    // Kconfig). ADR 0009's original claim that the driver never does this
+    // was wrong - it was checked against the generic NXP Wi-Fi Kconfig
+    // text, not this specific code path.
+    //
+    // This class used to *also* set a static IP and start its own DHCPv4
+    // server on the same interface (net_if_get_wifi_sap(), the same
+    // net_if the driver's own g_uap.netif resolves to - there is only one
+    // SoftAP interface on this chip). That second start always failed
+    // with -EALREADY ("DHCPv4 server instance already running") - the
+    // exact "DHCP Server start failed" nxp_wifi error seen on hardware -
+    // and because the driver's own UAP-success handler returns early on
+    // that failure, it never reached the lines that set
+    // s_nxp_wifi_UapActivated/raise NET_EVENT_WIFI_AP_ENABLE_RESULT either,
+    // which is why no "AP enabled" line ever followed. Zephyr's own
+    // samples/net/wifi/apsta_mode sample independently reaches the same
+    // conclusion for this exact board: its frdm_rw612 overlay sets
+    // CONFIG_WIFI_SAMPLE_DHCPV4_START=n specifically because (per that
+    // option's own Kconfig help) "some vendors start the DHCPv4 server
+    // after Soft AP initialization" - this is that vendor.
+    //
+    // Fix: don't start a second DHCPv4 server at all. The IP range is
+    // configured once, via CONFIG_NXP_WIFI_SOFTAP_IP_ADDRESS/_MASK/_BASE
+    // (prj.conf), and the driver brings up the static IP and DHCPv4 server
+    // itself once WLAN_REASON_UAP_SUCCESS fires.
+    //
+    // What this does NOT establish: WLAN_REASON_UAP_SUCCESS firing (and
+    // the DHCP conflict log appearing) proves the chip firmware itself
+    // already reported the SoftAP as started *before* hitting this
+    // conflict - so whether removing the conflict alone is sufficient to
+    // make "QCRemote" visible to a scanning phone is unconfirmed from
+    // source and needs a fresh hardware run with this fix applied.
     void startAccessPoint() {
 #if defined(CONFIG_WIFI_USAGE_MODE_AP)
         net_if* iface = net_if_get_wifi_sap();
@@ -246,30 +382,36 @@ private:
             return;
         }
 
-        startAccessPointDhcp(iface);
-
         static const uint8_t kSsid[] = CONFIG_QC_WIFI_AP_SSID;
         static const uint8_t kPsk[] = CONFIG_QC_WIFI_AP_PSK;
         apParams_.ssid = kSsid;
         apParams_.ssid_length = sizeof(CONFIG_QC_WIFI_AP_SSID) - 1;
         apParams_.channel = WIFI_CHANNEL_ANY;
+        // SoftAP stays 2.4 GHz-only here, deliberately: the driver's own
+        // ACS only auto-picks a 5 GHz channel from this band hint (see
+        // nxp_wifi_drv.c's acs_band), and 5 GHz AP operation brings in
+        // DFS/regulatory channel-vacating requirements this firmware does
+        // nothing to handle - not the owner's decision, just this build
+        // not having done that work. Station mode (startStation(), below)
+        // carries no such restriction.
         apParams_.band = WIFI_FREQ_BAND_2_4_GHZ;
         if (sizeof(CONFIG_QC_WIFI_AP_PSK) > 1) {
             apParams_.psk = kPsk;
             apParams_.psk_length = sizeof(CONFIG_QC_WIFI_AP_PSK) - 1;
             apParams_.security = WIFI_SECURITY_TYPE_PSK;
         } else {
-            LOG_WRN("CONFIG_QC_WIFI_AP_PSK is empty - starting an OPEN access point. Owner's "
-                    "decision (issue #71) is to use a WPA2 passphrase - set CONFIG_QC_WIFI_AP_PSK "
-                    "in a local wifi_credentials.conf (see wifi_credentials.conf.example).");
+            LOG_WRN("CONFIG_QC_WIFI_AP_PSK is empty - starting an OPEN access point. Set "
+                    "CONFIG_QC_WIFI_AP_PSK in a local wifi_credentials.conf (see "
+                    "wifi_credentials.conf.example) for a WPA2-protected AP instead.");
             apParams_.security = WIFI_SECURITY_TYPE_NONE;
         }
 
+        LOG_INF("Wi-Fi AP \"%s\" starting (DHCPv4 server is driver-managed - "
+                "CONFIG_NXP_WIFI_SOFTAP_IP_ADDRESS=%s)",
+                CONFIG_QC_WIFI_AP_SSID, CONFIG_NXP_WIFI_SOFTAP_IP_ADDRESS);
         const int ret = net_mgmt(NET_REQUEST_WIFI_AP_ENABLE, iface, &apParams_, sizeof(apParams_));
         if (ret != 0) {
             LOG_ERR("NET_REQUEST_WIFI_AP_ENABLE failed: %d", ret);
-        } else {
-            LOG_INF("Wi-Fi AP \"%s\" starting", CONFIG_QC_WIFI_AP_SSID);
         }
 #endif
     }
@@ -294,7 +436,14 @@ private:
         staParams_.ssid = kSsid;
         staParams_.ssid_length = sizeof(CONFIG_QC_WIFI_STA_SSID) - 1;
         staParams_.channel = WIFI_CHANNEL_ANY;
-        staParams_.band = WIFI_FREQ_BAND_2_4_GHZ;
+        // No band hint here, deliberately (ADR 0009 originally hardcoded
+        // WIFI_FREQ_BAND_2_4_GHZ as "the owner's decision" - the owner
+        // never asked for that; they only said 2.4 GHz reliability wasn't
+        // a concern). Confirmed by reading nxp_wifi_connect()
+        // (drivers/wifi/nxp/src/nxp_wifi_drv.c): the station connect path
+        // never reads params->band at all - only params->channel/
+        // chan_list - so this field was always a no-op for station mode
+        // on this driver, never an actual 2.4 GHz-only restriction.
         staParams_.psk = kPsk;
         staParams_.psk_length = sizeof(CONFIG_QC_WIFI_STA_PSK) - 1;
         staParams_.security =
@@ -314,19 +463,54 @@ private:
         }
     }
 
-    void onWifiEvent(uint64_t mgmtEvent, net_if* /*iface*/, net_mgmt_event_callback* cb) {
+    // PR #74 review / hardware finding (ac601b2): this used to log
+    // "connected"/"AP enabled" unconditionally on these events, regardless
+    // of outcome - which is exactly why the serial console showed "Wi-Fi
+    // station connected" immediately around a logged "authentication
+    // failed" warning on real hardware: the driver raises
+    // NET_EVENT_WIFI_CONNECT_RESULT with a non-zero wifi_status on a
+    // failed (re)association too (drivers/wifi/nxp/src/nxp_wifi_drv.c,
+    // WLAN_REASON_NETWORK_AUTH_FAILED ->
+    // wifi_mgmt_raise_connect_result_event(iface,
+    // WIFI_STATUS_CONN_WRONG_PASSWORD)), and this handler never looked at
+    // the event's own status field. Note the driver's own comment on that
+    // status value: it's raised for *any* 4-way-handshake failure
+    // (including lost EAPoL frames), not only an actually-wrong
+    // passphrase - logging the raw status/reason codes rather than
+    // renaming it is deliberate, so a real wrong password and a
+    // handshake-timing failure aren't conflated in the log either.
+    void onWifiEvent(uint64_t mgmtEvent, net_if* iface, net_mgmt_event_callback* cb) {
+        const auto* status = static_cast<const wifi_status*>(cb->info);
         switch (mgmtEvent) {
         case NET_EVENT_WIFI_CONNECT_RESULT:
-            LOG_INF("Wi-Fi station connected");
+            if (status != nullptr && status->conn_status == WIFI_STATUS_CONN_SUCCESS) {
+                LOG_INF("Wi-Fi station connected: %s", wifi_conn_status_txt(status->conn_status));
+                logReadySummary(iface, /*isAp=*/false);
+            } else {
+                LOG_WRN("Wi-Fi station connect failed: %s (status_code=%u, reason_code=%u)",
+                        status != nullptr ? wifi_conn_status_txt(status->conn_status) : "unknown",
+                        status != nullptr ? status->status_code : 0U,
+                        status != nullptr ? status->reason_code : 0U);
+            }
             break;
         case NET_EVENT_WIFI_DISCONNECT_RESULT:
-            LOG_INF("Wi-Fi station disconnected");
+            LOG_INF("Wi-Fi station disconnected: %s",
+                    status != nullptr ? wifi_disconn_reason_txt(status->disconn_reason) : "unknown");
             break;
         case NET_EVENT_WIFI_AP_ENABLE_RESULT:
-            LOG_INF("Wi-Fi AP enabled - waiting for a station to join");
+            if (status != nullptr && status->ap_status == WIFI_STATUS_AP_SUCCESS) {
+                LOG_INF("Wi-Fi AP enabled - waiting for a station to join");
+                logReadySummary(iface, /*isAp=*/true);
+            } else {
+                LOG_ERR("Wi-Fi AP enable failed: ap_status=%d (status_code=%u, reason_code=%u)",
+                        status != nullptr ? static_cast<int>(status->ap_status) : -1,
+                        status != nullptr ? status->status_code : 0U,
+                        status != nullptr ? status->reason_code : 0U);
+            }
             break;
         case NET_EVENT_WIFI_AP_DISABLE_RESULT:
-            LOG_INF("Wi-Fi AP disabled");
+            LOG_INF("Wi-Fi AP disabled (ap_status=%d)",
+                    status != nullptr ? static_cast<int>(status->ap_status) : -1);
             break;
         case NET_EVENT_WIFI_AP_STA_CONNECTED: {
             const auto* info = static_cast<const wifi_ap_sta_info*>(cb->info);
@@ -345,22 +529,69 @@ private:
         }
     }
 
+    // Issue #71's "add a clear startup summary" requirement: one line as
+    // soon as start() has issued the AP/STA request and started the HTTP
+    // server, reporting what's known synchronously (mode, SSID, HTTP
+    // server start result). The interface/IP/DHCP side of the picture
+    // isn't known yet at this point - logReadySummary() below reports that
+    // once the relevant NET_EVENT_WIFI_* result actually arrives.
+    void logStartupSummary() {
+#if defined(CONFIG_WIFI_USAGE_MODE_AP)
+        LOG_INF("Startup summary: mode=AP ssid=\"%s\" http_server=%s port=%u",
+                CONFIG_QC_WIFI_AP_SSID, httpServerStarted_ ? "listening" : "FAILED TO START",
+                g_qcWebPort);
+#else
+        LOG_INF("Startup summary: mode=STA ssid=\"%s\" http_server=%s port=%u",
+                sizeof(CONFIG_QC_WIFI_STA_SSID) > 1 ? CONFIG_QC_WIFI_STA_SSID : "(none configured)",
+                httpServerStarted_ ? "listening" : "FAILED TO START", g_qcWebPort);
+#endif
+    }
+
+    // Called once the interface actually reports success (AP enabled, or
+    // station connected) - reports the interface's current IPv4 address
+    // (if any yet) and a ready-to-browse URL, or says plainly that no
+    // address has been assigned yet.
+    void logReadySummary(net_if* iface, bool isAp) {
+        const net_in_addr* addr =
+            iface != nullptr ? net_if_ipv4_get_global_addr(iface, NET_ADDR_PREFERRED) : nullptr;
+        char ipStr[NET_IPV4_ADDR_LEN] = "none yet";
+        if (addr != nullptr) {
+            net_addr_ntop(NET_AF_INET, addr, ipStr, sizeof(ipStr));
+        }
+        LOG_INF("Startup summary: mode=%s iface=%s ip=%s dhcp=%s http_server=%s url=http://%s/",
+                isAp ? "AP" : "STA", iface != nullptr && net_if_is_up(iface) ? "up" : "down", ipStr,
+                isAp ? "driver-managed (CONFIG_NXP_WIFI_SOFTAP_DHCP_SERVER)"
+                     : "Zephyr DHCPv4 client (CONFIG_WIFI_STA_AUTO_DHCPV4)",
+                httpServerStarted_ ? "listening" : "FAILED TO START",
+                addr != nullptr ? ipStr : "<pending>");
+    }
+
     static QcWifiWebTransport* instance_;
 
     k_thread thread_{};
     K_KERNEL_STACK_MEMBER(stack_, 2048);
     bool threadStarted_ = false;
+    bool httpServerStarted_ = false;
     k_sem broadcastSem_{};
 
     k_mutex dataMutex_{};
     // Member storage, not stack - see CODING_STANDARDS.md's "big objects
     // never go on a thread's stack" rule and ADR 0008's own reasoning.
-    // catalogJson_ is also what GET /api/presets.json serves directly;
-    // broadcastJson_ is the worker thread's own copy, so a slow send never
-    // holds dataMutex_ (see broadcast()'s own comment).
+    // catalogSnapshot_ is the source of truth QcSession hands us
+    // (publishCatalog()); catalogJson_ is its encoded form, re-derived on
+    // qc_wifi_web (broadcast()) and also what GET /api/presets.json
+    // serves (via its own responseJson_ copy - see handlePresetsGet());
+    // broadcastJson_ is the worker thread's own send copy, so a slow send
+    // never holds dataMutex_.
+    QcCatalogSnapshot catalogSnapshot_{};
+    bool catalogDirty_ = false;
     etl::vector<char, kJsonCapacity> catalogJson_;
     etl::vector<char, kJsonCapacity> broadcastJson_;
+    etl::vector<char, kJsonCapacity> responseJson_;
     etl::vector<int, kMaxWsClients> wsSockets_;
+    QcPresetChangeEvent lastChangeEvent_{};
+    bool changePending_ = false;
+    uint8_t wsRecvBuffer_[256]{};
 
     net_mgmt_event_callback netMgmtCb_{};
     wifi_connect_req_params apParams_{};
@@ -374,7 +605,8 @@ namespace detail {
 // Kept small and embedded on purpose (issue #71: "doesn't need to look
 // like the Quad Cortex yet") - fetches the catalog once on load, then
 // re-renders from either the fetch or any websocket push using the same
-// JSON shape (QcCatalogJson.hpp).
+// JSON shape (QcCatalogJson.hpp), plus an optional "lastChange" field a
+// websocket push may carry (see QcWifiWebTransport::appendLastChange()).
 inline constexpr const char kIndexHtml[] = R"HTML(<!doctype html>
 <html><head><meta charset="utf-8"><title>QC Remote (Wi-Fi test)</title>
 <style>
@@ -401,6 +633,7 @@ function render(d){
   el.innerHTML=html;
   var s='presets: '+d.presetCount+' (generation '+d.generation+')';
   if(d.incomplete){ s+=' - listing may be incomplete'; }
+  if(d.lastChange){ s+=' - preset change (cmd '+d.lastChange.command+', #'+d.lastChange.count+')'; }
   document.getElementById('status').textContent=s;
 }
 function escapeHtml(s){
@@ -454,8 +687,6 @@ inline http_resource_detail_websocket g_qcWsResourceDetail{
     .data_buffer_len = sizeof(g_qcWsDataBuffer),
     .user_data = nullptr,
 };
-
-inline uint16_t g_qcWebPort = 80;
 
 // HTTP_SERVICE_DEFINE/HTTP_RESOURCE_DEFINE's per-service iterable-section
 // start/end symbols (STRUCT_SECTION_ITERABLE_ALTERNATE, zephyr/sys/
