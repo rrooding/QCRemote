@@ -23,7 +23,14 @@ namespace qcbridge {
 // heartbeat thread.
 class QcFileStream {
 public:
-    static constexpr int64_t kQuietWindowMs = 1500;
+    // issue #33 (ADR 0007): was 1500ms. A hardware run (commit 147fb48)
+    // found that too short - a genuine pause mid-reply, more than 1500ms
+    // but still part of the same reply, looked like the stream ending, and
+    // the real tail that followed got miscounted as a separate request's
+    // reply. 5000ms (first used as this issue's own measurement window,
+    // then kept through every subsequent hardware run with no recurrence of
+    // that problem) is the value with actual evidence behind it.
+    static constexpr int64_t kQuietWindowMs = 5000;
     static constexpr int64_t kOverallTimeoutMs = 30000;
 
     struct Summary {
@@ -36,7 +43,12 @@ public:
         // ones only - see maxWireBytes/maxInflatedBytes member comments
         // below for why a message dropped for being too big never reaches
         // here at all, and so can understate the real peak). What #33's
-        // buffer sizing actually needs.
+        // buffer sizing actually needs. maxInflatedBytes is the one
+        // exception to "inflated ones only": onInflateFailed() below folds
+        // in a failed inflate's true size too, when its gzip trailer's
+        // ISIZE field was readable (QcGzip.hpp's peekDecompressedSize()) -
+        // that's a real, known inflated size even though the bytes
+        // themselves were never produced.
         size_t maxWireBytes = 0;
         size_t maxInflatedBytes = 0;
         int64_t elapsedMs = 0;
@@ -94,9 +106,15 @@ public:
 
     // A File message whose gzip payload failed to inflate (QcGzip.hpp) -
     // e.g. it exceeded kMaxInflatedSize. Still real traffic: counts toward
-    // the stream and resets the quiet window, just with no inflated size to
-    // add (see "Why the sizes matter" in issue #60).
-    void onInflateFailed(int64_t nowMs, size_t wireSize) {
+    // the stream and resets the quiet window. totalInflatedBytes isn't
+    // credited (no bytes were actually produced), but maxInflatedBytes_
+    // still tracks `trueInflatedSize` when the caller could read it off the
+    // gzip trailer without decompressing (QcGzipInflater.hpp /
+    // QcGzip.hpp's peekDecompressedSize(), issue #33) - a real hardware
+    // `RecallPreset` that was too big for kMaxInflatedSize is exactly why
+    // this matters for sizing a real buffer.
+    void onInflateFailed(int64_t nowMs, size_t wireSize,
+                         std::optional<size_t> trueInflatedSize = std::nullopt) {
         if (!active_) {
             return;
         }
@@ -104,6 +122,9 @@ public:
         ++failedCount_;
         totalWireBytes_ += wireSize;
         maxWireBytes_ = std::max(maxWireBytes_, wireSize);
+        if (trueInflatedSize) {
+            maxInflatedBytes_ = std::max(maxInflatedBytes_, *trueInflatedSize);
+        }
         lastMessageAtMs_ = nowMs;
     }
 

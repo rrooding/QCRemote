@@ -8,9 +8,10 @@
 
 namespace qcbridge {
 
-// CortexMessageType.Enum command id for File (protocol.py's COMMANDS map;
-// issue #9's directory read).
-inline constexpr uint16_t kCommandFile = 4;
+// File's CortexMessageType.Enum command id lives in QcFileRequest.hpp
+// (kCommandFile) - not redeclared here to avoid a redefinition error in any
+// translation unit that includes both (this decoder has no need for the
+// command id itself; only the request encoder does).
 
 // FileMessage.type values (qc-mcp's directory.py FILE_TYPE). Only Presets is
 // in scope here - IRs/Captures folders exist in the same stream but aren't

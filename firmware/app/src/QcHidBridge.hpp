@@ -23,10 +23,18 @@ inline constexpr uint8_t kQuadCortexHidInterface = 5;
 // header dependency at all.
 inline constexpr uint8_t kUsbBaseClassHid = 0x03;
 
-// Placeholder pending issue #33's actual sizing exercise - generous enough
-// for any MVP1 message (Version, Connection, ResetCommsBuffers, KeepAlive,
-// ModelRepo, SetlistPosition) without having measured them yet.
-inline constexpr size_t kReassemblyCapacity = 4096;
+// issue #33's final sizing (ADR 0007): must hold a worst-case File folder
+// message, not just the owner's own 10193-byte `My Presets` (21 named, 235
+// empty slots) under `omit_factory_content=true`. A folder maxes out at 256
+// slots (confirmed on hardware: My Presets and Practice are both 256), and
+// a fully-named one costs far more per slot than an empty one (qc-mcp's
+// ProductData has 21 fields - name, author, tags, dates, cloud/version ids,
+// dependencies, ... - vs. an empty slot's bare index). 131072 bytes
+// (128 KiB) budgets ~511 bytes/slot for 256 named presets, comfortably above
+// the ~414 bytes/named-slot the real 10193-byte message implies once the
+// 235 near-empty slots' own small cost is subtracted - see ADR 0007 for the
+// full arithmetic and the RAM cost this carries.
+inline constexpr size_t kReassemblyCapacity = 131072;
 
 // Claims the Quad Cortex Mini's vendor HID interface (interface 5), rejects
 // every other interface the composite device exposes, and reassembles
@@ -82,12 +90,12 @@ protected:
             // is filtered out at the default level and so never actually
             // formats) really does run cbprintf synchronously on that
             // 1536-byte stack - the exact pattern that overflowed it once
-            // already (see QcSession.hpp's handleMessage() comment). An
-            // atomic counter costs nothing there; session_.recordReassemblyOverflow()
-            // surfaces the count through QcFileStream's summary instead
-            // (the known gap documented in firmware/README.md's issue #60
-            // section).
-            session_.recordReassemblyOverflow();
+            // already (see QcSession.hpp's handleMessage() comment). Atomic
+            // counters cost nothing there; session_.recordReassemblyOverflow()
+            // surfaces them (count + largest size seen) through the
+            // heartbeat thread instead - see QcSession.hpp's
+            // checkTrafficHealth().
+            session_.recordReassemblyOverflow(reassembler_.overflowSize());
             break;
         case Status::Malformed:
             session_.recordReassemblyMalformed();

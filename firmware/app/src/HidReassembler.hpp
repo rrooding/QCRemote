@@ -37,13 +37,26 @@ enum class HidReportFlag : uint8_t {
 // issue #33 for the actual sizing exercise. Not yet instantiated anywhere
 // in the real transport (that's the still-open part of #4 - see usbh_shim.c);
 // this file and its Ztest suite (tests/hid_framing) stand on their own.
+//
+// Issue #33's measurement step: a message whose true size exceeds Capacity
+// no longer aborts the moment that's detected (the original behavior silently
+// dropped the rest of the message, which meant every MIDDLE/LAST report that
+// followed for it had no preceding FIRST and miscounted as a second,
+// unrelated failure - see Status::Malformed below and the real hardware
+// numbers in firmware/README.md's #60/#61 section: overflow=31 but
+// malformed=2850, almost all of which were exactly this). Instead it keeps
+// consuming reports - without growing the stored body past Capacity - until
+// the LAST/SINGLE report completes it, tracking the message's true total
+// size via overflowSize() below.
 template <size_t Capacity>
 class HidReassembler {
 public:
     enum class Status {
         InProgress,  // fed a FIRST or MIDDLE report, message isn't complete yet
         Complete,    // fed a LAST or SINGLE report - message() is valid now
-        Overflow,    // message would exceed Capacity; reset, nothing retained
+        Overflow,    // fed a LAST or SINGLE report, but the true size exceeded
+                     // Capacity at some point during assembly - message() is
+                     // NOT valid; overflowSize()/overflowTrailer() are instead
         Malformed,   // bad chunk length, or a MIDDLE/LAST with no preceding FIRST
     };
 
@@ -72,19 +85,44 @@ public:
 
         if (isFirst) {
             buffer_.clear();
-        } else if (buffer_.empty()) {
-            // A MIDDLE/LAST with no preceding FIRST: out of order, or we
-            // missed the FIRST. Nothing sane to reassemble.
+            overflowing_ = false;
+            overflowSize_ = 0;
+        } else if (buffer_.empty() && !overflowing_) {
+            // A MIDDLE/LAST with no preceding FIRST, and not a continuation
+            // of a message already overflowing (see below): out of order,
+            // or we missed the FIRST. Nothing sane to reassemble.
             return fail();
         }
 
-        if (buffer_.size() + chunkLen > Capacity) {
-            buffer_.clear();
-            return Status::Overflow;
+        const auto chunk = report.subspan(kHidHeaderSize, chunkLen);
+
+        if (overflowing_) {
+            // Already past Capacity for this message - keep tracking its
+            // true size, but don't touch buffer_ (it was cleared, and stays
+            // empty, the moment overflow began below).
+            overflowSize_ += chunkLen;
+            if (isLast) {
+                overflowing_ = false;
+                return Status::Overflow;
+            }
+            return Status::InProgress;
         }
 
-        buffer_.insert(buffer_.end(), report.begin() + kHidHeaderSize,
-                       report.begin() + kHidHeaderSize + chunkLen);
+        if (buffer_.size() + chunkLen > Capacity) {
+            // Transition into overflow: the true size so far (whatever was
+            // already in buffer_, plus this chunk) is tracked from here on
+            // instead of the body itself.
+            overflowing_ = true;
+            overflowSize_ = buffer_.size() + chunkLen;
+            buffer_.clear();
+            if (isLast) {
+                overflowing_ = false;
+                return Status::Overflow;
+            }
+            return Status::InProgress;
+        }
+
+        buffer_.insert(buffer_.end(), chunk.begin(), chunk.end());
 
         return isLast ? Status::Complete : Status::InProgress;
     }
@@ -92,13 +130,21 @@ public:
     // Valid only right after feed() returns Complete.
     std::span<const uint8_t> message() const { return {buffer_.data(), buffer_.size()}; }
 
+    // Valid only right after feed() returns Overflow: the message's true
+    // total size (report headers excluded), which Capacity could not hold.
+    size_t overflowSize() const { return overflowSize_; }
+
 private:
     Status fail() {
         buffer_.clear();
+        overflowing_ = false;
+        overflowSize_ = 0;
         return Status::Malformed;
     }
 
     etl::vector<uint8_t, Capacity> buffer_;
+    bool overflowing_ = false;
+    size_t overflowSize_ = 0;
 };
 
 }  // namespace qcbridge

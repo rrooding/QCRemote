@@ -676,6 +676,69 @@ What a few of the summary fields mean, for issue #33's sizing work:
   thread's name appears in the dump (`qc_dispatch`, `qc_gzip_inflate`, `qc_session`,
   `qc_heartbeat`, or `usbh` itself).
 
+## File reassembly/inflate buffer sizing (issue #33)
+
+Issue #33 asked for real sizes for `kReassemblyCapacity` (`QcHidBridge.hpp`), the dispatcher
+mailbox (`QcDispatcher.hpp`), and `kMaxCompressedInputSize`/`kMaxInflatedSize` (`QcGzip.hpp`) -
+all originally 4096/4096/4096/16384, placeholders with no real traffic measured against them.
+Getting there took several hardware rounds (measuring the original placeholders' overflow by
+command, then testing whether `FileMessage` READ's `short_listing`/`omit_factory_content`
+options could shrink the listing before sizing anything) - that measurement history, the
+hardware evidence it produced, and the final sizing decision are all in
+[ADR 0007](../docs/adr/0007-file-reassembly-buffer-sizing.md). This section covers only the
+**final, shipped behavior** and what's confirmed on hardware for it.
+
+**Decision**: `FileMessage` READ always sends `omit_factory_content=true` (confirmed on
+hardware to shrink the owner's listing from ~550 messages/~716KB to 20 messages/~30KB while
+still naming every user/cloud preset - `short_listing` measured no effect and is no longer
+sent). `kReassemblyCapacity`/the dispatcher mailbox are 131072 bytes (128 KiB, sized for a
+worst-case fully-named 256-preset folder, not just the owner's own mostly-empty one).
+`kMaxInflatedSize` is 32768 bytes (32 KiB); `kMaxCompressedInputSize` is 8192 bytes. The
+measurement-only variant experiment, its per-folder tables, `CONFIG_THREAD_ANALYZER`, and the
+per-command overflow/size tallies that existed only to gather sizing evidence are all removed.
+`ModelRepo`/`ModuleStats` replies are now ignored outright (counted, not buffered) rather than
+dispatched - the preset listing doesn't need either, and both are large enough (59219/28354
+bytes, measured) that buffering them cost real RAM and gzip-inflater contention for no benefit.
+See ADR 0007 for the full reasoning, including the RAM cost this carries (measured: 371272 /
+983040 bytes, 37.77%, up from the pre-#33 baseline's 9.95% - a real, deliberate tradeoff worth
+weighing against issue #34's note that a smaller board is a possible later move) and the
+stack-margin re-check for every thread that touches these buffers.
+
+**What's confirmed on hardware, and what isn't.** Every hardware number ADR 0007 cites (the
+~550-message default listing, the 20-message `omit_factory_content` listing, the 10193-byte
+largest message, the 22667-byte `RecallPreset`, the `ModelRepo`/`ModuleStats` overflow sizes,
+the three stack overflows this issue found and fixed along the way) came from real runs against
+*earlier* commits of this PR - each one a smaller, targeted change, individually verified on
+hardware before the next step. **This PR's final tip - the cleaned-up build with the sizes
+above, the ModelRepo/ModuleStats ignore change, the always-5000ms quiet window, and the
+simplified `HidReassembler`/`QcSession` this ADR describes - has not itself been run on real
+hardware.** It differs from every commit that was actually flashed: smaller (the whole
+measurement scaffold is gone) but also different in a few real ways (no more per-variant
+sending, `ModelRepo`/`ModuleStats` no longer reach the dispatcher at all, the reassembly/gzip
+buffers are bigger than any previously-tested build used). Treat it as "built from
+hardware-verified pieces," not "hardware-verified as a whole," until the smoke test below runs
+on a real unit.
+
+### Smoke test for the next hardware run
+
+1. Flash this build. Handshake should complete and mirror firmware version `4.1.1`, same as
+   every prior run on this unit.
+2. The `File` stream should finish **quiet** (not timeout) with **about 20 messages**, no
+   `File stream limits:` line showing a nonzero `dropped`/`reassembly overflow`/`malformed`
+   count - a nonzero count there means the listing is incomplete. `My Presets` (21 presets),
+   `Practice` (2 presets), and `cloud-0-1` should all be present in that count (not printed by
+   this firmware - printing the decoded list is issue #10's job, not this one's).
+3. Changing the active preset, **including to "Practice 1"** (the ~22667-byte `RecallPreset`
+   this issue sized `kMaxInflatedSize` against), should inflate successfully - no
+   `Inflate failed ... OutputTooLarge` line for it.
+4. No crash, and no `Traffic drop/overflow:` log line, over a couple of minutes of normal use
+   (idle plus at least one preset change) after the stream finishes.
+
+Any deviation from the above - a `File stream limits:` line with a nonzero count, an
+`OutputTooLarge` on a real preset recall, or a crash - is worth a comment on #33 with the full
+log before assuming the sizing is wrong; it may instead be a bug in this cleanup pass itself
+(this build hasn't run on hardware at all yet, per the note above).
+
 ## Not yet done
 
 - ETL is wired in via CMake `FetchContent` (see `app/CMakeLists.txt`) but not yet used by

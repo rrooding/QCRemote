@@ -107,6 +107,22 @@ public:
             return;
         }
 
+        // issue #33 (ADR 0007): ModelRepo/ModuleStats replies can be tens
+        // of KB (a real hardware run saw ModelRepo at 59219 bytes,
+        // ModuleStats at 28354) and the preset listing doesn't need them -
+        // issue #61's post-connect state READs (see runHandshake()) just
+        // need to go out, not be buffered or dispatched here. Counted and
+        // dropped before the gzip-magic check or either worker's mailbox,
+        // so a reply to either can never consume the dispatcher/gzip-
+        // inflater's single in-flight slot - see checkTrafficHealth()'s
+        // comment on the gzip-mailbox drops a full (pre-omit_factory_content)
+        // catalog listing used to show. Atomic increment only - usbh-safe,
+        // same contract as the rest of this function.
+        if (decoded->command == kCommandModelRepo || decoded->command == kCommandModuleStats) {
+            ignoredLargeCommandCount_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
         if (gzip::hasMagic(decoded->protoBytes)) {
             gzipInflater_.submit(decoded->command, decoded->protoBytes, message.size());
             return;
@@ -126,49 +142,55 @@ public:
         }
 
         if (command == kCommandFile) {
-            // LOG_DBG, not LOG_INF: a File stream is ~400 of these over
-            // ~12s (issue #60) - see QcFileStream.hpp's summary, logged at
-            // LOG_INF, for the readable, once-per-stream version of this.
+            // LOG_DBG, not LOG_INF: a File stream is ~20 of these over a
+            // few seconds (issue #33: omit_factory_content=true shrank it
+            // from issue #60's ~550) - see QcFileStream.hpp's summary,
+            // logged at LOG_INF, for the readable, once-per-stream version
+            // of this.
             LOG_DBG("File message: wire=%zu inflated=%zu compressed=%d", wireSize, inflatedSize,
                     compressed);
         }
 
-        // messageTally_ records every command, not just File - see its own
-        // header comment (issue #60's hardware debugging: a run with zero
-        // File messages couldn't otherwise tell "the device sent nothing"
-        // apart from "the device sent something else").
         ScopedKMutex lock(fileStreamMutex_);
-        messageTally_.record(command);
+        // postStreamTally_ records every command, not just File (issue
+        // #61) - see its own start() call site for why.
         postStreamTally_.record(command);
-        if (command == kCommandFile) {
+        if (command == kCommandFile && fileStream_.isActive()) {
             fileStream_.onMessage(k_uptime_get(), wireSize, inflatedSize, compressed);
         }
     }
 
-    void onInflateFailed(uint16_t command, size_t wireSize, const char* reason) override {
+    void onInflateFailed(uint16_t command, size_t wireSize, const char* reason,
+                          std::optional<size_t> advertisedInflatedSize) override {
         if (command == kCommandFile) {
             LOG_WRN("File message failed to inflate (wire=%zu bytes): %s", wireSize, reason);
         }
 
         ScopedKMutex lock(fileStreamMutex_);
-        messageTally_.record(command);
         postStreamTally_.record(command);
-        if (command == kCommandFile) {
-            fileStream_.onInflateFailed(k_uptime_get(), wireSize);
+        if (command == kCommandFile && fileStream_.isActive()) {
+            fileStream_.onInflateFailed(k_uptime_get(), wireSize, advertisedInflatedSize);
         }
     }
 
     // Called from QcHidBridge::onReportIn() on the `usbh` thread for
-    // HidReassembler::Status::Overflow/Malformed (issue #60's
-    // hardware-safety follow-up) - atomic increment only, same contract as
-    // handleMessage() above: no logging, nothing that can block. These
-    // drops happen before a command id is even known, so they can't be
-    // attributed to the File stream specifically the way
-    // dispatcher_/gzipInflater_'s drops can - see QcFileStream::Summary's
-    // comment on reassemblyOverflowCount/reassemblyMalformedCount for why
-    // they're still folded into that summary anyway, as a best-effort
-    // "this happened somewhere during the stream" figure.
-    void recordReassemblyOverflow() { reassemblyOverflowCount_.fetch_add(1, std::memory_order_relaxed); }
+    // HidReassembler::Status::Overflow - atomic increment only, same
+    // contract as handleMessage() above: no logging, nothing that can
+    // block. Folded into the File stream's summary (QcFileStream::Summary's
+    // reassemblyOverflowCount) at stream finish, and watched continuously by
+    // checkTrafficHealth() (issue #33 / ADR 0007) so an overflow after the
+    // stream is done - e.g. a preset push too big for kReassemblyCapacity -
+    // is still visible, not just the known gap during the listing itself.
+    void recordReassemblyOverflow(size_t trueSize) {
+        reassemblyOverflowCount_.fetch_add(1, std::memory_order_relaxed);
+        // Single writer (usbh) - no race to arbitrate, same reasoning as
+        // reassemblyOverflowCount_'s own fetch_add. A plain load-then-store
+        // instead of compare_exchange is safe because only this thread ever
+        // writes this value.
+        if (trueSize > reassemblyOverflowMaxSize_.load(std::memory_order_relaxed)) {
+            reassemblyOverflowMaxSize_.store(static_cast<uint32_t>(trueSize), std::memory_order_relaxed);
+        }
+    }
     void recordReassemblyMalformed() { reassemblyMalformedCount_.fetch_add(1, std::memory_order_relaxed); }
 
     // Called from QcHidBridge::onReportIn() on the `usbh` thread for every
@@ -298,9 +320,11 @@ private:
         // try/except - since one state READ failing to go out shouldn't
         // block the rest or the File READ that follows; the replies (if
         // any) are handled by the same generic dispatch path as every other
-        // message (QcDispatcher.hpp/QcGzipInflater.hpp), so a large or
-        // compressed ModelRepo reply that overflows kReassemblyCapacity or
-        // either mailbox is safely dropped and counted there, not crashed.
+        // message (QcDispatcher.hpp/QcGzipInflater.hpp), except ModelRepo
+        // and ModuleStats, which handleMessage() now ignores outright
+        // (issue #33 / ADR 0007) - the preset listing below doesn't need
+        // either, and both are large enough that buffering them would cost
+        // real RAM for no benefit.
         for (const uint16_t command : kPostConnectStateReadCommands) {
             msg.clear();
             encodeStateRead(msg, command, nextRequestId());
@@ -316,10 +340,16 @@ private:
         // the drop/overflow/malformed counters here, to diff against at
         // the stream's finish, scopes those (otherwise lifetime) counts to
         // this stream rather than everything since boot.
+        //
+        // issue #33 (ADR 0007): always sent with omit_factory_content=true
+        // (QcFileRequest.hpp) - a hardware measurement found this is the
+        // option that actually shrinks the listing (568 messages/~716KB
+        // down to 20/~30KB on the owner's unit) while still naming every
+        // user/cloud preset; a sibling option, short_listing, measured no
+        // effect at all and is no longer sent.
         {
             ScopedKMutex lock(fileStreamMutex_);
             fileStream_.start(k_uptime_get());
-            messageTally_.start();
             dispatcherDroppedAtStart_ = dispatcher_.droppedCount();
             gzipDroppedAtStart_ = gzipInflater_.droppedCount();
             reassemblyOverflowAtStart_ = reassemblyOverflowCount_.load(std::memory_order_relaxed);
@@ -379,12 +409,9 @@ private:
 
             // Piggybacks on the heartbeat's own ~200ms cadence rather than
             // running a separate timer - plenty of resolution against
-            // QcFileStream's 1500ms quiet window and 30s overall timeout,
+            // QcFileStream's 5000ms quiet window and 30s overall timeout,
             // and keeps this off the `usbh` thread (see handleMessage()).
             std::optional<QcFileStream::Summary> summary;
-            std::array<QcMessageTally::Entry, QcMessageTally::kMaxDistinctCommands> tallyEntries{};
-            size_t tallyEntryCount = 0;
-            uint32_t tallyOtherCount = 0;
             uint32_t totalInTransfersThisStream = 0;
             bool postStreamChanged = false;
             std::array<QcMessageTally::Entry, QcMessageTally::kMaxDistinctCommands> postStreamEntries{};
@@ -407,34 +434,6 @@ private:
                         reassemblyOverflowCount_.load(std::memory_order_relaxed) - reassemblyOverflowAtStart_;
                     summary->reassemblyMalformedCount =
                         reassemblyMalformedCount_.load(std::memory_order_relaxed) - reassemblyMalformedAtStart_;
-
-                    // Copy out before stop() so the log lines below don't
-                    // need the lock - see QcMessageTally.hpp.
-                    const auto entries = messageTally_.entries();
-                    tallyEntryCount = entries.size();
-                    for (size_t i = 0; i < tallyEntryCount; ++i) {
-                        tallyEntries[i] = entries[i];
-                    }
-                    tallyOtherCount = messageTally_.otherCount();
-                    messageTally_.stop();
-
-                    // issue #61's preset-change check needs visibility into
-                    // whatever arrives *after* the File stream, too (a
-                    // preset recall on the unit pushing RecallPreset/Scene/
-                    // SetlistPosition or similar) - messageTally_ above is
-                    // scoped to the stream and goes silent the moment it
-                    // stops. postStreamTally_ picks up right here and keeps
-                    // running for the rest of the session; see the
-                    // "changed since last logged" check below for how it's
-                    // reported without flooding the log if the device turns
-                    // out to stream something continuously (qc-mcp's own
-                    // comment: GlobalTempo/CPULoad stream ~3/s under an
-                    // active heartbeat, with or without a preset change).
-                    postStreamTally_.start();
-                    postStreamLoggedEntries_ = {};
-                    postStreamLoggedEntryCount_ = 0;
-                    postStreamLoggedOtherCount_ = 0;
-                    postStreamLastLoggedAtMs_ = k_uptime_get();
                 }
 
                 if (postStreamTally_.isActive()) {
@@ -479,52 +478,12 @@ private:
                 }
             }
             if (summary) {
-                LOG_INF("File stream finished (%s): %u messages (%u compressed, %u failed), "
-                        "%zu wire bytes, %zu inflated bytes, %d ms",
-                        summary->timedOut ? "timeout" : "quiet", summary->messageCount,
-                        summary->compressedCount, summary->failedCount, summary->totalWireBytes,
-                        summary->totalInflatedBytes, static_cast<int>(summary->elapsedMs));
-                // Separate line: sizing (#33) and data-loss figures. A
-                // non-zero dropped/overflow/malformed count here is the
-                // known gap (see firmware/README.md's issue #60 section) -
-                // not necessarily specific to File messages for the
-                // reassembly counters (they're counted before a command id
-                // is known), but real evidence of loss during this stream's
-                // window either way.
-                LOG_INF("File stream limits: max wire=%zu max inflated=%zu, dropped "
-                        "(dispatch=%u gzip=%u), reassembly (overflow=%u malformed=%u)",
-                        summary->maxWireBytes, summary->maxInflatedBytes, summary->dispatcherDropped,
-                        summary->gzipDropped, summary->reassemblyOverflowCount,
-                        summary->reassemblyMalformedCount);
-                // Diagnostic (issue #60's hardware debugging): every
-                // command actually seen during the window, not just File -
-                // disambiguates "the device sent nothing" from "the device
-                // sent something, just not File". totalInTransfersThisStream
-                // goes one layer lower still: it counts successful USB IN
-                // transfers regardless of whether the reassembler ever
-                // turned them into a counted message, so a run with 0
-                // messages of every kind above but a nonzero transfer count
-                // here means the device sent *something* that never made it
-                // past HidReassembler (overflow/malformed should also be
-                // nonzero in that case) - versus 0 transfers, which means
-                // nothing arrived on the wire at all.
-                LOG_INF("File stream tally: %u total IN transfers", totalInTransfersThisStream);
-                if (tallyEntryCount == 0 && tallyOtherCount == 0) {
-                    LOG_INF("File stream tally: no messages of any command seen in this window");
-                } else {
-                    for (size_t i = 0; i < tallyEntryCount; ++i) {
-                        LOG_INF("File stream tally: command=%u count=%u", tallyEntries[i].command,
-                                tallyEntries[i].count);
-                    }
-                    if (tallyOtherCount > 0) {
-                        LOG_INF("File stream tally: %u messages from other distinct commands "
-                                "(> %zu tracked)",
-                                tallyOtherCount, QcMessageTally::kMaxDistinctCommands);
-                    }
-                }
-                LOG_INF("Post-connect tally started: watching for preset-change pushes "
-                        "(RecallPreset/Scene/SetlistPosition/...) - issue #61");
+                logFileStreamSummary(*summary, totalInTransfersThisStream);
             }
+            // issue #33 / ADR 0007 (Copilot review): checked every tick,
+            // not just when the File stream finishes - see this function's
+            // own comment.
+            checkTrafficHealth();
             if (postStreamChanged) {
                 for (size_t i = 0; i < postStreamEntryCount; ++i) {
                     LOG_INF("Post-connect tally: command=%u count=%u", postStreamEntries[i].command,
@@ -537,6 +496,84 @@ private:
                 }
             }
         }
+    }
+
+    // Logs the File stream's one-line-pair finish summary (issue #33's
+    // final, concise shape - the per-command/per-folder measurement
+    // breakdowns this issue used to pick real sizes are gone now that
+    // they're picked; see ADR 0007) and starts issue #61's post-connect
+    // watch. Called from runHeartbeat() only when a stream just finished.
+    void logFileStreamSummary(const QcFileStream::Summary& summary, uint32_t totalInTransfersThisStream) {
+        LOG_INF("File stream finished (%s): %u messages (%u compressed, %u failed), %zu wire "
+                "bytes, %zu inflated bytes, %d ms",
+                summary.timedOut ? "timeout" : "quiet", summary.messageCount, summary.compressedCount,
+                summary.failedCount, summary.totalWireBytes, summary.totalInflatedBytes,
+                static_cast<int>(summary.elapsedMs));
+        // Dropped/overflow/malformed counts above zero here mean the
+        // listing is incomplete (issue #33's safety requirement) - not
+        // necessarily specific to File messages for the reassembly counters
+        // (they're counted before a command id is known), but real evidence
+        // of loss during this stream's window either way.
+        LOG_INF("File stream limits: max wire=%zu max inflated=%zu, dropped (dispatch=%u gzip=%u), "
+                "reassembly (overflow=%u malformed=%u), transfers=%u",
+                summary.maxWireBytes, summary.maxInflatedBytes, summary.dispatcherDropped,
+                summary.gzipDropped, summary.reassemblyOverflowCount, summary.reassemblyMalformedCount,
+                totalInTransfersThisStream);
+
+        LOG_INF("Post-connect tally started: watching for preset-change pushes "
+                "(RecallPreset/Scene/SetlistPosition/...) - issue #61");
+        // issue #61's preset-change check needs visibility into whatever
+        // arrives *after* the File stream, too (a preset recall on the unit
+        // pushing RecallPreset/Scene/SetlistPosition or similar) -
+        // postStreamTally_ picks up right here and keeps running for the
+        // rest of the session; see the "changed since last logged" check in
+        // runHeartbeat() for how it's reported without flooding the log if
+        // the device turns out to stream something continuously (qc-mcp's
+        // own comment: GlobalTempo/CPULoad stream ~3/s under an active
+        // heartbeat, with or without a preset change).
+        ScopedKMutex lock(fileStreamMutex_);
+        postStreamTally_.start();
+        postStreamLoggedEntries_ = {};
+        postStreamLoggedEntryCount_ = 0;
+        postStreamLoggedOtherCount_ = 0;
+        postStreamLastLoggedAtMs_ = k_uptime_get();
+    }
+
+    // issue #33 / ADR 0007 (Copilot PR review): dispatcherDropped_/
+    // gzipDropped_/reassemblyOverflowCount_/reassemblyMalformedCount_ are
+    // lifetime atomics, written from usbh and the dispatcher/gzip-inflate
+    // worker threads - logFileStreamSummary() above only reports a snapshot
+    // diffed to the File stream's own window, so an oversized message
+    // arriving *after* that stream finishes (a big preset push, say) would
+    // otherwise never be reported. Called every heartbeat tick and only
+    // logs when something has changed since the last time this ran, so a
+    // steady state doesn't flood the log. Each counter is read
+    // independently (no multi-field struct to catch mid-update), so
+    // there's nothing here for a reader to observe half-written - the
+    // values are plain, single-field lifetime counts throughout.
+    void checkTrafficHealth() {
+        const uint32_t dispatcherDropped = dispatcher_.droppedCount();
+        const uint32_t gzipDropped = gzipInflater_.droppedCount();
+        const uint32_t reassemblyOverflow = reassemblyOverflowCount_.load(std::memory_order_relaxed);
+        const uint32_t reassemblyOverflowMax = reassemblyOverflowMaxSize_.load(std::memory_order_relaxed);
+        const uint32_t reassemblyMalformed = reassemblyMalformedCount_.load(std::memory_order_relaxed);
+
+        if (dispatcherDropped == lastReportedDispatcherDropped_ &&
+            gzipDropped == lastReportedGzipDropped_ &&
+            reassemblyOverflow == lastReportedReassemblyOverflow_ &&
+            reassemblyMalformed == lastReportedReassemblyMalformed_) {
+            return;
+        }
+
+        LOG_WRN("Traffic drop/overflow: dropped (dispatch=%u gzip=%u), reassembly (overflow=%u "
+                "largest=%u malformed=%u) - a listing or push in progress may be incomplete",
+                dispatcherDropped, gzipDropped, reassemblyOverflow, reassemblyOverflowMax,
+                reassemblyMalformed);
+
+        lastReportedDispatcherDropped_ = dispatcherDropped;
+        lastReportedGzipDropped_ = gzipDropped;
+        lastReportedReassemblyOverflow_ = reassemblyOverflow;
+        lastReportedReassemblyMalformed_ = reassemblyMalformed;
     }
 
     // Shared by the handshake thread and the heartbeat thread - sendMutex_
@@ -602,10 +639,12 @@ private:
 
     // Written from QcHidBridge::onReportIn() on the `usbh` thread (atomic
     // increment only - see recordReassemblyOverflow()/recordReassemblyMalformed()
-    // above), read from runHeartbeat() when assembling a File stream
-    // summary. Lifetime counts - runHandshake() snapshots them into
-    // *AtStart_ below to scope a summary to one stream.
+    // above), read from runHeartbeat()/checkTrafficHealth(). Lifetime counts
+    // - runHandshake() snapshots them into *AtStart_ below to scope a
+    // summary to one stream; checkTrafficHealth() watches the lifetime
+    // values directly so a later overflow/malformed report is never missed.
     std::atomic<uint32_t> reassemblyOverflowCount_{0};
+    std::atomic<uint32_t> reassemblyOverflowMaxSize_{0};
     std::atomic<uint32_t> reassemblyMalformedCount_{0};
 
     // Written from QcHidBridge::onReportIn() on the `usbh` thread (atomic
@@ -613,19 +652,31 @@ private:
     // IN transfer, independent of the reassembler's verdict on it.
     std::atomic<uint32_t> totalInTransfers_{0};
 
-    // Guards fileStream_, messageTally_ and the five *AtStart_ snapshots
-    // below: all are written from runHandshake() at stream start, read/
-    // diffed from runHeartbeat() at stream finish, and fileStream_/
-    // messageTally_ are also written from onMessage()/onInflateFailed()
-    // (the dispatcher_/gzipInflater_ worker threads) - never from `usbh`.
+    // issue #33 / ADR 0007: ModelRepo/ModuleStats replies ignored outright
+    // in handleMessage() (usbh thread, atomic increment only - same
+    // contract as the rest of that function).
+    std::atomic<uint32_t> ignoredLargeCommandCount_{0};
+
+    // Guards fileStream_ and the five *AtStart_ snapshots below: all are
+    // written from runHandshake() at stream start, read/diffed from
+    // runHeartbeat() at stream finish, and fileStream_ is also written from
+    // onMessage()/onInflateFailed() (the dispatcher_/gzipInflater_ worker
+    // threads) - never from `usbh`.
     struct k_mutex fileStreamMutex_ {};
     QcFileStream fileStream_;
-    QcMessageTally messageTally_;
     uint32_t dispatcherDroppedAtStart_ = 0;
     uint32_t gzipDroppedAtStart_ = 0;
     uint32_t reassemblyOverflowAtStart_ = 0;
     uint32_t reassemblyMalformedAtStart_ = 0;
     uint32_t totalInTransfersAtStart_ = 0;
+
+    // checkTrafficHealth()'s own "did anything change since last time"
+    // state - read and written only from the heartbeat thread, so no lock
+    // needed.
+    uint32_t lastReportedDispatcherDropped_ = 0;
+    uint32_t lastReportedGzipDropped_ = 0;
+    uint32_t lastReportedReassemblyOverflow_ = 0;
+    uint32_t lastReportedReassemblyMalformed_ = 0;
 
     // A new command id is always logged the moment it's first seen; a
     // count bump on an already-logged command is throttled to at most
@@ -641,9 +692,9 @@ private:
     // preset change on the unit push something new (RecallPreset/Scene/
     // SetlistPosition/...)" without re-logging unchanged counts every
     // ~200ms heartbeat tick. Guarded by fileStreamMutex_ above, same as
-    // messageTally_ - started in runHeartbeat() the moment the File
-    // stream's summary is produced, and never stopped again (unlike
-    // messageTally_, which is scoped to one File stream).
+    // fileStream_ - started in runHeartbeat() the moment the File stream's
+    // summary is produced, and never stopped again (unlike fileStream_,
+    // which is scoped to one File stream).
     QcMessageTally postStreamTally_;
     std::array<QcMessageTally::Entry, QcMessageTally::kMaxDistinctCommands> postStreamLoggedEntries_{};
     size_t postStreamLoggedEntryCount_ = 0;

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 
 namespace qcbridge {
@@ -27,8 +28,15 @@ public:
     // A gzip-compressed message (QcGzipInflater.hpp) that failed to
     // inflate - still real traffic for `command`, just with no usable
     // protoBytes to hand to onMessage(). `reason` is gzip::toString()'s
-    // output (QcGzip.hpp).
-    virtual void onInflateFailed(uint16_t command, size_t wireSize, const char* reason) = 0;
+    // output (QcGzip.hpp). `trueInflatedSize` is the gzip trailer's own
+    // ISIZE field (QcGzip.hpp's peekDecompressedSize(), issue #33) when
+    // the failure left enough of the compressed bytes to read it from -
+    // in particular, always present for `reason == "OutputTooLarge"`,
+    // since that's read straight from the trailer without needing to
+    // finish decompressing at all. std::nullopt if unavailable (e.g. the
+    // input was truncated before the trailer).
+    virtual void onInflateFailed(uint16_t command, size_t wireSize, const char* reason,
+                                  std::optional<size_t> trueInflatedSize) = 0;
 };
 
 }  // namespace qcbridge
