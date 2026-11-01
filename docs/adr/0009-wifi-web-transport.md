@@ -38,12 +38,31 @@ assumed from general RW612 marketing claims:
   already documents (`west blobs fetch hal_nxp`) — already present on this machine from that
   earlier BLE prep, confirmed by a real, non-`CONFIG_BUILD_ONLY_NO_BLOBS` build linking
   successfully (see Consequences).
-- One real gap found and fixed along the way, not assumed from the sample: the NXP driver
-  never auto-starts a DHCPv4 *server* for AP mode (only `CONFIG_WIFI_STA_AUTO_DHCPV4`'s
-  *client* path exists, confirmed against `drivers/wifi/nxp/src/nxp_wifi_net.c`) — a joining
-  phone/laptop would get no IP address otherwise. `QcWifiWebTransport::startAccessPoint()`
-  sets a static IP and starts a server itself, the same pattern `apsta_mode`'s own
-  `enable_dhcpv4_server()` uses.
+- **Correction (ac601b2 hardware results)**: this ADR originally claimed the NXP driver never
+  auto-starts a DHCPv4 server for AP mode, and had `QcWifiWebTransport::startAccessPoint()` set
+  a static IP and start one itself. That claim was wrong — checked against the generic NXP
+  Wi-Fi Kconfig text, not this specific code path. The driver's `CONFIG_NXP_WIFI_SOFTAP_DHCP_SERVER`
+  (on by default once SoftAP support is enabled) DOES start its own DHCPv4 server, confirmed at
+  `drivers/wifi/nxp/src/nxp_wifi_drv.c`'s `WLAN_REASON_UAP_SUCCESS` handler
+  (`net_dhcpv4_server_start(g_uap.netif, &base_addr)`). This firmware's own app-layer server
+  start raced it on the same interface (`net_if_get_wifi_sap()` resolves to that same
+  `g_uap.netif` — there's only one SoftAP interface on this chip) and always lost with
+  `-EALREADY` — the exact `nxp_wifi: DHCP Server start failed` seen on hardware. Worse, because
+  the driver's own success handler returns early on that failure, it never reached the lines
+  that raise `NET_EVENT_WIFI_AP_ENABLE_RESULT` either, which is why no "AP enabled" log line
+  ever followed on hardware. Zephyr's own `apsta_mode` sample independently reaches the same
+  conclusion for this exact board: its `frdm_rw612` overlay sets
+  `CONFIG_WIFI_SAMPLE_DHCPV4_START=n`, specifically because (per that option's own Kconfig
+  help) "some vendors start the DHCPv4 server after Soft AP initialization" — this is that
+  vendor. Fixed by removing the app-layer DHCPv4 server entirely and configuring the driver's
+  own IP range via `CONFIG_NXP_WIFI_SOFTAP_IP_ADDRESS`/`_MASK`/`_BASE` (prj.conf) instead — see
+  `QcWifiWebTransport::startAccessPoint()`'s own comment for the full writeup.
+
+  What this does *not* establish: `WLAN_REASON_UAP_SUCCESS` firing (confirmed by the DHCP
+  conflict log existing at all) means the chip firmware itself already reported the SoftAP as
+  started *before* hitting this conflict — so whether removing the conflict is sufficient to
+  make the AP's SSID visible to a scanning phone (it wasn't, on `ac601b2`) is unconfirmed from
+  source alone and needs a fresh hardware run with this fix applied.
 
 Conclusion: **both AP and STA mode are supported on `frdm_rw612` under Zephyr 4.5**, with no
 blocking gap — proceeding with the build was the right call, not a workaround.
@@ -89,8 +108,16 @@ and a change signal) — not HTTP/BLE-specific shapes.
 5. **Credentials**: build-time choice via Kconfig plus a local, gitignored
    `wifi_credentials.conf` (`wifi_credentials.conf.example` committed) — never a runtime
    provisioning flow, and never real credentials in this repo. AP mode defaults to WPA2-PSK
-   when a passphrase is set (the owner's decision — security hardening deferred, but not to an
-   open network by default); STA mode skips joining rather than attempting a blank SSID.
+   when a passphrase is set, open otherwise (this build's own default, not something the owner
+   asked for — issue #71's own text only says "security can come later"); STA mode skips
+   joining rather than attempting a blank SSID. Station mode has no band restriction —
+   confirmed by reading `nxp_wifi_connect()` (`drivers/wifi/nxp/src/nxp_wifi_drv.c`): the
+   station connect path never reads the connect request's `band` field at all, only
+   `channel`/`chan_list`, so an earlier version of this code setting `band = 2.4 GHz` there was
+   always a no-op, not an actual restriction. AP mode does stay 2.4 GHz-only, for an honest
+   reason that isn't the owner's either: the driver's auto-channel-select only reads that hint
+   when picking a 5 GHz channel, and 5 GHz AP operation brings DFS/regulatory channel-vacating
+   requirements this firmware does nothing to handle.
 6. **The fake-transport seam proof** (`tests/preset_transport`) implements `QcPresetTransport`
    with a plain struct that just counts calls — no Zephyr kernel, no socket, no `QcSession` —
    proving `addTransport()`'s call pattern and `QcCatalogSnapshot`/`QcCatalogJson`'s shape work
@@ -110,18 +137,38 @@ and a change signal) — not HTTP/BLE-specific shapes.
   | Build | Flash | RAM |
   | --- | --- | --- |
   | `master` baseline | 86952 B / 64 MB (0.13%) | 406984 B / 983040 B (41.40%) |
-  | This branch, AP mode | 743200 B / 64 MB (1.11%) | 696104 B / 983040 B (70.81%) |
-  | This branch, STA mode | 721860 B / 64 MB (1.08%) | 695248 B / 983040 B (70.72%) |
+  | This branch, AP mode | 746232 B / 64 MB (1.11%) | 743000 B / 983040 B (75.58%) |
+  | This branch, STA mode | 719588 B / 64 MB (1.07%) | 735656 B / 983040 B (74.83%) |
+
+  **Re-measured after the `ac601b2` hardware-fix round** (previously 743200/696104 B AP,
+  721860/695248 B STA) — RAM grew further, from moving JSON encoding off `qc_heartbeat` per PR
+  #74 review: `QcWifiWebTransport` now also holds a full `QcCatalogSnapshot` copy as member
+  storage (~23 KB at this build's `kMaxFolders=8`/`kMaxPresetsPerFolder=64`/`kNameCapacity=32`)
+  so the worker thread can re-encode it independently of `publishCatalog()`'s caller, plus a
+  third 16 KB JSON buffer (`responseJson_`) so an HTTP GET response survives a concurrent
+  broadcast re-encoding `catalogJson_` out from under it. Both are direct, necessary costs of
+  fixing real bugs the review found, not scope creep.
 
   Flash is trivial against the board's 64 MB external flash either way. RAM is the real cost:
-  **+289120 B (AP) / +288264 B (STA)**, roughly **+29 points**, landing just over 70% of the
-  board's 960 KB SRAM. There's still real headroom (286936 B / ~280 KB free at AP, 287792 B at
-  STA, before the board's RAM runs out entirely), but this is the single biggest RAM jump of
-  any issue so far in this project — the owner's go/no-go call should weigh that against the
-  web-UI-viability question this issue is answering, not just "does it build."
+  **+336016 B (AP) / +328672 B (STA)**, roughly **+34 points** now, landing just over 75% of
+  the board's 960 KB SRAM. There's still real headroom (240040 B / ~234 KB free at AP, 247384 B
+  / ~242 KB at STA, before the board's RAM runs out entirely), but this remains the single
+  biggest RAM jump of any issue so far in this project, and grew again this round — the
+  owner's go/no-go call should weigh that against the web-UI-viability question this issue is
+  answering, not just "does it build."
 - **Stack margins** (`-fstack-usage`, same worst-case-call-chain method as ADR 0008, GCC's
   inlining folded trivial wrapper/trampoline calls into their callers at this build's
-  optimization level):
+  optimization level). **Stale as of the `ac601b2` hardware-fix round** — the table below
+  predates `run()`/`broadcast()` being restructured, `pollWsClients()` being added, and
+  `publishCatalog()` now copying a full `QcCatalogSnapshot` instead of encoding JSON inline;
+  it was not re-run with `-fstack-usage` this round (unlike the RAM/flash table above, which
+  was). Qualitatively, `qc_wifi_web`'s own added functions (`pollWsClients()`,
+  `appendLastChange()`, the two summary loggers) are all small, fixed-size-local functions
+  comparable to `broadcast()`'s own frame, and `qc_heartbeat`'s added work
+  (`catalogSnapshot_ = snapshot;`, a structural copy through `etl::vector`'s own
+  element-by-element assignment, not a stack temporary) is unlikely to add meaningful depth
+  given the ~65-95% headroom already measured below — but this is reasoning, not a
+  measurement, and should be re-run before treating these specific numbers as current:
 
   | Thread | Call chain | Budget | Depth | Margin |
   | --- | --- | --- | --- | --- |
@@ -151,6 +198,72 @@ and a change signal) — not HTTP/BLE-specific shapes.
   ESP32-C3 that ADR 0002's own "Decision" section named, since the C3 has no USB-OTG/host
   silicon at all (confirmed against Espressif's docs, flagged there for confirmation against
   the S3's own datasheet before any real board-switch decision).
-- **Security is deliberately out of scope here** — no auth on the HTTP/WebSocket endpoints,
-  per the owner's decision (home use, not gigging; WPA2 on the Wi-Fi link itself is the one
-  hardening applied). Revisit if this graduates past a test build.
+- **Security is deliberately out of scope here** — no auth on the HTTP/WebSocket endpoints and
+  plain HTTP (not HTTPS), matching issue #71's own stated scope ("home use, not gigging...
+  security can come later"). WPA2-by-default on the Wi-Fi link itself (when a passphrase is
+  configured) is this build's own choice, not something the issue or the owner asked for
+  specifically — open-by-default would have been equally in scope. Revisit if this graduates
+  past a test build.
+
+## Hardware findings (`ac601b2`)
+
+Both modes built and flashed; USB, the 200ms KeepAlive, and the `File` listing (21 messages, no
+drops, full 48-preset list, handshake 4.1.1) kept working with Wi-Fi active in both modes — the
+coexistence requirement held. Wi-Fi itself failed in both modes. Findings below are split by
+how they were established — source-confirmed causes already fixed in this round, vs. what's
+still unconfirmed and needs another hardware run.
+
+**AP mode — confirmed from source, fixed**: `nxp_wifi: DHCP Server start failed` on the serial
+console, with no "AP enabled" line following. Root cause confirmed by reading
+`drivers/wifi/nxp/src/nxp_wifi_drv.c` (see the DHCP correction above): this firmware's own
+app-layer DHCPv4 server start raced the NXP driver's own, lost with `-EALREADY`, and the
+driver's own early return on that failure is why the enable-result event (and therefore the
+"AP enabled" log line) never fired. Fixed by removing the app-layer server entirely.
+**Unconfirmed**: whether this fix alone makes the AP's SSID visible to a scanning phone — on
+`ac601b2` the owner reported "QCRemote" never appeared at all, and `WLAN_REASON_UAP_SUCCESS`
+firing (which the DHCP conflict log proves happened) means the chip firmware had already
+reported the SoftAP as started *before* hitting that conflict. So the DHCP fix addresses a
+real, confirmed bug, but is not proven sufficient on its own to explain full AP visibility —
+needs a fresh hardware run to tell apart from a separate, still-unidentified cause (channel
+selection, a regulatory/country-code setting this driver doesn't expose a Kconfig for, or
+something else at the radio level).
+
+**STA mode — confirmed from source, fixed**: the serial console showed `Wi-Fi station
+connected` printed immediately around a logged `authentication failed` warning, and the board
+never appeared in the router's DHCP client list. Root cause confirmed by reading the same
+driver file: `onWifiEvent()`'s `NET_EVENT_WIFI_CONNECT_RESULT` handler logged "connected"
+unconditionally, never reading the event's own `wifi_status`. The driver raises that exact
+event with a non-zero status (`WIFI_STATUS_CONN_WRONG_PASSWORD`, the driver's own generic code
+for *any* 4-way-handshake failure, not only an actually-wrong passphrase) on
+`WLAN_REASON_NETWORK_AUTH_FAILED`, so the "connected" log line next to an "authentication
+failed" warning was this firmware misreporting a failed (re)association as a success, not two
+real but contradictory events. Fixed by reading `status->conn_status`/`status_code`/
+`reason_code` and logging success/failure accurately. The station connect path was also
+confirmed to never read the connect request's `band` field at all (only `channel`/
+`chan_list`), so the previous `WIFI_FREQ_BAND_2_4_GHZ` hardcode was already a no-op for station
+mode on this driver — removed for accuracy, not because it was causing the failure.
+**Unconfirmed**: why the handshake fails repeatedly in the first place. The owner has since
+confirmed the "Radioshack" network is WPA2 (not WPA3 or mixed) on both 2.4 GHz and 5 GHz under
+the same SSID, which rules out a security-type mismatch — this build's `WIFI_SECURITY_TYPE_PSK`
+request was already the correct type for that network. Possible remaining causes not yet
+confirmed from source: a management-frame-protection (MFP) mismatch (this code leaves
+`wifi_connect_req_params::mfp` at its zero-initialized `WIFI_MFP_DISABLE`; the router's actual
+PMF setting is unknown), or something at the radio/firmware level shared with the AP-mode
+failure (see below). Needs another hardware run with the improved logging to see the actual
+status/reason codes.
+
+**Shared-cause check**: both modes failing at the radio level (not just our own app code) was
+checked against Zephyr's own `samples/net/wifi/apsta_mode`/`shell` samples for this exact
+board — no missing Kconfig option, country/regulatory-code setting (this driver exposes none
+for `frdm_rw612`), or driver option was found that this firmware's `prj.conf` was missing. The
+`sections-rom.ld` linker fragment this issue added is a standard per-service iterable-section
+definition (same pattern as `samples/net/sockets/http_server`'s own) with no overlap with
+anything USB-related. Nothing in source review points at USB host activity or the linker change
+as a plausible shared cause; this is not the same as proof, since the actual radio-level
+failure mode is still unconfirmed.
+
+**Other hardware observations, acted on**: `thread_analyzer`'s own worker peaked at 952/1024
+bytes (92%) in this build — `CONFIG_THREAD_ANALYZER_AUTO_STACK_SIZE` raised back to 2048 (the
+value earlier builds used, per ADR 0007/0008) rather than leaving it this tight.
+`rx_q[0]` (936/1504, ~62% used) and `conn_mgr_monitor` (296/512, ~58% used) both still have
+healthy margin — read as sane, no change made.

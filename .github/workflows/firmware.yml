@@ -72,6 +72,22 @@ jobs:
             west sdk install --install-base ~ --gnu-toolchains arm-zephyr-eabi
           fi
 
+      # Issue #71 (Wi-Fi) needs the RW612's own Wi-Fi radio firmware blob,
+      # the same one ADR 0002 already documents fetching for BLE
+      # (rw61x_sb_ble_a2.bin, same hal_nxp module/license). Without this
+      # the frdm_rw612 build fails at CMake configure time looking for
+      # modules/hal/nxp/zephyr/blobs/rw61x/rw61x_sb_wifi_a2_compressed.bin.
+      # Safe to run non-interactively: hal_nxp's module.yml has no
+      # click-through field on any of its RW61x blob entries, and west's
+      # blobs.py schema defaults that field to false when absent (see
+      # zephyr/scripts/zephyr_module.py) - `west blobs fetch` only ever
+      # prompts when click-through is true, so no license click-through
+      # is actually being auto-accepted here, just a normal download.
+      - name: Fetch Wi-Fi/BLE radio firmware blobs
+        run: |
+          cd ~/zephyrproject
+          west blobs fetch hal_nxp
+
       - name: Build frdm_rw612
         run: |
           cd ~/zephyrproject
