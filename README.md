@@ -30,7 +30,7 @@ Follow progress in the [issues](https://github.com/rrooding/QCRemote/issues).
 
 ## Try it
 
-You'll need an [NXP FRDM-RW612](https://www.nxp.com/design/design-center/development-boards-and-designs/FRDM-RW612) board, a Quad Cortex Mini, and a Zephyr toolchain. Tested so far on one unit running CorOS 4.1.1. See the [firmware README](firmware/README.md) for setup, build and flash steps.
+You'll need an NXP FRDM-RW612 board, a Quad Cortex Mini, and a Zephyr toolchain. Tested so far on one unit running CorOS 4.1.1. See the [firmware README](firmware/README.md) for setup, build and flash steps.
 
 ## Learn more
 
