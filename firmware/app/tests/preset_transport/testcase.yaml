@@ -1,0 +1,13 @@
+tests:
+  firmware.preset_transport:
+    # mps2/an385, not qemu_cortex_m3 (this repo's other Ztest suites' usual
+    # second platform) - qemu_cortex_m3's 64KB RAM is too small to hold a
+    # full QcPresetCatalog and QcCatalogSnapshot at once (each ~20KB,
+    # sized the same as on real frdm_rw612 hardware, which has ~1MB RAM
+    # and no such problem - confirmed by a real "RAM overflow" build
+    # report, not assumed). mps2/an385 is the same Cortex-M3 architecture
+    # family under QEMU, just with 4MB of RAM.
+    platform_allow:
+      - native_sim
+      - mps2/an385
+    tags: firmware
