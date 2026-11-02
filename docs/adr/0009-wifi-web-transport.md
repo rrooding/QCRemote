@@ -149,6 +149,12 @@ and a change signal) — not HTTP/BLE-specific shapes.
   broadcast re-encoding `catalogJson_` out from under it. Both are direct, necessary costs of
   fixing real bugs the review found, not scope creep.
 
+  **Re-measured again after the `26bfec1` page-load-crash fix** (`CONFIG_NET_RX_STACK_SIZE`
+  1500 B -> 3072 B, see "Hardware findings (`26bfec1`)" below): **AP 744568 B / 75.74% (+1568 B),
+  STA 737224 B / 74.99% (+1568 B)**. Trivial and now fully explained — not a repeat of this
+  section's earlier open-ended growth, just the direct, measured cost of fixing a confirmed
+  stack overflow in Zephyr's own TCP ISN path.
+
   Flash is trivial against the board's 64 MB external flash either way. RAM is the real cost:
   **+336016 B (AP) / +328672 B (STA)**, roughly **+34 points** now, landing just over 75% of
   the board's 960 KB SRAM. There's still real headroom (240040 B / ~234 KB free at AP, 247384 B
@@ -267,3 +273,69 @@ bytes (92%) in this build — `CONFIG_THREAD_ANALYZER_AUTO_STACK_SIZE` raised ba
 value earlier builds used, per ADR 0007/0008) rather than leaving it this tight.
 `rx_q[0]` (936/1504, ~62% used) and `conn_mgr_monitor` (296/512, ~58% used) both still have
 healthy margin — read as sane, no change made.
+
+## Hardware findings (`26bfec1`), and the page-load crash
+
+Both modes came up this round: AP enabled at `192.168.4.1` with a station joining, and STA
+connected with a real DHCP-assigned IP — the DHCP-conflict and connect-logging fixes above both
+held. Loading the page then crashed identically in both modes: a USAGE FAULT ("Stack overflow
+(context area not valid)") on thread `rx_q[0]`, same faulting PC (`0x18006dba`) and LR
+(`0x18004db5`) in both logs. Neither log showed a Quad Cortex claimed; the owner has since
+confirmed it was powered off for both runs, so this is not a USB- or catalog-size-dependent bug.
+
+**Root cause — confirmed from source and from this build's own `zephyr.elf`, not our own code.**
+`addr2line` against a from-source rebuild of `26bfec1` (CI's `d44d3fc` on top doesn't touch
+firmware) resolves the fault: PC is the prologue of `mcuxClMemory_copy` (NXP's hal_nxp hash
+library), LR is inside `mcuxClHashModes_Els_oneShot_Sha2_Padding`. Tracing callers through the
+same `zephyr.elf` (`objdump -d`, following each `bl` target) finds exactly two call sites that
+reach this chain anywhere in the image:
+
+- `subsys/net/ip/tcp.c`'s `tcp_isn_hash()`, called inline from TCP SYN processing — confirmed
+  this runs on `net_tc`'s own `rx_q[N]` thread at `net_tc.c:421` (`snprintk(name, ..., "rx_q[%d]",
+  i)` is literally where that thread gets its name).
+- Zephyr's own `handle_http1_to_websocket_upgrade()` (the Sec-WebSocket-Accept hash), which runs
+  on the HTTP server's own thread, not `rx_q[0]` — not the match for this fault, but the same
+  underlying library call explains why both paths share a crypto chain.
+
+`tcp_isn_hash()` is the match: `subsys/net/ip/Kconfig.tcp`'s `CONFIG_NET_TCP_ISN_RFC6528`
+(`default y`, `depends on PSA_WANT_ALG_SHA_256`) is off on `master` today — nothing there
+satisfies that dependency — and turns on as a side effect of this issue enabling Wi-Fi, which
+pulls in `CONFIG_PSA_CRYPTO`/`CONFIG_MCUX_ELS_PKC` for the Wi-Fi driver's own security needs.
+Once on, computing a TCP initial sequence number for *every newly-accepted connection* switches
+from `master`'s shallow `sys_rand32_get()` fallback to a real `psa_hash_compute(PSA_ALG_SHA_256,
+...)` call, routed through `psa_driver_wrapper_hash_compute()` -> Zephyr's `els_pkc` PSA crypto
+driver -> `mcuxClPsaDriver_psa_driver_wrapper_hash_compute()` -> `mcuxClHash_compute()` ->
+`mcuxClHashModes_Els_oneShot_Sha2()` and its Padding/FullBlocks/ProcessData/Truncated helpers ->
+`mcuxClMemory_copy()` (where it faults). Measuring each frame the same way as every other
+stack-margin table in this ADR (gcc's prologue `push`/`stmdb` + `sub sp`, read directly from
+`objdump -d` on this exact build): `tcp_isn_hash` 56 B, `psa_hash_compute` 0 B net (it pops its
+own 8 B before tail-calling, confirmed by its own `pop {r4,r5}; b.w` sequence),
+`psa_driver_wrapper_hash_compute` 40 B, `els_pkc_transparent_hash_compute` 32 B,
+`mcuxClPsaDriver_psa_driver_wrapper_hash_compute` 296 B, `mcuxClHash_compute` 120 B,
+`mcuxClHashModes_Els_oneShot_Sha2` 152 B, its data-processing callee 108-240 B depending on input
+length, `mcuxClHashModes_Els_oneShot_Sha2_Padding` 120 B, `mcuxClMemory_copy` 80 B — **~1136 B for
+this chain alone**, before whatever depth `net_tc`/IP/TCP processing itself already needed to
+reach SYN handling. `CONFIG_NET_RX_STACK_SIZE`'s default (1500 B, matching the "1504" budget
+`thread_analyzer` reported pre-crash) was sized for the pre-Wi-Fi, non-cryptographic ISN path and
+was never going to survive this chain once Wi-Fi turned it on. This also explains every detail of
+the report: identical PC/LR in both modes (the chain is mode-independent — any new TCP
+connection triggers it), the crash tied to "loading the page" (the browser's first GET/WebSocket
+request is the first new TCP connection), and an empty catalog with no Quad Cortex attached still
+crashing (this path never touches our own catalog/HTTP/JSON code at all — it runs before any of
+that gets a chance to).
+
+**Fix**: `CONFIG_NET_RX_STACK_SIZE` raised from its 1500 B default to 3072 B (`prj.conf`, with
+the measurement above recorded in a comment there). Re-verified with a from-source rebuild of
+this exact fix for both modes: clean links, RAM `+1568 B` in each mode (3072 B rounds the
+underlying `K_KERNEL_STACK_ARRAY_DEFINE` allocation up slightly past the raw 1572 B difference) —
+a trivial, now-known cost, not a repeat of the open-ended growth flagged earlier in this ADR.
+**Not yet verified on hardware** - needs a fresh flash to confirm the fault doesn't recur (see
+firmware/README.md).
+
+**Other thread margins, checked, no change made**: the pre-crash `thread_analyzer` snapshot also
+showed `net_socket_service` at 2288/4096 (55.8%) and `sysworkq` at 1432/2048 (69.9%) — both
+higher than `rx_q[0]`'s own pre-crash 408/1504, but neither anywhere near its budget, and neither
+is on the path identified above (the HTTP server and websocket worker each run on their own
+thread, not `sysworkq`; `net_mgmt` events already get their own 4608 B thread, not routed through
+`sysworkq` either). No source-confirmed reason to raise either found - read as sane, no change
+made, same as `conn_mgr_monitor` and `rx_q[0]` itself were in the `ac601b2` round above.

@@ -924,7 +924,14 @@ stack, Wi-Fi driver, HTTP server, and mbedTLS).
    Wi-Fi > (i) on iPhone; System Settings > Wi-Fi > Details on Mac).
 4. Open `http://192.168.4.1/` in a browser on each device. Expect the folder/preset listing
    from the catalog (same content the serial console already prints, per issue #10) and a
-   `presets: N (generation G)` status line.
+   `presets: N (generation G)` status line. On `26bfec1` this step crashed the board outright -
+   a USAGE FAULT / stack overflow on thread `rx_q[0]` - in both AP and station mode, with or
+   without a Quad Cortex attached. Root cause confirmed from source and fixed (this build raises
+   `CONFIG_NET_RX_STACK_SIZE`; see ADR 0009's "Hardware findings (`26bfec1`)"), but **not yet
+   verified on hardware** - this is the first thing to check. The page should now load instead
+   of crashing; if it crashes again with the same `rx_q[0]`/stack-overflow signature, paste the
+   full fault register dump (especially PC/LR) on the issue rather than re-guessing - it would
+   mean the measured ~1136 B call-chain estimate in that ADR section was still short.
 5. With the page open, change the active preset or folder on the Quad Cortex Mini itself.
    Expect the page to update within a couple of seconds, without a manual reload - the
    WebSocket push (issue #61's preset-change signal), now shown as a
@@ -966,7 +973,9 @@ disabled) would be the coexistence requirement failing, not just a Wi-Fi bug.
    browser. Same expectations as the AP-mode steps above: listing loads, status line shows
    preset/generation counts, and a preset change on the unit pushes a live update over the
    WebSocket within a couple of seconds (shown as a `preset change (cmd N, #M)` note on the
-   status line, even when the listing itself didn't change).
+   status line, even when the listing itself didn't change). Same `26bfec1` page-load crash and
+   fix applies here too (see the AP-mode step above and ADR 0009) - not yet verified on
+   hardware.
 5. Same 10-15 minute soak as AP mode: confirm KeepAlive/File-stream/USB behavior is unaffected,
    and the station stays connected - watch for any further
    `Wi-Fi station connect failed`/`Wi-Fi station disconnected` lines, which now report the
