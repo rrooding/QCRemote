@@ -1,0 +1,21 @@
+config QC_USBH_FORCE_FULL_SPEED
+	bool "Force the USB host port to Full Speed (test only)"
+	depends on SOC_SERIES_RW6XX
+	help
+	  Sets PORTSC1.PFSC on the RW61x USB controller, so the port never
+	  chirps up to High Speed and the attached device has to run at
+	  12 Mbit/s. Lets the RW612 stand in for a Full Speed-only host
+	  (ESP32-S3, MAX3421E) - see issue #76. The bit must be set before
+	  the device attaches, so plug it in after boot. Leave off in normal
+	  builds.
+
+config QC_MESSAGE_CAPACITY
+	int "Largest reassembled message, in bytes"
+	default 131072
+	help
+	  Size of the HID reassembly buffer and the dispatcher mailbox, which
+	  are kept equal. 128 KiB holds a worst-case fully-named preset folder
+	  (ADR 0007). Boards with less internal RAM can lower it at the cost
+	  of dropping messages larger than this.
+
+source "Kconfig.zephyr"

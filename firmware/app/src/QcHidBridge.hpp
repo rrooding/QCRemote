@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <span>
 
+#include <etl/vector.h>
 #include <zephyr/logging/log.h>
 
 #include "HidReassembler.hpp"
@@ -33,8 +34,14 @@ inline constexpr uint8_t kUsbBaseClassHid = 0x03;
 // (128 KiB) budgets ~511 bytes/slot for 256 named presets, comfortably above
 // the ~414 bytes/named-slot the real 10193-byte message implies once the
 // 235 near-empty slots' own small cost is subtracted - see ADR 0007 for the
-// full arithmetic and the RAM cost this carries.
+// full arithmetic and the RAM cost this carries. CONFIG_QC_MESSAGE_CAPACITY
+// (app Kconfig) can lower it for a board with less RAM; the Ztest builds
+// don't source the app Kconfig, hence the fallback.
+#if defined(CONFIG_QC_MESSAGE_CAPACITY)
+inline constexpr size_t kReassemblyCapacity = CONFIG_QC_MESSAGE_CAPACITY;
+#else
 inline constexpr size_t kReassemblyCapacity = 131072;
+#endif
 
 // Claims the Quad Cortex Mini's vendor HID interface (interface 5), rejects
 // every other interface the composite device exposes, and reassembles
@@ -56,15 +63,17 @@ protected:
         }
         LOG_INF("Claimed Quad Cortex Mini HID interface %u (sub=%u, proto=%u)", iface, ifaceSub,
                 ifaceProto);
+        partialReport_.clear();
         session_.deviceConnected();
         return true;
     }
 
-    void onRemoved() override { LOG_INF("Quad Cortex Mini disconnected"); }
+    void onRemoved() override {
+        LOG_INF("Quad Cortex Mini disconnected");
+        partialReport_.clear();
+    }
 
-    void onReportIn(std::span<const uint8_t> report) override {
-        using Status = HidReassembler<kReassemblyCapacity>::Status;
-
+    void onReportIn(std::span<const uint8_t> transfer) override {
         // Every call here is one successful IN transfer (usbh_shim.c only
         // invokes on_report_in when xfer->err == 0) - counted regardless of
         // what the reassembler does with it, so a File stream's summary can
@@ -72,6 +81,37 @@ protected:
         // sent reports that never became a counted message" (issue #60's
         // hardware debugging).
         session_.recordInTransfer();
+
+        // A transfer isn't always a whole report. The RW612's EHCI driver
+        // keeps an interrupt IN transfer open until the buffer is full or a
+        // short packet ends it, so each 129-byte report arrives whole. Zephyr's
+        // DWC2 driver (ESP32-S3) completes one per packet instead, so with
+        // wMaxPacketSize 128 a report arrives as a 128-byte and a 1-byte
+        // transfer - which the reassembler would reject as two malformed
+        // reports (issue #76). Join the pieces back here.
+        if (partialReport_.empty() && transfer.size() == kHidReportSize) {
+            feedReport(transfer);
+            return;
+        }
+        if (partialReport_.size() + transfer.size() > kHidReportSize) {
+            // Lost a piece somewhere: drop what was pending and start over
+            // from this transfer, so one missing packet costs one report
+            // rather than knocking every report after it out of step. (A
+            // single transfer can't exceed kHidReportSize: the shim's
+            // receive buffer is exactly that size.)
+            partialReport_.clear();
+            session_.recordReassemblyMalformed();
+        }
+        partialReport_.insert(partialReport_.end(), transfer.begin(), transfer.end());
+        if (partialReport_.size() == kHidReportSize) {
+            feedReport({partialReport_.data(), partialReport_.size()});
+            partialReport_.clear();
+        }
+    }
+
+private:
+    void feedReport(std::span<const uint8_t> report) {
+        using Status = HidReassembler<kReassemblyCapacity>::Status;
 
         switch (reassembler_.feed(report)) {
         case Status::Complete: {
@@ -105,7 +145,8 @@ protected:
         }
     }
 
-private:
+    // Pieces of a report split across transfers - see onReportIn().
+    etl::vector<uint8_t, kHidReportSize> partialReport_;
     HidReassembler<kReassemblyCapacity> reassembler_;
     QcSession session_;
 };

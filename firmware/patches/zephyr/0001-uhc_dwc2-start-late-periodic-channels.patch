@@ -1,0 +1,42 @@
+From: QCRemote
+Subject: [PATCH] drivers: usb: uhc_dwc2: start periodic channels whose frame has passed
+
+port_start_periodic() only starts a waiting interrupt channel when the next
+frame number equals its scheduled frame exactly. SOF events are coalesced, so
+the driver thread can run after that frame has gone by; the channel then
+waits for the frame counter to wrap (16384 frames, ~16.4 s at Full Speed).
+Seen on an ESP32-S3 (Zephyr v4.5.0) polling a Full Speed interrupt IN
+endpoint with bInterval 1: no IN data for ~16.4 s after every connect.
+
+Start any channel whose scheduled frame is the next frame or already
+behind, moving it up to the next frame.
+
+---
+ drivers/usb/uhc/uhc_dwc2.c | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/usb/uhc/uhc_dwc2.c b/drivers/usb/uhc/uhc_dwc2.c
+--- a/drivers/usb/uhc/uhc_dwc2.c
++++ b/drivers/usb/uhc/uhc_dwc2.c
+@@ -1664,8 +1664,19 @@ static void port_start_periodic(const struct device *dev)
+ 			continue;
+ 		}
+
+-		if (next_frame == ch->data->scheduled_frame) {
+-			LOG_DBG("TODO: Channel%d schedule periodic to frame=%u",
++		const uint16_t delta = (ch->data->scheduled_frame - next_frame) &
++				       PERIODIC_FRAME_MASK;
++
++		/*
++		 * SOF events are coalesced, so this thread can run after the
++		 * scheduled frame has gone by. Waiting for an exact match then
++		 * stalls the endpoint for a whole frame-counter wrap (16384
++		 * frames, ~16.4 s at Full Speed). Start any channel whose frame
++		 * is now or already behind, moved up to the next frame.
++		 */
++		if (delta == 0U || delta >= PERIODIC_FRAME_HALF) {
++			ch->data->scheduled_frame = next_frame;
++			LOG_DBG("Channel%d schedule periodic to frame=%u",
+ 				ch->index,
+ 				ch->data->scheduled_frame);
+ 			ch->data->periodic_scheduled = false;
