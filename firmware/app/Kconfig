@@ -2,7 +2,7 @@
 # reuses Zephyr's own generic choice (drivers/wifi/Kconfig,
 # WIFI_USAGE_MODE_AP/STA) rather than inventing a parallel one - that choice
 # is already what the NXP Wi-Fi driver keys its own SoftAP/DHCP-server
-# defaults off (see ADR 0009). Real credentials belong in a local,
+# defaults off (see ADR 0010). Real credentials belong in a local,
 # untracked wifi_credentials.conf (see wifi_credentials.conf.example in
 # this directory and firmware/README.md) - never in this file or in
 # prj.conf, and never committed.
@@ -28,6 +28,31 @@ config QC_WIFI_AP_PSK
 	  a local wifi_credentials.conf whenever that's easy, rather than
 	  defaulting to an open network. Never set a real passphrase in this
 	  file or in prj.conf.
+
+config QC_WIFI_AP_APP_DHCP_SERVER
+	bool "Start the AP's address and DHCPv4 server in the app"
+	default y if !WIFI_NXP
+	depends on WIFI_USAGE_MODE_AP
+	select NET_DHCPV4_SERVER
+	help
+	  The NXP Wi-Fi driver sets the SoftAP's address and runs its own
+	  DHCPv4 server (CONFIG_NXP_WIFI_SOFTAP_*), and a second server would
+	  collide with it (ADR 0010). Other drivers, such as the ESP32's,
+	  leave both to the app - this turns that on, using the address
+	  below.
+
+config QC_WIFI_AP_IP_ADDRESS
+	string "AP interface IPv4 address"
+	default "192.168.4.1"
+	depends on QC_WIFI_AP_APP_DHCP_SERVER
+	help
+	  Also the gateway. The DHCPv4 pool starts 10 addresses above it,
+	  matching the 192.168.4.x range the NXP build uses.
+
+config QC_WIFI_AP_NETMASK
+	string "AP interface IPv4 netmask"
+	default "255.255.255.0"
+	depends on QC_WIFI_AP_APP_DHCP_SERVER
 
 config QC_WIFI_STA_SSID
 	string "Network SSID to join (CONFIG_WIFI_USAGE_MODE_STA)"

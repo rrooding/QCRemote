@@ -13,10 +13,11 @@ firmware/
 ├── patches/zephyr/ # local fixes to apply to the Zephyr workspace (see "ESP32-S3 target")
 └── app/            # the actual Zephyr application (out-of-tree, "freestanding")
     ├── CMakeLists.txt
-    ├── Kconfig                     # app options: message buffer size, RW612 Full Speed test mode
+    ├── Kconfig                     # app options: Wi-Fi, message buffer size, RW612 Full Speed test mode
     ├── prj.conf
     ├── boards/frdm_rw612.overlay   # switches the RW612's USB peripheral to host mode
-    ├── boards/esp32s3_devkitc_esp32s3_procpu.{overlay,conf}  # ESP32-S3 LED + RAM fit
+    ├── boards/frdm_rw612.conf      # RW612 Wi-Fi driver + SoftAP settings
+    ├── boards/esp32s3_devkitc_esp32s3_procpu{,_nopsram}.{overlay,conf}  # ESP32-S3, with/without PSRAM
     ├── src/
     │   ├── Main.cpp
     │   ├── usbh_shim.c/.h          # plain-C boundary around Zephyr's non-C++-safe USB host API
@@ -774,11 +775,35 @@ build succeeds without it, but the S3 then shows the 16 s stall above.
 
 ### Build, flash, monitor
 
+The S3 board config depends on whether the module has PSRAM. Check with
+`python3 -m esptool --port /dev/cu.usbserial-XXXX chip-id`: an R2/R8 module lists
+`Embedded PSRAM` under Features; an N8/N16 module doesn't.
+
+| Module | Build | What runs |
+|---|---|---|
+| **With 8 MB octal PSRAM** (WROOM-1-N8R8/N16R8; RevA's N16R8) | default | USB bridge **and** Wi-Fi/web transport (issue #71). The app's static data (`libapp.a` `.bss`, incl. the 128 KiB message buffers) lives in PSRAM. |
+| **Without PSRAM** (WROOM-1-N8/N16) | `-DFILE_SUFFIX=nopsram` | USB bridge only. Wi-Fi doesn't fit internal RAM (~160 KB over), so it's off; message buffers are 64 KiB. |
+
+The default (Wi-Fi) build also needs Espressif's Wi-Fi/BT blobs. Zephyr checks for the whole
+set, not just the S3's (~40 MB, no license click-through):
+
+```bash
+west blobs fetch hal_espressif
+```
+
 ```bash
 west build -b esp32s3_devkitc/esp32s3/procpu /path/to/QCRemote/firmware/app -d build-s3 --pristine
+west build -b esp32s3_devkitc/esp32s3/procpu /path/to/QCRemote/firmware/app -d build-s3 --pristine -- -DFILE_SUFFIX=nopsram   # no PSRAM
 west flash -d build-s3
 west espressif monitor
 ```
+
+Wi-Fi mode and credentials come from `wifi_credentials.conf`, the same as on the RW612 (see
+"Wi-Fi host/client mode" below). In AP mode the ESP32 driver, unlike NXP's, doesn't run a
+DHCPv4 server, so the app sets the AP's address and starts one itself
+(`CONFIG_QC_WIFI_AP_APP_DHCP_SERVER`, on automatically for non-NXP drivers; address
+`CONFIG_QC_WIFI_AP_IP_ADDRESS`, default 192.168.4.1, the same range as the RW612). The NXP
+driver's own Wi-Fi settings moved from `prj.conf` to `boards/frdm_rw612.conf`.
 
 Flash and log over the board's **UART** micro-USB port (CP2102N bridge, `zephyr,console` is
 UART0). If `west flash` doesn't find it, add `--esp-device /dev/tty.usbserial-XXXX`. The ROM
@@ -818,8 +843,9 @@ unit. The Quad Cortex draws no current from VBUS; it only needs it present.
   when the device disconnected then freed its buffer through the already-NULLed
   `claimed_udev`. It now holds a local copy. Not S3-specific; it just showed up there first.
 - **RAM**: the two 128 KiB message buffers (ADR 0007) don't fit the S3's internal RAM.
-  `CONFIG_QC_MESSAGE_CAPACITY` (app Kconfig, default 131072) sets both; the S3 board config
-  uses 65536, which still holds every message measured on the owner's unit (largest 22667).
+  `CONFIG_QC_MESSAGE_CAPACITY` (app Kconfig, default 131072) sets both. The PSRAM board
+  config keeps 131072 in PSRAM; the `nopsram` one uses 65536, which still holds every message
+  measured on the owner's unit (largest 22667).
 - **Heartbeat LED**: the board's own LED is addressable RGB, so the overlay puts `led0` on
   GPIO2 (J3 pin 5) - optional.
 
@@ -842,14 +868,14 @@ west build -b frdm_rw612 /path/to/QCRemote/firmware/app -d build-fs --pristine -
 
 Issue #71 tests whether a web UI served from the board over Wi-Fi is viable enough that the
 owner would go with web UI + Wi-Fi instead of the planned JUCE + BLE macOS/iOS app (MVP2). See
-[ADR 0009](../docs/adr/0009-wifi-web-transport.md) for the full design and the feasibility
+[ADR 0010](../docs/adr/0010-wifi-web-transport.md) for the full design and the feasibility
 findings (Zephyr 4.5 supports both Wi-Fi AP and station mode on `frdm_rw612` - confirmed
 against the Zephyr source tree and its own `samples/net/wifi/apsta_mode` sample, not assumed).
 This section covers setup, build/flash, and the exact hardware test for each mode.
 
 **Hardware results so far (`ac601b2`)**: USB, the KeepAlive, and the `File` listing kept
 working with Wi-Fi active in both modes - the coexistence requirement held. Wi-Fi itself
-failed in both modes; see ADR 0009's "Hardware findings" section for the full writeup. Two
+failed in both modes; see ADR 0010's "Hardware findings" section for the full writeup. Two
 confirmed-from-source bugs are fixed in this round (an AP-mode DHCPv4 server conflict, and
 STA/AP event logging that reported failures as successes) but neither fix has been verified on
 real hardware yet - the steps below are still what decides that.
@@ -899,7 +925,7 @@ Same as the plain build above, once `wifi_credentials.conf` is in place:
 west build -b frdm_rw612 firmware/app --pristine
 ```
 
-Both modes build clean; see ADR 0009 for the measured RAM/flash cost (a real, large jump - the
+Both modes build clean; see ADR 0010 for the measured RAM/flash cost (a real, large jump - the
 single biggest of any issue so far in this project, from bringing in Zephyr's networking
 stack, Wi-Fi driver, HTTP server, and mbedTLS).
 
@@ -913,12 +939,12 @@ stack, Wi-Fi driver, HTTP server, and mbedTLS).
    `Startup summary: mode=AP iface=up ip=192.168.4.1 dhcp=driver-managed ...
    url=http://192.168.4.1/` line, and (once something joins) a
    `Wi-Fi AP: station <MAC> joined` line. On `ac601b2` neither the enable-result nor the "AP
-   enabled" line ever appeared, and `nxp_wifi: DHCP Server start failed` did - see ADR 0009's
+   enabled" line ever appeared, and `nxp_wifi: DHCP Server start failed` did - see ADR 0010's
    "Hardware findings" for the confirmed cause (an app-layer DHCPv4 server conflicting with the
    driver's own) and the fix applied here; this is the first thing to check.
 3. On an iPhone and separately on a Mac: open Wi-Fi settings and look for the board's SSID in
    the list before anything else - on `ac601b2` it never appeared at all. If it still doesn't
-   appear even with the DHCP fix applied, that's the still-unconfirmed part (see ADR 0009) and
+   appear even with the DHCP fix applied, that's the still-unconfirmed part (see ADR 0010) and
    worth a comment on the issue with whatever the console showed. If it does appear, join with
    its passphrase and confirm the device gets an IP in the `192.168.4.x` range (Settings >
    Wi-Fi > (i) on iPhone; System Settings > Wi-Fi > Details on Mac).
@@ -927,7 +953,7 @@ stack, Wi-Fi driver, HTTP server, and mbedTLS).
    `presets: N (generation G)` status line. On `26bfec1` this step crashed the board outright -
    a USAGE FAULT / stack overflow on thread `rx_q[0]` - in both AP and station mode, with or
    without a Quad Cortex attached. Root cause confirmed from source and fixed (this build raises
-   `CONFIG_NET_RX_STACK_SIZE`; see ADR 0009's "Hardware findings (`26bfec1`)"), but **not yet
+   `CONFIG_NET_RX_STACK_SIZE`; see ADR 0010's "Hardware findings (`26bfec1`)"), but **not yet
    verified on hardware** - this is the first thing to check. The page should now load instead
    of crashing; if it crashes again with the same `rx_q[0]`/stack-overflow signature, paste the
    full fault register dump (especially PC/LR) on the issue rather than re-guessing - it would
@@ -963,7 +989,7 @@ disabled) would be the coexistence requirement failing, not just a Wi-Fi bug.
    `CONFIG_WIFI_STA_AUTO_DHCPV4`), or a `Wi-Fi station connect failed: <reason>
    (status_code=N, reason_code=N)` warning. On `ac601b2`, this firmware logged
    "connected" even around a genuine `nxp_wifi: WLAN: nxp_wlan_network authentication failed`
-   warning - that was this firmware not reading the event's own status (see ADR 0009's
+   warning - that was this firmware not reading the event's own status (see ADR 0010's
    "Hardware findings"), now fixed; a "connected" line should mean it actually connected.
 3. Find the board's IP address - easiest from the router's own client list (DHCP leases),
    since nothing here advertises it, or from the `ip=` field in the startup-summary log line
@@ -974,7 +1000,7 @@ disabled) would be the coexistence requirement failing, not just a Wi-Fi bug.
    preset/generation counts, and a preset change on the unit pushes a live update over the
    WebSocket within a couple of seconds (shown as a `preset change (cmd N, #M)` note on the
    status line, even when the listing itself didn't change). Same `26bfec1` page-load crash and
-   fix applies here too (see the AP-mode step above and ADR 0009) - not yet verified on
+   fix applies here too (see the AP-mode step above and ADR 0010) - not yet verified on
    hardware.
 5. Same 10-15 minute soak as AP mode: confirm KeepAlive/File-stream/USB behavior is unaffected,
    and the station stays connected - watch for any further
@@ -984,7 +1010,7 @@ disabled) would be the coexistence requirement failing, not just a Wi-Fi bug.
 **What each outcome means**: same as AP mode above, plus - a `Wi-Fi station connect failed`
 with `WIFI_STATUS_CONN_WRONG_PASSWORD` is the driver's generic code for *any* 4-way-handshake
 failure, not only an actually-wrong passphrase (confirmed from the driver's own source comment
-- see ADR 0009), so don't read it as proof the passphrase is wrong; paste the exact
+- see ADR 0010), so don't read it as proof the passphrase is wrong; paste the exact
 status/reason codes when commenting on the issue. The owner has confirmed "Radioshack" is WPA2
 (not WPA3/mixed) on both bands under the same SSID, which rules out a security-type mismatch -
 this build's request was already using the matching `WIFI_SECURITY_TYPE_PSK`. A station that

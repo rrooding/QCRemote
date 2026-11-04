@@ -5,7 +5,11 @@
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 #include "QcHidBridge.hpp"
+// Off on a board config without Wi-Fi (e.g. an ESP32-S3 module with no
+// PSRAM, issue #76) - the USB bridge then runs on its own.
+#if defined(CONFIG_WIFI)
 #include "QcWifiWebTransport.hpp"
+#endif
 
 namespace qcbridge {
 
@@ -35,7 +39,9 @@ namespace {
 const gpio_dt_spec kLedSpec = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 const auto kBlinkInterval = K_MSEC(500);
 qcbridge::QcHidBridge g_qcHidBridge;
+#if defined(CONFIG_WIFI)
 qcbridge::QcWifiWebTransport g_qcWifiWebTransport;
+#endif
 }  // namespace
 
 int main() {
@@ -54,8 +60,10 @@ int main() {
     // QcSession never include QcWifiWebTransport.hpp themselves (see that
     // header's own comment) - this is the one place Wi-Fi/HTTP and the USB
     // bridge meet.
+#if defined(CONFIG_WIFI)
     g_qcHidBridge.session().addTransport(g_qcWifiWebTransport);
     g_qcWifiWebTransport.start();
+#endif
 
     if (g_qcHidBridge.start() != 0) {
         LOG_ERR("USB host bridge failed to start");

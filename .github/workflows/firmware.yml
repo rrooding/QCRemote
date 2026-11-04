@@ -114,7 +114,15 @@ jobs:
           if ! git -C zephyr apply --reverse --check "$patch" 2>/dev/null; then
             git -C zephyr apply "$patch"
           fi
-          west build -b esp32s3_devkitc/esp32s3/procpu "$GITHUB_WORKSPACE/firmware/app" -d build-esp32s3 --pristine
+          # Default board config: PSRAM module, Wi-Fi on (issue #71). The ESP
+          # Wi-Fi driver needs hal_espressif's blobs (~40 MB, every chip);
+          # BUILD_ONLY_NO_BLOBS is Zephyr's own switch for building it in CI
+          # without them - the image links but isn't meant to run.
+          west build -b esp32s3_devkitc/esp32s3/procpu "$GITHUB_WORKSPACE/firmware/app" -d build-esp32s3 --pristine \
+            -- -DCONFIG_BUILD_ONLY_NO_BLOBS=y
+          # Module without PSRAM: USB only, Wi-Fi off.
+          west build -b esp32s3_devkitc/esp32s3/procpu "$GITHUB_WORKSPACE/firmware/app" -d build-esp32s3-nopsram --pristine \
+            -- -DFILE_SUFFIX=nopsram
 
       - name: Run firmware Ztest suites (native_sim)
         run: |

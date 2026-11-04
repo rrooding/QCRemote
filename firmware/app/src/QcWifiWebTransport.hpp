@@ -6,6 +6,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/net/dhcpv4_server.h>
 #include <zephyr/net/http/server.h>
 #include <zephyr/net/http/service.h>
 #include <zephyr/net/net_if.h>
@@ -343,7 +344,7 @@ private:
     // itself defaults to y under CONFIG_WIFI_USAGE_MODE_AP), confirmed at
     // drivers/wifi/nxp/src/nxp_wifi_drv.c's WLAN_REASON_UAP_SUCCESS case
     // (net_dhcpv4_server_start(g_uap.netif, &base_addr), gated by that
-    // Kconfig). ADR 0009's original claim that the driver never does this
+    // Kconfig). ADR 0010's original claim that the driver never does this
     // was wrong - it was checked against the generic NXP Wi-Fi Kconfig
     // text, not this specific code path.
     //
@@ -365,8 +366,14 @@ private:
     //
     // Fix: don't start a second DHCPv4 server at all. The IP range is
     // configured once, via CONFIG_NXP_WIFI_SOFTAP_IP_ADDRESS/_MASK/_BASE
-    // (prj.conf), and the driver brings up the static IP and DHCPv4 server
-    // itself once WLAN_REASON_UAP_SUCCESS fires.
+    // (boards/frdm_rw612.conf), and the driver brings up the static IP and
+    // DHCPv4 server itself once WLAN_REASON_UAP_SUCCESS fires.
+    //
+    // Other drivers don't (the ESP32's doesn't - Zephyr's apsta_mode sample
+    // starts its own server for it). For those, CONFIG_QC_WIFI_AP_APP_DHCP_SERVER
+    // (app Kconfig, on whenever the driver isn't NXP's) has this class set the
+    // address and start the server itself, before enabling the AP, the same
+    // way that sample does - see startAppDhcpServer().
     //
     // What this does NOT establish: WLAN_REASON_UAP_SUCCESS firing (and
     // the DHCP conflict log appearing) proves the chip firmware itself
@@ -406,15 +413,58 @@ private:
             apParams_.security = WIFI_SECURITY_TYPE_NONE;
         }
 
+#if defined(CONFIG_QC_WIFI_AP_APP_DHCP_SERVER)
+        if (!startAppDhcpServer(iface)) {
+            return;
+        }
+        LOG_INF("Wi-Fi AP \"%s\" starting (DHCPv4 server started by this firmware - "
+                "CONFIG_QC_WIFI_AP_IP_ADDRESS=%s)",
+                CONFIG_QC_WIFI_AP_SSID, CONFIG_QC_WIFI_AP_IP_ADDRESS);
+#else
         LOG_INF("Wi-Fi AP \"%s\" starting (DHCPv4 server is driver-managed - "
                 "CONFIG_NXP_WIFI_SOFTAP_IP_ADDRESS=%s)",
                 CONFIG_QC_WIFI_AP_SSID, CONFIG_NXP_WIFI_SOFTAP_IP_ADDRESS);
+#endif
         const int ret = net_mgmt(NET_REQUEST_WIFI_AP_ENABLE, iface, &apParams_, sizeof(apParams_));
         if (ret != 0) {
             LOG_ERR("NET_REQUEST_WIFI_AP_ENABLE failed: %d", ret);
         }
 #endif
     }
+
+#if defined(CONFIG_QC_WIFI_AP_APP_DHCP_SERVER)
+    // Static address, netmask and gateway on the AP interface, then a DHCPv4
+    // server whose pool starts 10 addresses above it - the same steps as
+    // Zephyr's samples/net/wifi/apsta_mode enable_dhcpv4_server().
+    static bool startAppDhcpServer(net_if* iface) {
+        net_in_addr addr{};
+        net_in_addr netmask{};
+        if (net_addr_pton(NET_AF_INET, CONFIG_QC_WIFI_AP_IP_ADDRESS, &addr) != 0 ||
+            net_addr_pton(NET_AF_INET, CONFIG_QC_WIFI_AP_NETMASK, &netmask) != 0) {
+            LOG_ERR("Invalid CONFIG_QC_WIFI_AP_IP_ADDRESS/_NETMASK");
+            return false;
+        }
+
+        net_if_ipv4_set_gw(iface, &addr);
+        if (net_if_ipv4_addr_add(iface, &addr, NET_ADDR_MANUAL, 0) == nullptr) {
+            LOG_ERR("Unable to set the AP interface's IPv4 address");
+            return false;
+        }
+        if (!net_if_ipv4_set_netmask_by_addr(iface, &addr, &netmask)) {
+            LOG_ERR("Unable to set the AP interface's netmask");
+            return false;
+        }
+
+        net_in_addr poolStart = addr;
+        poolStart.s4_addr[3] += 10;
+        const int ret = net_dhcpv4_server_start(iface, &poolStart);
+        if (ret != 0) {
+            LOG_ERR("DHCPv4 server start failed: %d", ret);
+            return false;
+        }
+        return true;
+    }
+#endif
 
     void startStation() {
 #if !defined(CONFIG_WIFI_USAGE_MODE_AP)
@@ -436,7 +486,7 @@ private:
         staParams_.ssid = kSsid;
         staParams_.ssid_length = sizeof(CONFIG_QC_WIFI_STA_SSID) - 1;
         staParams_.channel = WIFI_CHANNEL_ANY;
-        // No band hint here, deliberately (ADR 0009 originally hardcoded
+        // No band hint here, deliberately (ADR 0010 originally hardcoded
         // WIFI_FREQ_BAND_2_4_GHZ as "the owner's decision" - the owner
         // never asked for that; they only said 2.4 GHz reliability wasn't
         // a concern). Confirmed by reading nxp_wifi_connect()
@@ -560,11 +610,18 @@ private:
         }
         LOG_INF("Startup summary: mode=%s iface=%s ip=%s dhcp=%s http_server=%s url=http://%s/",
                 isAp ? "AP" : "STA", iface != nullptr && net_if_is_up(iface) ? "up" : "down", ipStr,
-                isAp ? "driver-managed (CONFIG_NXP_WIFI_SOFTAP_DHCP_SERVER)"
-                     : "Zephyr DHCPv4 client (CONFIG_WIFI_STA_AUTO_DHCPV4)",
+                isAp ? kApDhcpDescription : "Zephyr DHCPv4 client (CONFIG_WIFI_STA_AUTO_DHCPV4)",
                 httpServerStarted_ ? "listening" : "FAILED TO START",
                 addr != nullptr ? ipStr : "<pending>");
     }
+
+#if defined(CONFIG_QC_WIFI_AP_APP_DHCP_SERVER)
+    static constexpr const char* kApDhcpDescription =
+        "started by this firmware (CONFIG_QC_WIFI_AP_APP_DHCP_SERVER)";
+#else
+    static constexpr const char* kApDhcpDescription =
+        "driver-managed (CONFIG_NXP_WIFI_SOFTAP_DHCP_SERVER)";
+#endif
 
     static QcWifiWebTransport* instance_;
 

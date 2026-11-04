@@ -1,4 +1,4 @@
-# ADR 0009: Generic transport seam, proven with a Wi-Fi web/WebSocket transport
+# ADR 0010: Generic transport seam, proven with a Wi-Fi web/WebSocket transport
 
 Date: 2026-11-01
 Status: Accepted

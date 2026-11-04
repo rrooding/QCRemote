@@ -1,0 +1,21 @@
+/*
+ * ESP32-S3-DevKitC-1 with a module *without* PSRAM (WROOM-1-N8/N16), selected
+ * with -DFILE_SUFFIX=nopsram - issue #76. Wi-Fi is off in the matching .conf:
+ * it doesn't fit internal RAM alongside the protocol buffers. Otherwise the
+ * same as esp32s3_devkitc_esp32s3_procpu.overlay (see there for the USB and
+ * LED notes), minus the PSRAM node.
+ */
+
+/ {
+	aliases {
+		led0 = &heartbeat_led;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		heartbeat_led: heartbeat_led {
+			gpios = <&gpio0 2 GPIO_ACTIVE_HIGH>;
+		};
+	};
+};
