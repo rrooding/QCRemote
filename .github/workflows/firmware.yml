@@ -39,10 +39,12 @@ jobs:
       # Confirmed working: a warm-cache run restored 4.7GB and finished in
       # ~5 minutes (vs ~8.5 cold), with the SDK correctly found unreinstalled.
       #
-      # Keyed on the Zephyr version alone - the workspace/SDK don't depend
-      # on our own source, so hashing it here would invalidate this cache
-      # (re-clone zephyr, re-download the SDK) on every commit, defeating
-      # the point of caching it at all.
+      # Keyed on the Zephyr version and the installed toolchains - the
+      # workspace/SDK don't depend on our own source, so hashing it here would
+      # invalidate this cache (re-clone zephyr, re-download the SDK) on every
+      # commit, defeating the point of caching it at all. The toolchain list
+      # is in the key because a cache hit skips the SDK install entirely, so
+      # adding a toolchain (issue #76: the ESP32-S3's) needs a fresh cache.
       - name: Cache Zephyr workspace and SDK
         uses: actions/cache@v6
         with:
@@ -50,7 +52,7 @@ jobs:
             ~/zephyrproject
             ~/zephyr-sdk-*
             ~/.cmake/packages
-          key: zephyr-${{ env.ZEPHYR_VERSION }}-${{ runner.os }}
+          key: zephyr-${{ env.ZEPHYR_VERSION }}-${{ runner.os }}-arm-esp32s3
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -69,13 +71,26 @@ jobs:
           west update
           west packages pip --install --ignore-venv-check
           if ! compgen -G "$HOME/zephyr-sdk-*" > /dev/null; then
-            west sdk install --install-base ~ --gnu-toolchains arm-zephyr-eabi
+            west sdk install --install-base ~ --gnu-toolchains arm-zephyr-eabi xtensa-espressif_esp32s3_zephyr-elf
           fi
 
       - name: Build frdm_rw612
         run: |
           cd ~/zephyrproject
           west build -b frdm_rw612 "$GITHUB_WORKSPACE/firmware/app" --pristine
+
+      # Issue #76 / ADR 0009. The DWC2 driver patch is a runtime fix and the
+      # build passes without it, but build what actually runs on the board.
+      # The workspace is cached, so the patch may already be applied from an
+      # earlier run - apply only if it isn't.
+      - name: Build esp32s3_devkitc
+        run: |
+          cd ~/zephyrproject
+          patch="$GITHUB_WORKSPACE/firmware/patches/zephyr/0001-uhc_dwc2-start-late-periodic-channels.patch"
+          if ! git -C zephyr apply --reverse --check "$patch" 2>/dev/null; then
+            git -C zephyr apply "$patch"
+          fi
+          west build -b esp32s3_devkitc/esp32s3/procpu "$GITHUB_WORKSPACE/firmware/app" -d build-esp32s3 --pristine
 
       - name: Run firmware Ztest suites (native_sim)
         run: |

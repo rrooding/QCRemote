@@ -242,6 +242,18 @@ private:
     // Still below the main LED-blink loop's priority.
     static constexpr int kHeartbeatThreadPriority = 5;
     static constexpr k_timeout_t kHeartbeatInterval = K_MSEC(200);
+    static constexpr int32_t kSlowSendMs = 50;
+
+    // See waitForInTrafficToSettle(). A "busy" poll is one with more IN
+    // transfers than the background pushes produce (GlobalTempo alone is
+    // ~4/s, so ~1 per poll); the reply burst runs at hundreds per second.
+    static constexpr int32_t kSettlePollMs = 200;
+    static constexpr uint32_t kSettledMaxTransfersPerPoll = 5;
+    // How long to wait for the burst to start before assuming it never will
+    // (the device's Version reply alone has taken ~700ms), and the cap on
+    // the whole wait.
+    static constexpr int32_t kSettleNoBurstMs = 1600;
+    static constexpr int32_t kSettleMaxMs = 6000;
 
     // Single device, single session at a time - a fixed id is enough (no
     // need for qc-mcp's Python client's random per-run UUID-style value).
@@ -328,9 +340,8 @@ private:
         // after its Connection UPDATE, before any listing - with a comment
         // that this is what "makes the QC start streaming and marks the
         // session active." Sent back-to-back with no wait for a reply in
-        // between (and no wait for any of their replies before moving on to
-        // the File READ below either): that's what qc-mcp itself does - its
-        // loop fires all twelve, then only pauses briefly before discarding
+        // between: that's what qc-mcp itself does - its loop fires all
+        // twelve, then only pauses briefly before discarding
         // whatever already came back, never gating on a specific reply.
         // This firmware mirrors that fire-and-forget shape rather than
         // inventing a synchronous wait qc-mcp doesn't have. A send failure
@@ -342,7 +353,9 @@ private:
         // and ModuleStats, which handleMessage() now ignores outright
         // (issue #33 / ADR 0007) - the preset listing below doesn't need
         // either, and both are large enough that buffering them would cost
-        // real RAM for no benefit.
+        // real RAM for no benefit. The File READ itself does wait, though:
+        // not for any one reply, but for the replies' combined burst to
+        // drain (waitForInTrafficToSettle()).
         for (const uint16_t command : kPostConnectStateReadCommands) {
             msg.clear();
             encodeStateRead(msg, command, nextRequestId());
@@ -350,6 +363,8 @@ private:
                 LOG_WRN("Handshake: failed to send state READ (command=%u)", command);
             }
         }
+
+        waitForInTrafficToSettle();
 
         // File READ (issue #60): asks for the device's whole catalog, which
         // comes back as a stream of File UPDATE messages - see
@@ -382,6 +397,45 @@ private:
         encodeFileRead(msg, nextRequestId());
         if (!sendMessage(msg)) {
             LOG_ERR("Handshake: failed to send File READ");
+        }
+    }
+
+    // Holds the File READ back until the state READs' replies have drained
+    // (issue #76). ModelRepo (~59 KB) and ModuleStats (~28 KB) come back as one burst of
+    // several hundred reports. A Full Speed host gets one interrupt packet
+    // per 1ms frame and needs two per 129-byte report (wMaxPacketSize is
+    // 128), so it tops out around 500 reports/s - and the device drops what
+    // it can't send in time instead of waiting. A dropped report can't be
+    // detected (no sequence numbers), so a File READ sent into that burst
+    // came back as merged, undecodable messages and an empty catalog (RW612
+    // forced to Full Speed: 471 IN transfers against 986 at High Speed). At
+    // High Speed the burst drains quickly and this costs little.
+    void waitForInTrafficToSettle() {
+        const int64_t start = k_uptime_get();
+        uint32_t last = totalInTransfers_.load(std::memory_order_relaxed);
+        const uint32_t first = last;
+        bool sawBurst = false;
+
+        while (true) {
+            k_sleep(K_MSEC(kSettlePollMs));
+            const uint32_t now = totalInTransfers_.load(std::memory_order_relaxed);
+            const auto elapsed = static_cast<int32_t>(k_uptime_get() - start);
+            const bool busy = now - last > kSettledMaxTransfersPerPoll;
+            last = now;
+
+            if (busy) {
+                sawBurst = true;
+            } else if (sawBurst || elapsed >= kSettleNoBurstMs) {
+                LOG_INF("State READ replies settled after %d ms (%u IN transfers)", elapsed,
+                        now - first);
+                return;
+            }
+            if (elapsed >= kSettleMaxMs) {
+                LOG_WRN("IN traffic still busy after %d ms (%u IN transfers), sending File "
+                        "READ anyway",
+                        elapsed, now - first);
+                return;
+            }
         }
     }
 
@@ -618,7 +672,16 @@ private:
         report.resize(kHidReportSize);
 
         while (chunker.next({report.data(), report.size()})) {
+            const int64_t sendStart = k_uptime_get();
             const int ret = UsbHostClass::sendReport({report.data(), report.size()});
+            const auto sendMs = static_cast<int32_t>(k_uptime_get() - sendStart);
+            // A SET_REPORT normally finishes in a few ms. A slow one holds
+            // sendMutex_ and delays the KeepAlive behind it, which can make
+            // the device stop streaming - worth seeing in the log. Not on the
+            // usbh thread, so logging is safe here.
+            if (sendMs > kSlowSendMs) {
+                LOG_WRN("sendReport took %d ms (ret=%d)", sendMs, ret);
+            }
             if (ret != 0 && ret != -EPIPE) {
                 LOG_ERR("sendReport failed: %d", ret);
                 return false;

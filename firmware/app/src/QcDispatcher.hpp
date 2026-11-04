@@ -103,8 +103,13 @@ private:
     // back here would be circular. Keep in sync by hand - issue #33's final
     // sizing (ADR 0007) is 131072, matching kReassemblyCapacity: uncompressed
     // `File` messages (confirmed on every hardware run so far: 0 compressed)
-    // go through this mailbox, not QcGzipInflater's.
+    // go through this mailbox, not QcGzipInflater's. Follows the same
+    // CONFIG_QC_MESSAGE_CAPACITY override as kReassemblyCapacity.
+#if defined(CONFIG_QC_MESSAGE_CAPACITY)
+    static constexpr size_t kMailboxCapacity = CONFIG_QC_MESSAGE_CAPACITY;
+#else
     static constexpr size_t kMailboxCapacity = 131072;
+#endif
 
     static void threadEntryTrampoline(void* p1, void*, void*) { static_cast<QcDispatcher*>(p1)->run(); }
 

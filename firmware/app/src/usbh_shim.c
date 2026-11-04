@@ -14,6 +14,15 @@
 #include <usbh_desc.h>
 #include <usbh_device.h>
 
+#if defined(CONFIG_QC_USBH_FORCE_FULL_SPEED)
+#include <fsl_device_registers.h>
+
+/* PORTSC1's write-1-to-clear change bits (CSC, PEC, OCC) - masked out of a
+ * read-modify-write so it doesn't acknowledge changes the EHCI driver hasn't
+ * handled yet. Same value as the NXP SDK's EHCI_PORTSC1_W1_BITS. */
+#define QC_PORTSC1_W1C_BITS 0x0000002AU
+#endif
+
 LOG_MODULE_REGISTER(usbh_shim, LOG_LEVEL_INF);
 
 /*
@@ -187,9 +196,10 @@ static void discover_endpoints(const struct usb_if_descriptor *const if_desc)
 		if (desc->bDescriptorType == USB_DESC_ENDPOINT) {
 			const struct usb_ep_descriptor *ep_desc = (const void *)desc;
 
-			LOG_INF("Found endpoint 0x%02x, attributes 0x%02x, wMaxPacketSize %u",
+			LOG_INF("Found endpoint 0x%02x, attributes 0x%02x, wMaxPacketSize %u, "
+				"bInterval %u",
 				ep_desc->bEndpointAddress, ep_desc->bmAttributes,
-				ep_desc->wMaxPacketSize);
+				ep_desc->wMaxPacketSize, ep_desc->bInterval);
 
 			if (USB_EP_DIR_IS_IN(ep_desc->bEndpointAddress)) {
 				ep_in = ep_desc->bEndpointAddress;
@@ -234,6 +244,12 @@ static int shim_probe(struct usbh_class_data *const c_data, struct usb_device *c
 	}
 
 	claimed_udev = udev;
+#if defined(CONFIG_QC_USBH_FORCE_FULL_SPEED)
+	/* PSPD: 0 = Full, 1 = Low, 2 = High Speed */
+	LOG_INF("Port speed (PSPD): %u",
+		(unsigned int)((USBOTG->PORTSC1 & USBC_PORTSC1_PSPD_MASK) >>
+			       USBC_PORTSC1_PSPD_SHIFT));
+#endif
 	discover_endpoints(desc);
 
 	LOG_INF("Interface %u endpoints: IN=0x%02x", registered_filter.iface, ep_in);
@@ -294,16 +310,36 @@ int qc_usbh_bridge_start(const struct qc_usbh_filter *filter, const struct qc_us
 	if (ret != 0) {
 		return ret;
 	}
-	return usbh_enable(&qc_usbh_ctx);
+	ret = usbh_enable(&qc_usbh_ctx);
+
+#if defined(CONFIG_QC_USBH_FORCE_FULL_SPEED)
+	/* After usbh_enable(): the controller start-up rewrites PORTSC1. The
+	 * driver's later port reset is a read-modify-write, so PFSC survives it.
+	 * Plug the device in after this line is logged. */
+	if (ret == 0) {
+		USBOTG->PORTSC1 = (USBOTG->PORTSC1 & ~QC_PORTSC1_W1C_BITS) |
+				  USBC_PORTSC1_PFSC_MASK;
+		LOG_WRN("USB host forced to Full Speed (CONFIG_QC_USBH_FORCE_FULL_SPEED)");
+	}
+#endif
+	return ret;
 }
 
 int qc_usbh_send_report(const uint8_t *report, size_t len)
 {
-	if (claimed_udev == NULL) {
+	/* A local copy, not claimed_udev itself: usbh_req_setup() below blocks
+	 * (up to its own timeout), and shim_removed() can clear claimed_udev on
+	 * the usbh thread meanwhile. Freeing the buffer through the cleared
+	 * global then dereferenced NULL - a KeepAlive send that was in flight
+	 * when the Quad Cortex disconnected crashed this way on the ESP32-S3
+	 * (issue #76). */
+	struct usb_device *const udev = claimed_udev;
+
+	if (udev == NULL) {
 		return -ENODEV;
 	}
 
-	struct net_buf *buf = usbh_xfer_buf_alloc(claimed_udev, len);
+	struct net_buf *buf = usbh_xfer_buf_alloc(udev, len);
 
 	if (buf == NULL) {
 		return -ENOMEM;
@@ -322,9 +358,9 @@ int qc_usbh_send_report(const uint8_t *report, size_t len)
 	const uint16_t w_value = (0x02 << 8) | report_id;
 	const uint16_t w_index = registered_filter.iface;
 
-	int ret = usbh_req_setup(claimed_udev, bm_request_type, b_request, w_value, w_index,
+	int ret = usbh_req_setup(udev, bm_request_type, b_request, w_value, w_index,
 				 (uint16_t)len, buf);
 
-	usbh_xfer_buf_free(claimed_udev, buf);
+	usbh_xfer_buf_free(udev, buf);
 	return ret;
 }

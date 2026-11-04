@@ -1,0 +1,28 @@
+/*
+ * ESP32-S3-DevKitC-1 (issue #76, ADR 0009).
+ *
+ * USB host: the board devicetree already labels the S3's OTG controller
+ * zephyr_uhc0 and enables it, so nothing to change here. Its D-/D+ are fixed
+ * at GPIO19/GPIO20 (header J3 pins 20/19), not routed through pinctrl. The
+ * board's native micro-USB port has no VBUS output (it only powers the
+ * board), so the Quad Cortex is wired from the header instead - see
+ * firmware/README.md.
+ *
+ * Heartbeat LED: Main.cpp blinks led0, but this board only has an addressable
+ * RGB LED (GPIO48), which a plain GPIO toggle can't drive. GPIO2 (J3 pin 5) is
+ * unused here - put an LED + resistor on it to see the heartbeat, or ignore.
+ */
+
+/ {
+	aliases {
+		led0 = &heartbeat_led;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		heartbeat_led: heartbeat_led {
+			gpios = <&gpio0 2 GPIO_ACTIVE_HIGH>;
+		};
+	};
+};
