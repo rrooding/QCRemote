@@ -161,6 +161,29 @@ the first). Unconfirmed: how long a late-booting unit actually takes between enu
 and answering, and whether it needs anything beyond a repeated `Version` READ. Not fixed
 yet — tracked in #65.
 
+## Full Speed hosts (#76)
+
+Tested on an RW612 forced to Full Speed and on an ESP32-S3 (Full Speed only):
+
+- **The device works at Full Speed but keeps a High Speed endpoint size.** Interface 5's
+  interrupt IN endpoint `0x81` still reports `wMaxPacketSize 128` and `bInterval 1` at Full
+  Speed, above USB 2.0's 64-byte Full Speed limit. Both the RW612's EHCI and the S3's DWC2
+  accepted it. Each 129-byte report goes as two packets (128 + 1), one packet per 1 ms frame,
+  so the endpoint tops out around 500 reports/s.
+- **The device drops reports it can't send.** It doesn't wait for the host: when the host
+  polls too slowly, whole reports go missing without any error. The reassembler can't detect
+  a missing middle report (no sequence numbers), so neighbouring messages merge into one
+  oversized, undecodable message. On the RW612 at Full Speed, a File READ sent straight after
+  the 12 state READs saw 471 IN transfers against 986 at High Speed, 18 instead of 21 File
+  messages, a 15737-byte message that never occurs at High Speed, and an empty catalog.
+- **Spacing requests fixes it.** Waiting for the state READs' reply burst (~465 reports over
+  ~1.6 s at Full Speed) to drain before the File READ gives a File stream identical to High
+  Speed on both hosts.
+- **A transfer isn't always a report.** Zephyr's EHCI driver (RW612) completes an interrupt
+  IN transfer when the buffer fills or a short packet arrives, so a 129-byte buffer receives a
+  whole report. Its DWC2 driver (ESP32-S3) completes per packet, so the same report arrives as
+  a 128-byte and a 1-byte transfer. The firmware joins them (see `firmware/README.md`).
+
 ## Open follow-ups
 
 - No heartbeat-off A/B test has been run; "reads require the heartbeat" is still only

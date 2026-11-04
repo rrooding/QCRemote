@@ -1,16 +1,22 @@
-# Firmware (NXP FRDM-RW612)
+# Firmware (NXP FRDM-RW612, ESP32-S3)
 
-Target board: `frdm_rw612` (see [ADR 0002](../docs/adr/0002-devkit-selection.md) for why).
-Zephyr, C++23 (see [CODING_STANDARDS.md](../CODING_STANDARDS.md)).
+Target boards: `frdm_rw612` (see [ADR 0002](../docs/adr/0002-devkit-selection.md) for why)
+and `esp32s3_devkitc/esp32s3/procpu`, a Full Speed USB host and the likely RevA MCU (see
+[ADR 0009](../docs/adr/0009-esp32-s3-second-target.md) and
+["ESP32-S3 target"](#esp32-s3-target-issue-76) below). Same source tree; the board picks the
+target. Zephyr, C++23 (see [CODING_STANDARDS.md](../CODING_STANDARDS.md)).
 
 ## Layout
 
 ```
 firmware/
+├── patches/zephyr/ # local fixes to apply to the Zephyr workspace (see "ESP32-S3 target")
 └── app/            # the actual Zephyr application (out-of-tree, "freestanding")
     ├── CMakeLists.txt
+    ├── Kconfig                     # app options: message buffer size, RW612 Full Speed test mode
     ├── prj.conf
     ├── boards/frdm_rw612.overlay   # switches the RW612's USB peripheral to host mode
+    ├── boards/esp32s3_devkitc_esp32s3_procpu.{overlay,conf}  # ESP32-S3 LED + RAM fit
     ├── src/
     │   ├── Main.cpp
     │   ├── usbh_shim.c/.h          # plain-C boundary around Zephyr's non-C++-safe USB host API
@@ -63,7 +69,9 @@ west blobs fetch hal_nxp
 west build -b frdm_rw612 /path/to/QCRemote/firmware/app --pristine
 ```
 
-Drop `--pristine` on subsequent builds once the build directory exists.
+Drop `--pristine` on subsequent builds once the build directory exists. For the ESP32-S3,
+apply the Zephyr patch first and use its own build directory, so the two targets don't
+overwrite each other - see ["ESP32-S3 target"](#esp32-s3-target-issue-76).
 
 ## Flash
 
@@ -738,6 +746,97 @@ Any deviation from the above - a `File stream limits:` line with a nonzero count
 `OutputTooLarge` on a real preset recall, or a crash - is worth a comment on #33 with the full
 log before assuming the sizing is wrong; it may instead be a bug in this cleanup pass itself
 (this build hasn't run on hardware at all yet, per the note above).
+
+## ESP32-S3 target (issue #76)
+
+The same app builds for the ESP32-S3-DevKitC-1 (`esp32s3_devkitc/esp32s3/procpu`). The S3 is a
+**Full Speed** (12 Mbit/s) USB host; the RW612 is High Speed. Verified on hardware against a
+Quad Cortex Mini on CorOS 4.1.1: the handshake mirrors `4.1.1`, and the File stream is
+identical to the RW612's (21 messages, 29599 wire bytes, largest 10193, 0 malformed, 3
+folders / 48 presets, ~5.7 s). Why this is a target at all: [ADR 0009](../docs/adr/0009-esp32-s3-second-target.md).
+
+### One-time: patch the Zephyr workspace
+
+Zephyr v4.5.0's DWC2 host driver (the S3's USB controller) only starts a waiting interrupt
+transfer when the next frame number *exactly* matches the one it scheduled. Its SOF events
+are coalesced, so a late driver thread steps past that frame and the endpoint stalls for a
+whole frame-counter wrap: **~16.4 s with no IN data** after every connect, long enough for
+the Quad Cortex to drop the Version reply and much of the File stream. The patch starts any
+channel whose frame is now or already past:
+
+```bash
+git -C ~/zephyrproject/zephyr apply /path/to/QCRemote/firmware/patches/zephyr/0001-uhc_dwc2-start-late-periodic-channels.patch
+```
+
+It only touches `drivers/usb/uhc/uhc_dwc2.c`, so RW612 builds aren't affected. Undo with
+`git -C ~/zephyrproject/zephyr checkout drivers/usb/uhc/uhc_dwc2.c`. Not yet upstream; the
+build succeeds without it, but the S3 then shows the 16 s stall above.
+
+### Build, flash, monitor
+
+```bash
+west build -b esp32s3_devkitc/esp32s3/procpu /path/to/QCRemote/firmware/app -d build-s3 --pristine
+west flash -d build-s3
+west espressif monitor
+```
+
+Flash and log over the board's **UART** micro-USB port (CP2102N bridge, `zephyr,console` is
+UART0). If `west flash` doesn't find it, add `--esp-device /dev/tty.usbserial-XXXX`. The ROM
+loader's `SHA-256 comparison failed ... Attempting to boot anyway` line on boot is expected
+with Zephyr's simple-boot image.
+
+### Wiring the Quad Cortex
+
+The board's native "USB" micro-USB port only takes power in - it has no VBUS output - so the
+Quad Cortex is wired from the header pins instead, with VBUS from the 5V pin. Leave the native
+port unplugged; it's in parallel with GPIO19/20.
+
+| Signal | USB colour | USB-A pin | DevKitC-1 header |
+|---|---|---|---|
+| VBUS | red | 1 | J1 pin 21 (5V) |
+| D- | white | 2 | J3 pin 20 (GPIO19) |
+| D+ | green | 3 | J3 pin 19 (GPIO20) |
+| GND | black | 4 | J3 pin 21 (G) |
+
+Check the colours with a meter before connecting - VBUS on a GPIO damages the S3. From the
+USB-A plug, a USB-C-plug-to-USB-A-socket adapter into the Quad Cortex worked on the owner's
+unit. The Quad Cortex draws no current from VBUS; it only needs it present.
+
+### What the S3 needed (all in this tree, all harmless on the RW612)
+
+- **Joining split reports** (`QcHidBridge::onReportIn()`): the DWC2 driver completes an
+  interrupt IN transfer per packet, so with `wMaxPacketSize 128` each 129-byte report arrives
+  as 128 + 1 bytes. The RW612's EHCI driver delivered whole reports, which the reassembler
+  requires.
+- **Connect pacing** (`QcSession::waitForInTrafficToSettle()`): the File READ now waits until
+  the 12 state READs' reply burst (ModelRepo ~59 KB, ModuleStats ~28 KB) has drained. At Full
+  Speed the burst runs close to the endpoint's ceiling (two packets per report, one packet per
+  1 ms frame), and the device drops reports it can't send rather than waiting. With the File
+  READ sent into the burst, messages merged and the catalog came back empty. Logged as
+  `State READ replies settled after N ms (M IN transfers)`; at High Speed it costs ~1-2 s.
+- **Send/disconnect race** (`qc_usbh_send_report()`): a send blocked in `usbh_req_setup()`
+  when the device disconnected then freed its buffer through the already-NULLed
+  `claimed_udev`. It now holds a local copy. Not S3-specific; it just showed up there first.
+- **RAM**: the two 128 KiB message buffers (ADR 0007) don't fit the S3's internal RAM.
+  `CONFIG_QC_MESSAGE_CAPACITY` (app Kconfig, default 131072) sets both; the S3 board config
+  uses 65536, which still holds every message measured on the owner's unit (largest 22667).
+- **Heartbeat LED**: the board's own LED is addressable RGB, so the overlay puts `led0` on
+  GPIO2 (J3 pin 5) - optional.
+
+`sendMessage()` also now logs any `SET_REPORT` that takes over 50 ms, since a slow send holds
+the send lock and delays the KeepAlive behind it.
+
+### Testing Full Speed on the RW612
+
+`CONFIG_QC_USBH_FORCE_FULL_SPEED=y` (RW61x only, off by default) sets `PORTSC1.PFSC`, so the
+RW612 never negotiates High Speed and stands in for a Full Speed host. Set the bit before the
+device attaches: boot with the Quad Cortex unplugged and plug it in after
+`USB host forced to Full Speed` is logged. A board reset with it already plugged in comes up at
+High Speed. The probe log then shows `Port speed (PSPD): 0` (Full; 2 = High).
+
+```bash
+west build -b frdm_rw612 /path/to/QCRemote/firmware/app -d build-fs --pristine -- -DCONFIG_QC_USBH_FORCE_FULL_SPEED=y
+```
 
 ## Not yet done
 
