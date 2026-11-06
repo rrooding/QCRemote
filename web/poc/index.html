@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- viewport-fit=cover is what lets env(safe-area-inset-*) report real
+         values in iOS standalone mode; without it the page is letterboxed
+         inside the safe area and can't draw under the status bar.
+         No user-scalable=no: iOS Safari ignores it for accessibility, and
+         `touch-action: manipulation` below removes the double-tap zoom this
+         UI actually cares about. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>QC Remote</title>
+
+    <!-- Home-screen / standalone behaviour. Both of these work over plain
+         HTTP - unlike service workers and Web Push, which need a secure
+         context and so are unavailable to us by design (ADR 0011). -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="QC Remote" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="theme-color" content="#121316" />
+    <link rel="manifest" href="manifest.webmanifest" />
+
+    <style>
+      /* Design tokens. Our own palette, drawn from scratch - deliberately
+         not sampled from Neural DSP's app or device (issue #84 question 8). */
+      :root {
+        color-scheme: dark;
+        --qc-bg: #121316;
+        --qc-surface: #1a1c21;
+        --qc-surface-2: #23262d;
+        --qc-line: #2e323a;
+        --qc-text: #eceef2;
+        --qc-text-dim: #878d99;
+        --qc-accent: #4fb6c4;
+        --qc-accent-dim: #1d3b41;
+        --qc-ok: #4fc47c;
+        --qc-warn: #d8a93c;
+        --qc-bad: #d4634f;
+        --qc-bad-dim: #40201c;
+      }
+
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--qc-bg);
+        color: var(--qc-text);
+      }
+
+      body {
+        /* The system stack: zero bytes to download, and it is the single
+           biggest reason a web page reads as native on both a phone and a
+           Mac. No webfont, which also means no Neural DSP typeface. */
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, Roboto, sans-serif;
+        /* Kills the 300 ms double-tap-to-zoom delay on taps without
+           disabling pinch zoom. */
+        touch-action: manipulation;
+        /* No page-level rubber banding; the list does its own scrolling. */
+        overscroll-behavior: none;
+        overflow: hidden;
+      }
+
+      noscript {
+        display: block;
+        padding: 2rem 1rem;
+        text-align: center;
+        color: var(--qc-text-dim);
+      }
+    </style>
+  </head>
+  <body>
+    <noscript>This remote needs JavaScript: it streams the board's state over a WebSocket.</noscript>
+    <script type="module" src="src/main.js"></script>
+  </body>
+</html>

@@ -36,6 +36,8 @@ You'll need an NXP FRDM-RW612 board, a Quad Cortex Mini, and a Zephyr toolchain.
 
 - [Protocol notes](docs/PROTOCOL-NOTES.md): what we've learned about talking to the unit
 - [Architecture decisions](docs/adr/): why things are built the way they are
+- [Web UI proof of concept](web/poc/README.md): the remote's interface, running against a mock
+  board on your laptop
 - [Coding standards](CODING_STANDARDS.md): how to contribute code
 
 Ideas, bug reports and test results from other units are very welcome. Please [open an issue](https://github.com/rrooding/QCRemote/issues).
