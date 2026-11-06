@@ -125,9 +125,17 @@ and a change signal) — not HTTP/BLE-specific shapes.
 
 ## Consequences
 
-- **This is a go, pending hardware confirmation.** Both modes build clean on `frdm_rw612`
-  (measurements below); the actual AP/STA/web-UI behavior on real hardware is unverified — see
-  `firmware/README.md`'s exact test steps for each mode.
+- **Go.** The owner has decided Wi-Fi is a viable transport and MVP2 moves to a web UI over
+  Wi-Fi, based on the `b735057` hardware result below: station mode on `frdm_rw612`, from a
+  Mac, Quad Cortex connected — joined the home network, HTTP server listening, page loaded
+  with the full 3-folder/48-preset list, USB/handshake/heartbeat/`File` listing unaffected (21
+  messages, no drops), about 3 minutes with no fault. Access point mode came up and a phone
+  joined on the prior build (`26bfec1`, before the page-load-crash fix) but wasn't retested
+  after it; an iPhone was never tested in either mode; live WebSocket updates don't work and
+  are out of scope for this decision, split out to
+  [issue #75](https://github.com/rrooding/QCRemote/issues/75). See "Hardware findings
+  (`b735057`), and the go decision" below for the full result, and `firmware/README.md`'s
+  exact test steps for what remains unconfirmed.
 - **RAM/flash cost is real and large** — bringing in Zephyr's networking stack, Wi-Fi driver,
   HTTP server, and mbedTLS (pulled in transitively by the HTTP/TLS-capable build, even with
   plain HTTP in use) costs far more than any feature added so far in this firmware. Measured
@@ -329,8 +337,7 @@ the measurement above recorded in a comment there). Re-verified with a from-sour
 this exact fix for both modes: clean links, RAM `+1568 B` in each mode (3072 B rounds the
 underlying `K_KERNEL_STACK_ARRAY_DEFINE` allocation up slightly past the raw 1572 B difference) —
 a trivial, now-known cost, not a repeat of the open-ended growth flagged earlier in this ADR.
-**Not yet verified on hardware** - needs a fresh flash to confirm the fault doesn't recur (see
-firmware/README.md).
+**Confirmed fixed on hardware** — see "Hardware findings (`b735057`), and the go decision" below.
 
 **Other thread margins, checked, no change made**: the pre-crash `thread_analyzer` snapshot also
 showed `net_socket_service` at 2288/4096 (55.8%) and `sysworkq` at 1432/2048 (69.9%) — both
@@ -339,3 +346,44 @@ is on the path identified above (the HTTP server and websocket worker each run o
 thread, not `sysworkq`; `net_mgmt` events already get their own 4608 B thread, not routed through
 `sysworkq` either). No source-confirmed reason to raise either found - read as sane, no change
 made, same as `conn_mgr_monitor` and `rx_q[0]` itself were in the `ac601b2` round above.
+
+## Hardware findings (`b735057`), and the go decision
+
+Station mode, from a Mac, Quad Cortex Mini connected: joined the home network and got an IP
+from DHCP; the HTTP server was listening. The page loaded with the full catalog — 3 folders,
+48 presets. USB, the handshake (`4.1.1`), the heartbeat, and the `File` listing were
+unaffected: 21 messages, no drops or overflows. A preset change arrived over USB as before
+(`RecallPreset` inflated 1223 → 13235 bytes). About 3 minutes with no fault; peak stacks
+`rx_q[0]` 1612/3072, `http_server_tid` 1528/3072, `usbh_bus` 1000/1536 — confirming the
+`CONFIG_NET_RX_STACK_SIZE` fix above with real margin to spare, not just enough to survive.
+
+This is the result the owner's go decision is based on: **Wi-Fi is a viable transport, and
+MVP2 moves to a web UI over Wi-Fi.**
+
+**What this run does not cover**, and so remains exactly as unconfirmed as the sections
+above left it:
+
+- **Access point mode on this build.** AP mode last came up on `26bfec1` (a phone joined
+  "QCRemote", got an IP) — that was *before* the `rx_q[0]` page-load-crash fix this build
+  carries, so AP mode's own page load was never retried against it. Nothing points at an
+  AP-specific gap (the crash was mode-independent — see the `26bfec1` findings above), but it
+  is untested, not assumed-fine.
+- **An iPhone**, in either mode. Every hardware result in this ADR is from a Mac (or, for the
+  `26bfec1` AP join, unspecified which device joined). Safari/iOS's networking stack hasn't
+  touched this build at all.
+- **The 10-15 minute soak** `firmware/README.md`'s test steps ask for — this run was ~3
+  minutes, long enough to rule out the specific crash this round fixed, not a longer-duration
+  regression.
+- **Live WebSocket updates.** These don't work on this build. The owner has treated that as
+  out of scope for the go/no-go decision above, and it's split out to its own issue
+  ([#75](https://github.com/rrooding/QCRemote/issues/75)) rather than blocking this one. A
+  client still gets the catalog on page load (`GET /api/presets.json`); it just doesn't update
+  live without a manual reload.
+
+**ESP32-S3**: Wi-Fi was also wired up for the ESP32-S3 target in this round (issues #71/#76,
+after rebasing onto [#77](https://github.com/rrooding/QCRemote/issues/77)) — see
+[ADR 0009](0009-esp32-s3-second-target.md) and `firmware/README.md`'s "ESP32-S3 target"
+section. That's a CI-only build-cleanliness check so far (`CONFIG_BUILD_ONLY_NO_BLOBS`, no
+Espressif Wi-Fi blobs fetched), not a hardware result — none of the findings in this ADR have
+been run against the S3 with Wi-Fi actually enabled. The S3's own hardware verification to
+date (issue #76/PR #77) is USB-only, with Wi-Fi off (the no-PSRAM config).

@@ -784,6 +784,12 @@ The S3 board config depends on whether the module has PSRAM. Check with
 | **With 8 MB octal PSRAM** (WROOM-1-N8R8/N16R8; RevA's N16R8) | default | USB bridge **and** Wi-Fi/web transport (issue #71). The app's static data (`libapp.a` `.bss`, incl. the 128 KiB message buffers) lives in PSRAM. |
 | **Without PSRAM** (WROOM-1-N8/N16) | `-DFILE_SUFFIX=nopsram` | USB bridge only. Wi-Fi doesn't fit internal RAM (~160 KB over), so it's off; message buffers are 64 KiB. |
 
+**The default (Wi-Fi) build is CI-build-only on the S3 today** - verified to build and link
+clean (`CONFIG_BUILD_ONLY_NO_BLOBS`, no Espressif Wi-Fi blobs fetched), but none of this
+firmware's Wi-Fi/web-transport hardware results (see "Wi-Fi host/client mode" below) have been
+run against the S3 - every one of them is from the `frdm_rw612`. The S3's own hardware
+verification to date (issue #76/PR #77) is USB-only, with Wi-Fi off (the `nopsram` config).
+
 The default (Wi-Fi) build also needs Espressif's Wi-Fi/BT blobs. Zephyr checks for the whole
 set, not just the S3's (~40 MB, no license click-through):
 
@@ -873,12 +879,19 @@ findings (Zephyr 4.5 supports both Wi-Fi AP and station mode on `frdm_rw612` - c
 against the Zephyr source tree and its own `samples/net/wifi/apsta_mode` sample, not assumed).
 This section covers setup, build/flash, and the exact hardware test for each mode.
 
-**Hardware results so far (`ac601b2`)**: USB, the KeepAlive, and the `File` listing kept
-working with Wi-Fi active in both modes - the coexistence requirement held. Wi-Fi itself
-failed in both modes; see ADR 0010's "Hardware findings" section for the full writeup. Two
-confirmed-from-source bugs are fixed in this round (an AP-mode DHCPv4 server conflict, and
-STA/AP event logging that reported failures as successes) but neither fix has been verified on
-real hardware yet - the steps below are still what decides that.
+**Go: the owner has decided Wi-Fi is a viable transport, and MVP2 moves to a web UI over
+Wi-Fi.** That decision is based on this build's (`b735057`) station-mode hardware result: from
+a Mac, Quad Cortex Mini connected, the board joined the home network, the page loaded with the
+full 3-folder/48-preset catalog, and USB/handshake/heartbeat/`File` listing were unaffected (21
+messages, no drops) over about 3 minutes with no fault. See ADR 0010's "Hardware findings
+(`b735057`), and the go decision" section for the full writeup, including what this result
+does and doesn't cover - in particular: **access point mode last came up on an earlier build
+(`26bfec1`, a phone joined) and hasn't been retested since**, **no iPhone has been tested in
+either mode**, and **live WebSocket updates don't work** - a client gets the catalog on page
+load, but a preset change on the unit doesn't push a live update; that's split out to
+[issue #75](https://github.com/rrooding/QCRemote/issues/75) rather than blocking this one. The
+steps below are still the exact test to repeat for anything not yet covered by the result
+above.
 
 ### Setup: Wi-Fi mode and credentials
 
@@ -941,28 +954,29 @@ stack, Wi-Fi driver, HTTP server, and mbedTLS).
    `Wi-Fi AP: station <MAC> joined` line. On `ac601b2` neither the enable-result nor the "AP
    enabled" line ever appeared, and `nxp_wifi: DHCP Server start failed` did - see ADR 0010's
    "Hardware findings" for the confirmed cause (an app-layer DHCPv4 server conflicting with the
-   driver's own) and the fix applied here; this is the first thing to check.
+   driver's own) and the fix applied here. **Confirmed fixed on `26bfec1`**: "AP enabled" and
+   the second startup-summary line both appeared.
 3. On an iPhone and separately on a Mac: open Wi-Fi settings and look for the board's SSID in
-   the list before anything else - on `ac601b2` it never appeared at all. If it still doesn't
-   appear even with the DHCP fix applied, that's the still-unconfirmed part (see ADR 0010) and
-   worth a comment on the issue with whatever the console showed. If it does appear, join with
-   its passphrase and confirm the device gets an IP in the `192.168.4.x` range (Settings >
-   Wi-Fi > (i) on iPhone; System Settings > Wi-Fi > Details on Mac).
+   the list before anything else - on `ac601b2` it never appeared at all. **Confirmed on
+   `26bfec1`**: "QCRemote" appeared and a phone joined. (Which device joined wasn't recorded at
+   the time; an iPhone specifically has not been confirmed in this mode - see step 4.)
 4. Open `http://192.168.4.1/` in a browser on each device. Expect the folder/preset listing
    from the catalog (same content the serial console already prints, per issue #10) and a
    `presets: N (generation G)` status line. On `26bfec1` this step crashed the board outright -
    a USAGE FAULT / stack overflow on thread `rx_q[0]` - in both AP and station mode, with or
    without a Quad Cortex attached. Root cause confirmed from source and fixed (this build raises
-   `CONFIG_NET_RX_STACK_SIZE`; see ADR 0010's "Hardware findings (`26bfec1`)"), but **not yet
-   verified on hardware** - this is the first thing to check. The page should now load instead
-   of crashing; if it crashes again with the same `rx_q[0]`/stack-overflow signature, paste the
-   full fault register dump (especially PC/LR) on the issue rather than re-guessing - it would
-   mean the measured ~1136 B call-chain estimate in that ADR section was still short.
+   `CONFIG_NET_RX_STACK_SIZE`; see ADR 0010's "Hardware findings (`26bfec1`)"), and **confirmed
+   fixed on `b735057` in station mode** (see the go-decision result below) - but **AP mode's own
+   page load hasn't been retried against this fix**, since the owner's `b735057` run was station
+   mode only. This step, specifically, is the first thing to check on a fresh AP-mode run. If it
+   crashes with the same `rx_q[0]`/stack-overflow signature, paste the full fault register dump
+   (especially PC/LR) on the issue rather than re-guessing - it would mean the measured ~1136 B
+   call-chain estimate in that ADR section was still short.
 5. With the page open, change the active preset or folder on the Quad Cortex Mini itself.
-   Expect the page to update within a couple of seconds, without a manual reload - the
-   WebSocket push (issue #61's preset-change signal), now shown as a
-   `preset change (cmd N, #M)` note appended to the status line even when the folder/preset
-   listing itself didn't change.
+   **Known broken** ([issue #75](https://github.com/rrooding/QCRemote/issues/75)): the page
+   does not update live. The catalog it loaded on step 4 stays as-is until manually reloaded -
+   this is not the coexistence/stability check, just a known gap out of scope for this issue's
+   go/no-go decision.
 6. Leave it running for at least 10-15 minutes with the Quad Cortex Mini connected over USB
    (handshake complete) and the web page open: watch for KeepAlive/File-stream behavior
    unaffected by the AP running (`qc_heartbeat`'s usual ~200ms cadence, no new
@@ -996,12 +1010,11 @@ disabled) would be the coexistence requirement failing, not just a Wi-Fi bug.
    above. (A follow-up issue could add mDNS/`.local` advertising if this test succeeds; out of
    scope for this one.)
 4. From an iPhone and a Mac already on the **same** network, open `http://<that IP>/` in a
-   browser. Same expectations as the AP-mode steps above: listing loads, status line shows
-   preset/generation counts, and a preset change on the unit pushes a live update over the
-   WebSocket within a couple of seconds (shown as a `preset change (cmd N, #M)` note on the
-   status line, even when the listing itself didn't change). Same `26bfec1` page-load crash and
-   fix applies here too (see the AP-mode step above and ADR 0010) - not yet verified on
-   hardware.
+   browser. **Verified on `b735057` from a Mac**: the page loads with the full catalog (3
+   folders, 48 presets). **Not tested**: an iPhone, in this mode or AP mode. **Known broken**
+   ([issue #75](https://github.com/rrooding/QCRemote/issues/75)): a preset change on the unit
+   does not push a live update over the WebSocket - the page stays as it loaded until manually
+   reloaded.
 5. Same 10-15 minute soak as AP mode: confirm KeepAlive/File-stream/USB behavior is unaffected,
    and the station stays connected - watch for any further
    `Wi-Fi station connect failed`/`Wi-Fi station disconnected` lines, which now report the
@@ -1017,8 +1030,51 @@ this build's request was already using the matching `WIFI_SECURITY_TYPE_PSK`. A 
 connects but the board never gets a reachable IP from the router's own DHCP pool is a
 network-side problem to check from the router, not this firmware.
 
+### Hardware results and the go decision
+
+**Verified on `b735057`**, station mode, from a Mac, Quad Cortex Mini connected: joined the
+home network and got an IP from DHCP; HTTP server listening; page loaded with the full
+catalog (3 folders, 48 presets); USB, handshake (`4.1.1`), heartbeat, and `File` listing
+unaffected (21 messages, no drops); about 3 minutes with no fault; a preset change arrived over
+USB as before. This is the result the owner's go decision - Wi-Fi is a viable transport, MVP2
+moves to a web UI over Wi-Fi - is based on. Full writeup: ADR 0010's "Hardware findings
+(`b735057`), and the go decision".
+
+**Not covered by that result, and still exactly as open as the sections above left it**:
+
+- Access point mode on this build - last came up on `26bfec1` (before the `rx_q[0]` fix this
+  build carries), not retried since.
+- An iPhone, in either mode - every result above is from a Mac.
+- The full 10-15 minute soak this section's own steps ask for - the verified run was ~3
+  minutes.
+- Live WebSocket updates - known broken, split out to
+  [issue #75](https://github.com/rrooding/QCRemote/issues/75), not part of this decision.
+
+**The cleaned-up build differs from `b735057`**: the commit this hardware result is pinned to
+(`b735057`) still carried `CONFIG_THREAD_ANALYZER` and its periodic stack-dump logging, added
+for this issue's own measure-and-report requirement. Those are removed in the current commit
+now that the measurements they produced (ADR 0010's stack-margin tables) are recorded - the
+underlying fix they helped verify (`CONFIG_NET_RX_STACK_SIZE=3072`) is unchanged. The smoke
+test below is what to re-run against the current commit before trusting it the same way.
+
+### Smoke test for this build
+
+1. Flash the current commit in station mode (`CONFIG_WIFI_USAGE_MODE_STA=y` with a real
+   SSID/passphrase), with the Quad Cortex Mini connected over USB.
+2. Confirm the usual boot/USB/handshake traces (see "Verify" above), then
+   `Joining Wi-Fi network "<SSID>"`, `Wi-Fi station connected: Connection successful`, and a
+   `Startup summary: ... ip=<ip> ... url=http://<ip>/` line.
+3. From a browser on the same network, open that URL. Confirm the page loads with the real
+   folder/preset listing (48 presets on the owner's unit) and no fault/reboot.
+4. Leave it running a few minutes with the web page open: confirm no `LOG_ERR` lines, no
+   `qc_heartbeat`/`qc_dispatch`/USB-side regression, and the Wi-Fi link stays up.
+
 ### Known limitations of this test build
 
+- **Live WebSocket updates don't work** ([issue #75](https://github.com/rrooding/QCRemote/issues/75))
+  - a client gets the catalog on page load, but a preset change on the unit doesn't push a
+  live update; the page needs a manual reload to see it. Out of scope for this issue's
+  go/no-go decision, tracked separately.
 - **No authentication** on the HTTP/WebSocket endpoints - matching issue #71's own stated
   scope ("home use, not gigging... security can come later").
 - **Plain HTTP, not HTTPS** - also matching that stated scope; `CONFIG_HTTP_SERVER`'s TLS
