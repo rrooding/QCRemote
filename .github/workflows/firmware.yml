@@ -102,6 +102,17 @@ jobs:
         run: |
           cd ~/zephyrproject
           west build -b frdm_rw612 "$GITHUB_WORKSPACE/firmware/app" --pristine
+          # Nothing downstream needs this build tree, and a cold cache (SDK/
+          # workspace reinstall after a cache-key change) leaves this runner
+          # disk-constrained by the time the ESP32-S3 builds below run -
+          # confirmed as a real failure, not a hypothetical one: GH run
+          # 41834770616 hit "Free space left: 89 MB" partway through the
+          # second ESP32-S3 build and cmake's Ninja generator silently wrote
+          # an incomplete build.ninja, which then failed as "No such file or
+          # directory" instead of a clear disk-full error. Freeing each
+          # --pristine build's tree before the next one starts keeps that
+          # from recurring.
+          rm -rf ~/zephyrproject/build
 
       # Issue #76 / ADR 0009. The DWC2 driver patch is a runtime fix and the
       # build passes without it, but build what actually runs on the board.
@@ -120,6 +131,9 @@ jobs:
           # without them - the image links but isn't meant to run.
           west build -b esp32s3_devkitc/esp32s3/procpu "$GITHUB_WORKSPACE/firmware/app" -d build-esp32s3 --pristine \
             -- -DCONFIG_BUILD_ONLY_NO_BLOBS=y
+          # See the disk-space comment on the frdm_rw612 step above - same
+          # reason, between these two --pristine builds instead of after.
+          rm -rf ~/zephyrproject/build-esp32s3
           # Module without PSRAM: USB only, Wi-Fi off.
           west build -b esp32s3_devkitc/esp32s3/procpu "$GITHUB_WORKSPACE/firmware/app" -d build-esp32s3-nopsram --pristine \
             -- -DFILE_SUFFIX=nopsram
