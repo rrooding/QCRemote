@@ -75,7 +75,7 @@ jobs:
             ~/zephyrproject
             ~/zephyr-sdk-*
             ~/.cmake/packages
-          key: zephyr-${{ env.ZEPHYR_VERSION }}-${{ runner.os }}-arm-esp32s3
+          key: zephyr-${{ env.ZEPHYR_VERSION }}-${{ runner.os }}-arm-esp32s3-COLDTEST-issue86
 
       - name: Set up Python
         uses: actions/setup-python@v7
