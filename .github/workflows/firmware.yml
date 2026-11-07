@@ -23,6 +23,13 @@ jobs:
       - name: Check out QCRemote
         uses: actions/checkout@v7
 
+      # Temporary measurement for issue #46: real pull time of Zephyr's
+      # official CI image on a GitHub-hosted runner, pinned by digest. Removed
+      # before this PR is marked ready.
+      - name: TEMP measure zephyrproject-rtos/ci pull time (issue #46)
+        run: |
+          time docker pull ghcr.io/zephyrproject-rtos/ci@sha256:435c51009aaccd579109a32d5a020dfb14806bd53247a8e55a16b9a0f50dc47d
+
       # Package list trimmed from Zephyr's own Ubuntu install docs
       # (doc/develop/getting_started/installation_linux.rst) down to what
       # our 3 builds + twister actually use (issue #86) - gcc-multilib/
