@@ -1,0 +1,11 @@
+tests:
+  firmware.wifi_web_http:
+    # mps2/an385, not qemu_cortex_m3: this suite holds a full
+    # QcCatalogSnapshot plus Zephyr's networking/TCP/HTTP-server stack,
+    # which qemu_cortex_m3's 64KB RAM can't fit (same reason
+    # ../preset_transport gives). native_sim is listed for a host run,
+    # but note it needs a Linux host.
+    platform_allow:
+      - native_sim
+      - mps2/an385
+    tags: firmware

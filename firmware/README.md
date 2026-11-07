@@ -29,7 +29,9 @@ firmware/
     │   └── QcGzipInflater.hpp      # issue #6: runs QcGzip.hpp off the usbh thread
     └── tests/
         ├── hid_framing/            # Ztest suite for HidReassembler/HidChunker - no hardware needed
-        └── gzip_inflate/           # Ztest suite for QcGzip.hpp, with real gzip fixtures
+        ├── gzip_inflate/           # Ztest suite for QcGzip.hpp, with real gzip fixtures
+        └── wifi_web_http/          # Ztest suite driving the real HTTP/WebSocket resources over
+                                    # the loopback interface - no Wi-Fi driver or board needed
 ```
 
 This repo does **not** vendor its own `west.yml`/manifest. `firmware/app` is a standard
@@ -1000,11 +1002,11 @@ disabled) would be the coexistence requirement failing, not just a Wi-Fi bug.
    `Wi-Fi station connected: Connection successful` followed by a
    `Startup summary: mode=STA iface=up ip=<ip> dhcp=Zephyr DHCPv4 client ... url=http://<ip>/`
    line (Zephyr's own DHCPv4 client assigns that IP automatically -
-   `CONFIG_WIFI_STA_AUTO_DHCPV4`), or a `Wi-Fi station connect failed: <reason>
-   (status_code=N, reason_code=N)` warning. On `ac601b2`, this firmware logged
-   "connected" even around a genuine `nxp_wifi: WLAN: nxp_wlan_network authentication failed`
-   warning - that was this firmware not reading the event's own status (see ADR 0010's
-   "Hardware findings"), now fixed; a "connected" line should mean it actually connected.
+   `CONFIG_WIFI_STA_AUTO_DHCPV4`), or a `Wi-Fi station connect failed: <reason>` warning. On
+   `ac601b2`, this firmware logged "connected" even around a genuine
+   `nxp_wifi: WLAN: nxp_wlan_network authentication failed` warning - that was this firmware
+   not reading the event's own status (see ADR 0010's "Hardware findings"), now fixed; a
+   "connected" line should mean it actually connected.
 3. Find the board's IP address - easiest from the router's own client list (DHCP leases),
    since nothing here advertises it, or from the `ip=` field in the startup-summary log line
    above. (A follow-up issue could add mDNS/`.local` advertising if this test succeeds; out of
@@ -1016,15 +1018,21 @@ disabled) would be the coexistence requirement failing, not just a Wi-Fi bug.
    does not push a live update over the WebSocket - the page stays as it loaded until manually
    reloaded.
 5. Same 10-15 minute soak as AP mode: confirm KeepAlive/File-stream/USB behavior is unaffected,
-   and the station stays connected - watch for any further
-   `Wi-Fi station connect failed`/`Wi-Fi station disconnected` lines, which now report the
-   actual status/reason code rather than always reading as success.
+   and the station stays connected. A
+   `Wi-Fi station link dropped and is re-associating` warning here is the NXP stack reporting an
+   AP-initiated disassociation, not a credential problem - see "What each outcome means" below.
 
-**What each outcome means**: same as AP mode above, plus - a `Wi-Fi station connect failed`
-with `WIFI_STATUS_CONN_WRONG_PASSWORD` is the driver's generic code for *any* 4-way-handshake
-failure, not only an actually-wrong passphrase (confirmed from the driver's own source comment
-- see ADR 0010), so don't read it as proof the passphrase is wrong; paste the exact
-status/reason codes when commenting on the issue. The owner has confirmed "Radioshack" is WPA2
+**What each outcome means**: same as AP mode above, plus - `Wrong password`
+(`WIFI_STATUS_CONN_WRONG_PASSWORD`) is the *only* status the NXP stack has for a station
+losing its association, and it reports an AP-initiated disassociation/deauthentication with it
+just as readily as an actually-wrong passphrase: the middleware's
+`wlcm_process_disassoc_event()` calls `do_connect_failed(WLAN_REASON_NETWORK_AUTH_FAILED)`
+without ever looking at the 802.11 reason code (confirmed from source - see ADR 0010's
+`5068403` findings). Mid-session it is almost never a credential problem, and the stack
+re-associates on its own; this firmware now says so in the log rather than repeating the
+vendor wording. If the *underlying* 802.11 reason is ever needed, build with
+`CONFIG_WIFI_LOG_LEVEL_DBG=y`, which turns on the middleware's own
+`got event: disassociation, code=<N>` line. The owner has confirmed "Radioshack" is WPA2
 (not WPA3/mixed) on both bands under the same SSID, which rules out a security-type mismatch -
 this build's request was already using the matching `WIFI_SECURITY_TYPE_PSK`. A station that
 connects but the board never gets a reachable IP from the router's own DHCP pool is a
@@ -1057,6 +1065,28 @@ now that the measurements they produced (ADR 0010's stack-margin tables) are rec
 underlying fix they helped verify (`CONFIG_NET_RX_STACK_SIZE=3072`) is unchanged. The smoke
 test below is what to re-run against the current commit before trusting it the same way.
 
+### Smoke test of `5068403`, and what it found
+
+The owner's smoke test of `5068403` found USB/handshake/`File` fine (21 messages, no drops, 3
+folders / 49 presets) and two problems - the page never showing presets, and a "Wrong password"
+warning 52 s into a working session on a correct passphrase. Both are now reproduced off-board
+and fixed; ADR 0010's "Hardware findings (`5068403`)" has the full trace. In short:
+
+- `GET /api/presets.json` answered with a status line of `HTTP/1.1 200` - no space, no reason
+  phrase - because Zephyr builds a *dynamic* resource's status line from
+  `"HTTP/1.1 %d%s%s\r\n"` and leaves both `%s` empty unless
+  `CONFIG_HTTP_SERVER_COMPLETE_STATUS_PHRASES` is on. RFC 9112 §4 requires that space. The
+  static page resource was never affected (it sends a hardcoded `HTTP/1.1 200 OK`), which is
+  exactly why the page loaded and its own fetch didn't. Fixed in `prj.conf`, and pinned by a new
+  Ztest suite - `firmware/app/tests/wifi_web_http` drives the real resources over a real socket
+  on the loopback interface with real browser headers, and fails without the option.
+- A newly connected WebSocket client used to receive nothing until the next publish (once per
+  device connect, or one throttled push per minute) - it now gets the catalog immediately.
+- The page itself had no error path and no retry. It now reports what failed in its own status
+  line, retries the fetch, and reconnects the WebSocket. The firmware logs every
+  `GET /api/presets.json` it answers (`Served GET /api/presets.json (<N> bytes)`) and every push
+  (`Pushed catalog to websocket client <fd> (<N> bytes)`).
+
 ### Smoke test for this build
 
 1. Flash the current commit in station mode (`CONFIG_WIFI_USAGE_MODE_STA=y` with a real
@@ -1064,17 +1094,41 @@ test below is what to re-run against the current commit before trusting it the s
 2. Confirm the usual boot/USB/handshake traces (see "Verify" above), then
    `Joining Wi-Fi network "<SSID>"`, `Wi-Fi station connected: Connection successful`, and a
    `Startup summary: ... ip=<ip> ... url=http://<ip>/` line.
-3. From a browser on the same network, open that URL. Confirm the page loads with the real
-   folder/preset listing (48 presets on the owner's unit) and no fault/reboot.
+3. From a browser on the same network, open that URL. The page should show the real
+   folder/preset listing (49 presets on the owner's unit) **within a second or two**, and the
+   console should show both of these, in either order:
+
+   ```
+   <inf> main: Served GET /api/presets.json (NNNN bytes)
+   <inf> main: Websocket client connected (sock=N)
+   <inf> main: Pushed catalog to websocket client N (NNNN bytes)
+   ```
+
+   If the page still says `could not load presets (...)`, that message names the failure
+   (an HTTP status, or a JSON error) - paste it along with whether the `Served GET` line
+   appeared, which separates "the browser never asked" from "the firmware answered and the
+   browser rejected it".
 4. Leave it running a few minutes with the web page open: confirm no `LOG_ERR` lines, no
-   `qc_heartbeat`/`qc_dispatch`/USB-side regression, and the Wi-Fi link stays up.
+   `qc_heartbeat`/`qc_dispatch`/USB-side regression, and the Wi-Fi link stays up. A
+   `Wi-Fi station link dropped and is re-associating` warning is the vendor-stack misreport
+   described above and is expected to be followed by `Wi-Fi station connected`; the page should
+   recover on its own (`websocket closed - reconnecting...` then the listing again).
+5. `Post-connect tally: command=33 count=<N>` stepping up once a minute is `GlobalTempo`
+   streaming at ~3/s, as `docs/PROTOCOL-NOTES.md` records - expected, not a preset change.
 
 ### Known limitations of this test build
 
 - **Live WebSocket updates don't work** ([issue #75](https://github.com/rrooding/QCRemote/issues/75))
-  - a client gets the catalog on page load, but a preset change on the unit doesn't push a
-  live update; the page needs a manual reload to see it. Out of scope for this issue's
-  go/no-go decision, tracked separately.
+  - a client gets the catalog when it connects, but a preset change on the unit doesn't push a
+  live update of its own; what does arrive once a minute is whatever the post-connect tally
+  bumped (usually `GlobalTempo`), which the page mislabels as a preset change. Out of scope for
+  this issue's go/no-go decision, tracked separately.
+- **Two browsers at once share one WebSocket receive buffer** (ADR 0011,
+  [issue #75](https://github.com/rrooding/QCRemote/issues/75)) - Zephyr's HTTP server hands the
+  resource's single `data_buffer` to every `websocket_register()`, so with
+  `CONFIG_WEBSOCKET_MAX_CONTEXTS=2` two clients can corrupt each other's partially received
+  frames. Not reachable from the pages this firmware serves today (they only ever receive), and
+  not fixable within Zephyr's API without dropping to a single client.
 - **No authentication** on the HTTP/WebSocket endpoints - matching issue #71's own stated
   scope ("home use, not gigging... security can come later").
 - **Plain HTTP, not HTTPS** - also matching that stated scope; `CONFIG_HTTP_SERVER`'s TLS

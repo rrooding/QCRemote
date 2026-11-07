@@ -378,7 +378,11 @@ above left it:
   out of scope for the go/no-go decision above, and it's split out to its own issue
   ([#75](https://github.com/rrooding/QCRemote/issues/75)) rather than blocking this one. A
   client still gets the catalog on page load (`GET /api/presets.json`); it just doesn't update
-  live without a manual reload.
+  live without a manual reload. **Corrected after the `5068403` smoke test**: that last sentence
+  was wrong. `GET /api/presets.json` answered with a malformed status line and no browser ever
+  accepted it — this run's page got its listing over the WebSocket, because here the catalog
+  happened to be published after the browser had already connected. See the `5068403` findings
+  below.
 
 **ESP32-S3**: Wi-Fi was also wired up for the ESP32-S3 target in this round (issues #71/#76,
 after rebasing onto [#77](https://github.com/rrooding/QCRemote/issues/77)) — see
@@ -387,3 +391,126 @@ section. That's a CI-only build-cleanliness check so far (`CONFIG_BUILD_ONLY_NO_
 Espressif Wi-Fi blobs fetched), not a hardware result — none of the findings in this ADR have
 been run against the S3 with Wi-Fi actually enabled. The S3's own hardware verification to
 date (issue #76/PR #77) is USB-only, with Wi-Fi off (the no-PSRAM config).
+
+## Hardware findings (`5068403`), and two bugs the go-decision run hid
+
+The owner's smoke test of `5068403` (station mode, Quad Cortex Mini connected) found USB, the
+handshake and the `File` listing fine — 21 messages, no drops, 3 folders / 49 presets — and two
+problems. Both are now reproduced off-board and fixed; one of them had been there all along and
+only looked like a regression.
+
+### 1. The page stayed on "Loading…" — a malformed status line, plus no recovery path
+
+Zephyr's HTTP server builds a **dynamic** resource's response line from
+`RESPONSE_TEMPLATE_DYNAMIC_PART1` in `subsys/net/lib/http/http_server_http1.c`:
+
+```c
+#define RESPONSE_TEMPLATE_DYNAMIC_PART1 "HTTP/1.1 %d%s%s\r\n" "Transfer-Encoding: chunked\r\n"
+```
+
+Both `%s` are empty unless `CONFIG_HTTP_SERVER_COMPLETE_STATUS_PHRASES` is on (it defaults off),
+so `GET /api/presets.json` answered with a status line of `HTTP/1.1 200\r\n` — missing not just
+the reason phrase but **the space after the status code**, which RFC 9112 §4 makes mandatory
+(`status-line = HTTP-version SP status-code SP [ reason-phrase ]`; only the phrase itself is
+optional). Zephyr's own Kconfig help for that option says the absence "does not affect protocol
+compliance or client behavior", which the line it generates contradicts.
+
+The embedded page is a *static* resource, and `handle_http1_static_resource()` sends a hardcoded
+`HTTP/1.1 200 OK` with a real `Content-Length` — so the page always loaded while its own
+`fetch('/api/presets.json')` was the one request in this firmware not sending a well-formed
+status line. `CONFIG_HTTP_SERVER_COMPLETE_STATUS_PHRASES=y` (`prj.conf`) fixes it.
+
+This is reproduced and pinned by a new Ztest suite, `firmware/app/tests/wifi_web_http`, which
+drives the real `QcWifiWebTransport` resources over a real TCP socket on Zephyr's loopback
+interface — the browser's own sequence (`GET /`, then `GET /api/presets.json` both on the same
+keep-alive connection and on a fresh one, then a WebSocket upgrade), with real Safari request
+headers. It fails without the option and passes with it. No Wi-Fi driver and no board are needed:
+`QcWifiWebTransport::startServer()` is the HTTP/WebSocket half of `start()`, split out for this.
+
+Two things compounded it, and are fixed too:
+
+- **A newly connected WebSocket client received nothing at all until the *next* publish.**
+  `publishCatalog()` fires once per device connect (when the `File` stream finishes) and
+  `publishPresetChange()` is throttled to one push per minute per command, so a page opened after
+  the catalog was already published sat empty until the next throttled push. `handleWsSetup()` now
+  wakes the worker so the client gets the catalog the firmware already holds immediately.
+
+  This also explains why the `b735057` go-decision run looked fine: there, the catalog was
+  published *after* the browser had connected, so the WebSocket delivered it. On `5068403` the
+  order flipped — the catalog is published at 12.59 s and Wi-Fi only connects at 13.04 s (the
+  `File` READ now waits for the state-READ replies to drain, `QcSession::waitForInTrafficToSettle()`,
+  issue #76) — so a page opened afterwards had nothing coming. The claim in the `b735057` section
+  above that "a client still gets the catalog on page load (`GET /api/presets.json`)" was wrong:
+  that fetch has never worked in a browser.
+
+- **The page had no error path and no retry.** It fetched once, with no `.catch`, and opened one
+  WebSocket with no `onclose` — so a single failed request left it reading "loading…" with nothing
+  on screen or in the log to say why. It now reports what failed in its own status line, retries
+  the fetch, and reconnects the WebSocket. The firmware also logs every `GET /api/presets.json` it
+  answers and every WebSocket push, so "the browser never asked" and "the firmware answered and the
+  browser rejected it" are distinguishable from the console next time.
+
+`catalogJson_` is also now re-encoded by `handlePresetsGet()` if the snapshot is newer than the
+JSON, not only by the worker thread's `broadcast()` — a `GET` can no longer serve a stale listing
+because of thread ordering. (Still off `qc_heartbeat`, which is what PR #74's review asked for:
+this runs on Zephyr's own single HTTP server thread.)
+
+### 2. "Wrong password" ~52 s into a working session — the vendor stack's misreport
+
+`nxp_wifi: WLAN: nxp_wlan_network authentication failed` / `Wi-Fi station connect failed: Wrong
+password (status_code=0, reason_code=0)` appeared 52 s after a successful connect, on a correct
+passphrase, and the link came back 3.4 s later. Traced through the vendor stack:
+
+- `wlcm_process_disassoc_event()` (`modules/hal/nxp/mcux/middleware/wifi_nxp/wlcmgr/wlan.c`)
+  handles *any* asynchronous disassociation from the AP by calling
+  `do_connect_failed(WLAN_REASON_NETWORK_AUTH_FAILED)` **unconditionally** — it never looks at the
+  802.11 reason code. The link-loss path does the same for every reason other than a
+  4-way-handshake timeout.
+- Zephyr's driver then maps that single `WLAN_REASON` value to one status:
+  `wifi_mgmt_raise_connect_result_event(g_mlan.netif, WIFI_STATUS_CONN_WRONG_PASSWORD)`
+  (`drivers/wifi/nxp/src/nxp_wifi_drv.c`), whose text is "Wrong password".
+- `wlan.reassoc_control` then re-associates on its own, which is the `Wi-Fi station connected`
+  line that follows (and the `board_type: 2` print in between, from the middleware's own
+  `wlan_txpwrlimit_cfg.c` on the re-association path).
+
+So the status covers an AP-initiated disassoc/deauth, a lost EAPoL frame and an actually-wrong
+passphrase alike. Nothing in this firmware is wrong, and there is nothing here to fix beyond the
+log line, which now says what actually happened: a station that has associated successfully at
+least once logs a dropped-link-and-re-associating warning naming the vendor status and stating
+plainly that it is not evidence of a wrong passphrase; a station that has never associated still
+gets the "check your SSID/PSK" wording. `status_code`/`reason_code` are no longer printed on that
+path — `wifi_mgmt_raise_connect_result_event()` (`subsys/net/l2/wifi/wifi_mgmt.c`) fills in only
+`.status` and leaves both at 0, and this driver never uses the `_status_event()` variant that
+could set them, so `status_code=0, reason_code=0` was structurally guaranteed and carried no
+information.
+
+**What the underlying 802.11 reason was is still unknown** — it needs
+`CONFIG_WIFI_LOG_LEVEL_DBG`, which turns on the middleware's own
+`wlcm_d("got event: disassociation, code=%d", ...)`. It isn't needed to explain the log line, and
+the link recovers on its own, so this build doesn't enable it.
+
+### 3. `Post-connect tally: command=33 count=2` → `count=170`: expected
+
+Command 33 is `GlobalTempo` (`QcStateReads.hpp`), which `docs/PROTOCOL-NOTES.md` already records
+as arriving continuously at about 4/s for the whole session once the heartbeat is active, with or
+without any preset change. 168 more in 60 s is 2.8/s — that behaviour, nothing else. The tally
+logs an entry at most once per minute, which is why it steps rather than streams.
+
+One real wart falls out of it: because a bumped tally entry is what gets forwarded to transports,
+a `GlobalTempo` tick pushes a `lastChange` of `{"command":33,...}` and the page's status line calls
+it a "preset change". That is misleading rather than broken, and belongs with the message schema
+([#15](https://github.com/rrooding/QCRemote/issues/15)) and live preset-change updates
+([#75](https://github.com/rrooding/QCRemote/issues/75)), not here.
+
+### Still open after this round
+
+- **The shared WebSocket receive buffer** (ADR 0011, PR #85). `websocket_register()` stores the
+  caller's buffer pointer per context (`ctx->recv_buf.buf = recv_buf`) while keeping each
+  context's own `count`/`parser_state`, and Zephyr's server passes the resource's single
+  `data_buffer` for every upgrade — so with `CONFIG_WEBSOCKET_MAX_CONTEXTS=2` two simultaneous
+  clients share `g_qcWsDataBuffer[256]` and can corrupt each other's partially received frames.
+  Confirmed, but **not** part of the "Loading…" bug (one browser, one WebSocket), and not fixable
+  within Zephyr's API without dropping to a single client — left to
+  [#75](https://github.com/rrooding/QCRemote/issues/75).
+- Everything the `b735057` section lists as uncovered: AP mode on a current build, an iPhone, and
+  a 10-15 minute soak.

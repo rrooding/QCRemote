@@ -77,6 +77,25 @@ public:
         net_mgmt_init_event_callback(&netMgmtCb_, &onWifiEventTrampoline, kNetEventMask);
         net_mgmt_add_event_callback(&netMgmtCb_);
 
+        startServer();
+
+#if defined(CONFIG_WIFI_USAGE_MODE_AP)
+        startAccessPoint();
+#else
+        startStation();
+#endif
+
+        logStartupSummary();
+    }
+
+    // The HTTP/WebSocket half of start(), with no Wi-Fi in it: Zephyr's
+    // HTTP server plus the worker thread that pushes to connected
+    // websocket clients. Separate from start() so tests/wifi_web_http can
+    // drive the real resources over the loopback interface on a board with
+    // no Wi-Fi driver at all - the page, the JSON resource and the
+    // WebSocket upgrade are all reachable without one. Production code
+    // calls start(), not this.
+    void startServer() {
         // PR #74 review: HTTP_SERVICE_DEFINE/HTTP_RESOURCE_DEFINE only
         // register the resources - Zephyr's HTTP server thread waits for
         // an explicit http_server_start() before it ever accepts a
@@ -91,20 +110,12 @@ public:
                     httpRet);
         }
 
-#if defined(CONFIG_WIFI_USAGE_MODE_AP)
-        startAccessPoint();
-#else
-        startStation();
-#endif
-
         if (!threadStarted_) {
             k_thread_create(&thread_, stack_, K_KERNEL_STACK_SIZEOF(stack_), &threadEntryTrampoline,
                             this, nullptr, nullptr, kThreadPriority, 0, K_NO_WAIT);
             k_thread_name_set(&thread_, "qc_wifi_web");
             threadStarted_ = true;
         }
-
-        logStartupSummary();
     }
 
     // QcPresetTransport overrides - called from QcSession's own heartbeat/
@@ -161,12 +172,27 @@ public:
         // actual socket send.
         {
             ScopedKMutex lock(instance_->dataMutex_);
+            // Smoke test of 5068403 (issue #71): catalogJson_ used to be
+            // re-encoded *only* by the worker thread's broadcast(), so
+            // this response depended on that thread having already woken
+            // since the last publishCatalog(). Encode here too if the
+            // snapshot is newer than the JSON, so a GET can never serve a
+            // stale (or the startup placeholder) listing just because of
+            // thread ordering. Still off qc_heartbeat - this runs on
+            // Zephyr's own single HTTP server thread, which is what PR
+            // #74's review asked for.
+            instance_->encodeIfDirtyLocked();
             instance_->responseJson_.assign(instance_->catalogJson_.begin(),
                                             instance_->catalogJson_.end());
         }
         response_ctx->body = reinterpret_cast<const uint8_t*>(instance_->responseJson_.data());
         response_ctx->body_len = instance_->responseJson_.size();
         response_ctx->final_chunk = true;
+        // Issue #71's smoke test could not tell "the browser never asked"
+        // from "the firmware answered and the browser rejected it" - one
+        // line per request settles that, and the page's own status line
+        // reports its side (see kIndexHtml).
+        LOG_INF("Served GET /api/presets.json (%zu bytes)", instance_->responseJson_.size());
         return 0;
     }
 
@@ -174,6 +200,16 @@ public:
         if (instance_ != nullptr) {
             instance_->addWsClient(wsSocket);
             LOG_INF("Websocket client connected (sock=%d)", wsSocket);
+            // Smoke test of 5068403 (issue #71): a newly connected client
+            // used to receive nothing at all until the *next* publish.
+            // publishCatalog() only fires when a File stream finishes
+            // (once per device connect) and publishPresetChange() is
+            // throttled to one log/push per minute per command, so a page
+            // opened after the catalog was already published sat empty for
+            // up to a minute - which is what "the page shows only the
+            // title and Loading..." looked like. Wake the worker so it
+            // sends the catalog it already has to this client right away.
+            instance_->requestInitialSend();
         }
         return 0;
     }
@@ -223,10 +259,7 @@ private:
         etl::vector<int, kMaxWsClients> sockets;
         {
             ScopedKMutex lock(dataMutex_);
-            if (catalogDirty_) {
-                encodeCatalogJson(catalogSnapshot_, catalogJson_);
-                catalogDirty_ = false;
-            }
+            encodeIfDirtyLocked();
             if (changePending_) {
                 change = lastChangeEvent_;
                 includeChange = true;
@@ -254,6 +287,11 @@ private:
                 LOG_INF("Websocket client %d gone (err=%d), dropping", sock, sent);
                 removeWsClient(sock);
                 (void)websocket_unregister(sock);
+            } else {
+                // Same reason handlePresetsGet() logs its own response:
+                // the 5068403 smoke test had no way to tell a push that
+                // never happened from one the page failed to render.
+                LOG_INF("Pushed catalog to websocket client %d (%zu bytes)", sock, length);
             }
         }
     }
@@ -320,6 +358,22 @@ private:
             // today) is simply drained above and otherwise ignored.
         }
     }
+
+    // Re-encodes catalogJson_ from the latest published snapshot if one
+    // arrived since the last encode. Call with dataMutex_ held - both
+    // callers (broadcast() on qc_wifi_web, handlePresetsGet() on Zephyr's
+    // HTTP server thread) already hold it.
+    void encodeIfDirtyLocked() {
+        if (catalogDirty_) {
+            encodeCatalogJson(catalogSnapshot_, catalogJson_);
+            catalogDirty_ = false;
+        }
+    }
+
+    // See handleWsSetup(): makes the worker thread's next broadcast()
+    // happen now rather than waiting for a publish, so a client that
+    // connects between publishes still gets the current listing.
+    void requestInitialSend() { k_sem_give(&broadcastSem_); }
 
     void addWsClient(int sock) {
         ScopedKMutex lock(dataMutex_);
@@ -523,24 +577,54 @@ private:
     // WLAN_REASON_NETWORK_AUTH_FAILED ->
     // wifi_mgmt_raise_connect_result_event(iface,
     // WIFI_STATUS_CONN_WRONG_PASSWORD)), and this handler never looked at
-    // the event's own status field. Note the driver's own comment on that
-    // status value: it's raised for *any* 4-way-handshake failure
-    // (including lost EAPoL frames), not only an actually-wrong
-    // passphrase - logging the raw status/reason codes rather than
-    // renaming it is deliberate, so a real wrong password and a
-    // handshake-timing failure aren't conflated in the log either.
+    // the event's own status field.
+    //
+    // Hardware finding (5068403 smoke test, issue #71): that same
+    // WIFI_STATUS_CONN_WRONG_PASSWORD then appeared ~52s into a session
+    // on a correct passphrase. Traced through the vendor stack: the NXP
+    // Wi-Fi middleware's connection manager reports an asynchronous
+    // disassociation from the AP by calling
+    // do_connect_failed(WLAN_REASON_NETWORK_AUTH_FAILED) *unconditionally*
+    // - wlcm_process_disassoc_event() in modules/hal/nxp/mcux/middleware/
+    // wifi_nxp/wlcmgr/wlan.c, which ignores the 802.11 reason code
+    // entirely - and the link-loss path does the same for every reason
+    // other than a 4-way-handshake timeout. Zephyr's driver then maps that
+    // one WLAN_REASON value to "Wrong password". So the status is not a
+    // credential diagnosis at all: it covers an AP-initiated
+    // disassoc/deauth, a lost EAPoL frame, and an actually-wrong
+    // passphrase alike. wlan.reassoc_control then re-associates on its
+    // own, which is the "Wi-Fi station connected" line that follows.
+    //
+    // status_code/reason_code are deliberately no longer printed on this
+    // path: wifi_mgmt_raise_connect_result_event() (subsys/net/l2/wifi/
+    // wifi_mgmt.c) fills in only .status and leaves both at 0, and this
+    // driver never uses the _status_event() variant that could set them -
+    // so "status_code=0, reason_code=0" was structurally guaranteed and
+    // read as "no information available", which it was.
     void onWifiEvent(uint64_t mgmtEvent, net_if* iface, net_mgmt_event_callback* cb) {
         const auto* status = static_cast<const wifi_status*>(cb->info);
         switch (mgmtEvent) {
         case NET_EVENT_WIFI_CONNECT_RESULT:
             if (status != nullptr && status->conn_status == WIFI_STATUS_CONN_SUCCESS) {
                 LOG_INF("Wi-Fi station connected: %s", wifi_conn_status_txt(status->conn_status));
+                staConnectedOnce_ = true;
                 logReadySummary(iface, /*isAp=*/false);
+            } else if (staConnectedOnce_) {
+                // Smoke test of 5068403 (issue #71): this is the line that
+                // read "Wi-Fi station connect failed: Wrong password" ~52s
+                // into a working session, on a correct passphrase. The
+                // status is accurate as reported and wrong as a diagnosis,
+                // and the misreport is in the vendor stack, not here - see
+                // this handler's own note above for the trace.
+                LOG_WRN("Wi-Fi station link dropped and is re-associating - the NXP stack "
+                        "reported it as \"%s\", which it also reports for an AP-initiated "
+                        "disassociation/deauthentication, so it is NOT evidence of a wrong "
+                        "passphrase. Expect a \"Wi-Fi station connected\" line next.",
+                        status != nullptr ? wifi_conn_status_txt(status->conn_status) : "unknown");
             } else {
-                LOG_WRN("Wi-Fi station connect failed: %s (status_code=%u, reason_code=%u)",
-                        status != nullptr ? wifi_conn_status_txt(status->conn_status) : "unknown",
-                        status != nullptr ? status->status_code : 0U,
-                        status != nullptr ? status->reason_code : 0U);
+                LOG_WRN("Wi-Fi station connect failed: %s - no association has succeeded yet, "
+                        "so check CONFIG_QC_WIFI_STA_SSID/CONFIG_QC_WIFI_STA_PSK first",
+                        status != nullptr ? wifi_conn_status_txt(status->conn_status) : "unknown");
             }
             break;
         case NET_EVENT_WIFI_DISCONNECT_RESULT:
@@ -629,6 +713,10 @@ private:
     K_KERNEL_STACK_MEMBER(stack_, 2048);
     bool threadStarted_ = false;
     bool httpServerStarted_ = false;
+    // Set once a station association has actually succeeded, so a later
+    // failure event can be logged as the re-association it is rather than
+    // as a credential problem - see onWifiEvent().
+    bool staConnectedOnce_ = false;
     k_sem broadcastSem_{};
 
     k_mutex dataMutex_{};
@@ -698,9 +786,34 @@ function escapeHtml(s){
     return c==='&'?'&amp;':c==='<'?'&lt;':'&gt;';
   });
 }
-fetch('/api/presets.json').then(function(r){return r.json();}).then(render);
-var ws=new WebSocket('ws://'+location.host+'/ws');
-ws.onmessage=function(ev){ render(JSON.parse(ev.data)); };
+// Issue #71's 5068403 smoke test: the page used to fetch once, with no
+// .catch and no retry, so any single failed request left it reading
+// "loading..." forever with nothing on screen or in the log to say why.
+// Report what went wrong and keep trying - and do the same for the
+// WebSocket, which otherwise stayed dead after one failed upgrade.
+var loaded=false;
+function note(s){
+  if(!loaded){ document.getElementById('status').textContent=s; }
+}
+function load(){
+  fetch('/api/presets.json').then(function(r){
+    if(!r.ok){ throw new Error('HTTP '+r.status); }
+    return r.json();
+  }).then(function(d){ loaded=true; render(d); }).catch(function(e){
+    note('could not load presets ('+e.message+') - retrying…');
+    setTimeout(load,2000);
+  });
+}
+function connect(){
+  var ws=new WebSocket('ws://'+location.host+'/ws');
+  ws.onmessage=function(ev){ loaded=true; render(JSON.parse(ev.data)); };
+  ws.onclose=function(){
+    note('websocket closed - reconnecting…');
+    setTimeout(connect,2000);
+  };
+}
+load();
+connect();
 </script>
 </body></html>
 )HTML";
