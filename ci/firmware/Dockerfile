@@ -12,12 +12,15 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG ZEPHYR_VERSION=v4.5.0
 
 # Same trimmed package list as firmware.yml's "Install Zephyr host
-# dependencies" step (issue #86) - ca-certificates added since this base
-# image, unlike ubuntu-latest runners, doesn't carry it already (needed for
-# the https clones/fetches below).
+# dependencies" step (issue #86), plus two packages that list dropped because
+# ubuntu-latest runners already carry them: ca-certificates (needed for the
+# https clones/fetches below, confirmed missing on this bare base image) and
+# wget (confirmed required - not by `west sdk install`'s own download, which
+# is pure Python, but by the Zephyr SDK's bundled setup.sh, which shells out
+# to wget and fails with "Zephyr SDK setup requires 'wget'" without it).
 RUN apt-get update \
     && apt-get install --no-install-recommends -y \
-         ca-certificates git cmake ninja-build gperf ccache device-tree-compiler \
+         ca-certificates wget git cmake ninja-build gperf ccache device-tree-compiler \
          python3-dev python3-venv python3-pip python3-setuptools python3-wheel \
          xz-utils file make gcc gcc-multilib g++-multilib libmagic1 \
     && rm -rf /var/lib/apt/lists/*
