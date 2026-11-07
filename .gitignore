@@ -1,0 +1,5 @@
+# Only ever created by the occasional, developer-only Lit vendoring step
+# (web/poc/tools/vendor-lit.mjs). Nothing in the firmware build, the CI
+# workflow, or running the PoC needs it - see ADR 0011.
+node_modules/
+package-lock.json
