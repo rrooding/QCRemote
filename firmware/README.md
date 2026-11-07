@@ -1096,7 +1096,8 @@ and fixed; ADR 0010's "Hardware findings (`5068403`)" has the full trace. In sho
    `Startup summary: ... ip=<ip> ... url=http://<ip>/` line.
 3. From a browser on the same network, open that URL. The page should show the real
    folder/preset listing (49 presets on the owner's unit) **within a second or two**, and the
-   console should show both of these, in either order:
+   console should show the fetch being served and the WebSocket being pushed to, in either
+   order:
 
    ```
    <inf> main: Served GET /api/presets.json (NNNN bytes)
