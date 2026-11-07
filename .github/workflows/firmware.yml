@@ -91,6 +91,19 @@ jobs:
             west init -m https://github.com/zephyrproject-rtos/zephyr --mr "$ZEPHYR_VERSION" ~/zephyrproject
           fi
 
+      # Not covered by the cache below (fresh Python venv every run) - runs
+      # unconditionally, and before the (possibly skipped) step below, since
+      # `west sdk install` needs patoolib from these requirements. Confirmed
+      # as a real failure, not a hypothetical one: GH run 42356316058 (a
+      # forced cache-miss test) hit "ModuleNotFoundError: No module named
+      # 'patoolib'" when this ran after `west sdk install` instead of before
+      # it; run 42355037549 separately hit a missing `requests` when this
+      # was skipped entirely on a cache hit.
+      - name: Install Zephyr Python requirements
+        run: |
+          cd ~/zephyrproject
+          west packages pip --install --ignore-venv-check
+
       # Issue #86: a full `west update` clones every HAL under modules/hal/
       # (~30 vendor SDKs) plus every other always-active module (hostap,
       # openthread, lvgl, ...) even though our 3 boards only ever compile
@@ -117,10 +130,6 @@ jobs:
       # Skipped entirely on a cache hit: same Zephyr version and toolchain
       # list (the cache key below) means the same manifest and the same
       # pinned revisions, so there is nothing for `west update` to change.
-      # Only ~/zephyrproject and the SDK are cached, not the Python
-      # environment itself (a fresh runner/venv every run) - west's own
-      # pip requirements (below) still need installing every run
-      # regardless of this cache's state.
       - name: Update Zephyr workspace and SDK
         if: steps.zephyr-cache.outputs.cache-hit != 'true'
         run: |
@@ -131,17 +140,6 @@ jobs:
           if ! compgen -G "$HOME/zephyr-sdk-*" > /dev/null; then
             west sdk install --install-base ~ --gnu-toolchains arm-zephyr-eabi xtensa-espressif_esp32s3_zephyr-elf
           fi
-
-      # Not covered by the cache above (fresh Python venv every run) -
-      # `west blobs fetch` needs these (requests, jsonschema) even on a
-      # cache hit that skips the step above entirely. Confirmed as a real
-      # failure, not a hypothetical one: GH run 42355037549 failed here
-      # with "No module named 'requests'" after this was folded into the
-      # cache-gated step above.
-      - name: Install Zephyr Python requirements
-        run: |
-          cd ~/zephyrproject
-          west packages pip --install --ignore-venv-check
 
       # Issue #71 (Wi-Fi) needs the RW612's own Wi-Fi radio firmware blob,
       # the same one ADR 0002 already documents fetching for BLE
