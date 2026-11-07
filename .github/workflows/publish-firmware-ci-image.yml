@@ -1,0 +1,56 @@
+name: publish firmware CI image
+
+# Builds and pushes ci/firmware/Dockerfile (issue #46) to GHCR. Never runs on
+# a pull_request - only a manual dispatch, or a push to master that touches
+# the Dockerfile or the Zephyr patch it bakes in, so an ordinary firmware PR
+# never rebuilds or republishes this image.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image tag (e.g. v4.5.0-1) - bump the suffix for a toolchain/package change, the Zephyr version for a Zephyr bump"
+        required: true
+  push:
+    branches: [master]
+    paths:
+      - "ci/firmware/Dockerfile"
+      - "firmware/patches/zephyr/**"
+      - ".github/workflows/publish-firmware-ci-image.yml"
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out QCRemote
+        uses: actions/checkout@v7
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A push trigger (Dockerfile changed on master, no explicit version
+      # input) tags with the run number so it's still unique and traceable;
+      # firmware.yml should be repinned to a deliberate `version` tag from a
+      # workflow_dispatch run, not one of these.
+      - name: Resolve image tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=untagged-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ci/firmware/Dockerfile
+          push: true
+          tags: ghcr.io/rrooding/qcremote-firmware:${{ steps.tag.outputs.tag }}

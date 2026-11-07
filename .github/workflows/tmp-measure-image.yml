@@ -1,0 +1,50 @@
+name: TEMP measure firmware CI image (issue #46)
+
+# Temporary, same spirit as the removed pull-time measurement step on
+# firmware.yml: the real publish-firmware-ci-image.yml workflow can't be
+# workflow_dispatch'd from this branch (GitHub only registers
+# workflow_dispatch workflows once they exist on the default branch), so
+# this measures build time, image size, and a real cross-job pull time
+# without needing that one-time dispatch. Removed before this PR is marked
+# ready.
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/tmp-measure-image.yml"
+      - "ci/firmware/Dockerfile"
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push (timed)
+        run: |
+          time docker build -f ci/firmware/Dockerfile -t ghcr.io/rrooding/qcremote-firmware:tmp-measure-46 .
+          docker image inspect ghcr.io/rrooding/qcremote-firmware:tmp-measure-46 --format '{{.Size}}' > /tmp/image_size_bytes.txt
+          cat /tmp/image_size_bytes.txt
+          time docker push ghcr.io/rrooding/qcremote-firmware:tmp-measure-46
+
+  pull-fresh:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull on a fresh runner (timed)
+        run: |
+          time docker pull ghcr.io/rrooding/qcremote-firmware:tmp-measure-46
