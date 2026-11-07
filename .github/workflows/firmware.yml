@@ -74,10 +74,45 @@ jobs:
             west sdk install --install-base ~ --gnu-toolchains arm-zephyr-eabi xtensa-espressif_esp32s3_zephyr-elf
           fi
 
+      # Issue #71 (Wi-Fi) needs the RW612's own Wi-Fi radio firmware blob,
+      # the same one ADR 0002 already documents fetching for BLE
+      # (rw61x_sb_ble_a2.bin, same hal_nxp module/license). Without this
+      # the frdm_rw612 build fails at CMake configure time looking for
+      # modules/hal/nxp/zephyr/blobs/rw61x/rw61x_sb_wifi_a2_compressed.bin.
+      #
+      # Scoped with --allow-regex to only the rw61x_sb_{wifi,ble}_a2 blobs
+      # this build actually needs - a plain `west blobs fetch hal_nxp`
+      # (tried first) fetches hal_nxp's *entire* blob list, which includes
+      # unrelated blobs that DO require interactive click-through (e.g.
+      # imx-boot-firmware's imx95-evk blob) - confirmed as a real CI
+      # failure (EOFError on input(), not a hypothetical one), not
+      # something to work around with --auto-accept, since that would
+      # accept a license on the user's behalf without them reading it.
+      # The rw61x_sb_{wifi,ble}_a2 blobs this regex selects have no
+      # click-through field in hal_nxp's module.yml at all (west's
+      # blobs.py schema defaults that to false when absent - see
+      # zephyr/scripts/zephyr_module.py), so this fetch is a plain
+      # non-interactive download, no license being auto-accepted.
+      - name: Fetch Wi-Fi/BLE radio firmware blobs
+        run: |
+          cd ~/zephyrproject
+          west blobs fetch hal_nxp --allow-regex '^rw61x/rw61x_sb_(wifi|ble)_a2'
+
       - name: Build frdm_rw612
         run: |
           cd ~/zephyrproject
           west build -b frdm_rw612 "$GITHUB_WORKSPACE/firmware/app" --pristine
+          # Nothing downstream needs this build tree, and a cold cache (SDK/
+          # workspace reinstall after a cache-key change) leaves this runner
+          # disk-constrained by the time the ESP32-S3 builds below run -
+          # confirmed as a real failure, not a hypothetical one: GH run
+          # 41834770616 hit "Free space left: 89 MB" partway through the
+          # second ESP32-S3 build and cmake's Ninja generator silently wrote
+          # an incomplete build.ninja, which then failed as "No such file or
+          # directory" instead of a clear disk-full error. Freeing each
+          # --pristine build's tree before the next one starts keeps that
+          # from recurring.
+          rm -rf ~/zephyrproject/build
 
       # Issue #76 / ADR 0009. The DWC2 driver patch is a runtime fix and the
       # build passes without it, but build what actually runs on the board.
@@ -90,7 +125,18 @@ jobs:
           if ! git -C zephyr apply --reverse --check "$patch" 2>/dev/null; then
             git -C zephyr apply "$patch"
           fi
-          west build -b esp32s3_devkitc/esp32s3/procpu "$GITHUB_WORKSPACE/firmware/app" -d build-esp32s3 --pristine
+          # Default board config: PSRAM module, Wi-Fi on (issue #71). The ESP
+          # Wi-Fi driver needs hal_espressif's blobs (~40 MB, every chip);
+          # BUILD_ONLY_NO_BLOBS is Zephyr's own switch for building it in CI
+          # without them - the image links but isn't meant to run.
+          west build -b esp32s3_devkitc/esp32s3/procpu "$GITHUB_WORKSPACE/firmware/app" -d build-esp32s3 --pristine \
+            -- -DCONFIG_BUILD_ONLY_NO_BLOBS=y
+          # See the disk-space comment on the frdm_rw612 step above - same
+          # reason, between these two --pristine builds instead of after.
+          rm -rf ~/zephyrproject/build-esp32s3
+          # Module without PSRAM: USB only, Wi-Fi off.
+          west build -b esp32s3_devkitc/esp32s3/procpu "$GITHUB_WORKSPACE/firmware/app" -d build-esp32s3-nopsram --pristine \
+            -- -DFILE_SUFFIX=nopsram
 
       - name: Run firmware Ztest suites (native_sim)
         run: |

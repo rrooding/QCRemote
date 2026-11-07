@@ -1,3 +1,77 @@
+# Issue #71: Wi-Fi mode/credentials, chosen at build time. Mode itself
+# reuses Zephyr's own generic choice (drivers/wifi/Kconfig,
+# WIFI_USAGE_MODE_AP/STA) rather than inventing a parallel one - that choice
+# is already what the NXP Wi-Fi driver keys its own SoftAP/DHCP-server
+# defaults off (see ADR 0010). Real credentials belong in a local,
+# untracked wifi_credentials.conf (see wifi_credentials.conf.example in
+# this directory and firmware/README.md) - never in this file or in
+# prj.conf, and never committed.
+
+mainmenu "QC Remote Bridge Firmware"
+
+config QC_WIFI_AP_SSID
+	string "Soft AP SSID (CONFIG_WIFI_USAGE_MODE_AP)"
+	default "QCRemote"
+	depends on WIFI_USAGE_MODE_AP
+	help
+	  SSID the board advertises when running as its own access point.
+	  Override in a local wifi_credentials.conf, not here.
+
+config QC_WIFI_AP_PSK
+	string "Soft AP WPA2 passphrase (CONFIG_WIFI_USAGE_MODE_AP)"
+	default ""
+	depends on WIFI_USAGE_MODE_AP
+	help
+	  WPA2-PSK passphrase for the board's own access point (8-63
+	  characters). Left empty, the AP starts open (no password) - the
+	  owner's decision for issue #71 is to set a real passphrase here via
+	  a local wifi_credentials.conf whenever that's easy, rather than
+	  defaulting to an open network. Never set a real passphrase in this
+	  file or in prj.conf.
+
+config QC_WIFI_AP_APP_DHCP_SERVER
+	bool "Start the AP's address and DHCPv4 server in the app"
+	default y if !WIFI_NXP
+	depends on WIFI_USAGE_MODE_AP
+	select NET_DHCPV4_SERVER
+	help
+	  The NXP Wi-Fi driver sets the SoftAP's address and runs its own
+	  DHCPv4 server (CONFIG_NXP_WIFI_SOFTAP_*), and a second server would
+	  collide with it (ADR 0010). Other drivers, such as the ESP32's,
+	  leave both to the app - this turns that on, using the address
+	  below.
+
+config QC_WIFI_AP_IP_ADDRESS
+	string "AP interface IPv4 address"
+	default "192.168.4.1"
+	depends on QC_WIFI_AP_APP_DHCP_SERVER
+	help
+	  Also the gateway. The DHCPv4 pool starts 10 addresses above it,
+	  matching the 192.168.4.x range the NXP build uses.
+
+config QC_WIFI_AP_NETMASK
+	string "AP interface IPv4 netmask"
+	default "255.255.255.0"
+	depends on QC_WIFI_AP_APP_DHCP_SERVER
+
+config QC_WIFI_STA_SSID
+	string "Network SSID to join (CONFIG_WIFI_USAGE_MODE_STA)"
+	default ""
+	depends on WIFI_USAGE_MODE_STA
+	help
+	  SSID of the existing Wi-Fi network the board should join. Left
+	  empty, the firmware logs a warning and skips connecting rather than
+	  attempting to join a blank network - set this in a local
+	  wifi_credentials.conf.
+
+config QC_WIFI_STA_PSK
+	string "Network WPA2 passphrase (CONFIG_WIFI_USAGE_MODE_STA)"
+	default ""
+	depends on WIFI_USAGE_MODE_STA
+	help
+	  WPA2-PSK passphrase for the network above. Set this in a local
+	  wifi_credentials.conf - never here or in prj.conf.
+
 config QC_USBH_FORCE_FULL_SPEED
 	bool "Force the USB host port to Full Speed (test only)"
 	depends on SOC_SERIES_RW6XX

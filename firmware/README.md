@@ -13,10 +13,11 @@ firmware/
 ├── patches/zephyr/ # local fixes to apply to the Zephyr workspace (see "ESP32-S3 target")
 └── app/            # the actual Zephyr application (out-of-tree, "freestanding")
     ├── CMakeLists.txt
-    ├── Kconfig                     # app options: message buffer size, RW612 Full Speed test mode
+    ├── Kconfig                     # app options: Wi-Fi, message buffer size, RW612 Full Speed test mode
     ├── prj.conf
     ├── boards/frdm_rw612.overlay   # switches the RW612's USB peripheral to host mode
-    ├── boards/esp32s3_devkitc_esp32s3_procpu.{overlay,conf}  # ESP32-S3 LED + RAM fit
+    ├── boards/frdm_rw612.conf      # RW612 Wi-Fi driver + SoftAP settings
+    ├── boards/esp32s3_devkitc_esp32s3_procpu{,_nopsram}.{overlay,conf}  # ESP32-S3, with/without PSRAM
     ├── src/
     │   ├── Main.cpp
     │   ├── usbh_shim.c/.h          # plain-C boundary around Zephyr's non-C++-safe USB host API
@@ -28,7 +29,9 @@ firmware/
     │   └── QcGzipInflater.hpp      # issue #6: runs QcGzip.hpp off the usbh thread
     └── tests/
         ├── hid_framing/            # Ztest suite for HidReassembler/HidChunker - no hardware needed
-        └── gzip_inflate/           # Ztest suite for QcGzip.hpp, with real gzip fixtures
+        ├── gzip_inflate/           # Ztest suite for QcGzip.hpp, with real gzip fixtures
+        └── wifi_web_http/          # Ztest suite driving the real HTTP/WebSocket resources over
+                                    # the loopback interface - no Wi-Fi driver or board needed
 ```
 
 This repo does **not** vendor its own `west.yml`/manifest. `firmware/app` is a standard
@@ -774,11 +777,41 @@ build succeeds without it, but the S3 then shows the 16 s stall above.
 
 ### Build, flash, monitor
 
+The S3 board config depends on whether the module has PSRAM. Check with
+`python3 -m esptool --port /dev/cu.usbserial-XXXX chip-id`: an R2/R8 module lists
+`Embedded PSRAM` under Features; an N8/N16 module doesn't.
+
+| Module | Build | What runs |
+|---|---|---|
+| **With 8 MB octal PSRAM** (WROOM-1-N8R8/N16R8; RevA's N16R8) | default | USB bridge **and** Wi-Fi/web transport (issue #71). The app's static data (`libapp.a` `.bss`, incl. the 128 KiB message buffers) lives in PSRAM. |
+| **Without PSRAM** (WROOM-1-N8/N16) | `-DFILE_SUFFIX=nopsram` | USB bridge only. Wi-Fi doesn't fit internal RAM (~160 KB over), so it's off; message buffers are 64 KiB. |
+
+**The default (Wi-Fi) build is CI-build-only on the S3 today** - verified to build and link
+clean (`CONFIG_BUILD_ONLY_NO_BLOBS`, no Espressif Wi-Fi blobs fetched), but none of this
+firmware's Wi-Fi/web-transport hardware results (see "Wi-Fi host/client mode" below) have been
+run against the S3 - every one of them is from the `frdm_rw612`. The S3's own hardware
+verification to date (issue #76/PR #77) is USB-only, with Wi-Fi off (the `nopsram` config).
+
+The default (Wi-Fi) build also needs Espressif's Wi-Fi/BT blobs. Zephyr checks for the whole
+set, not just the S3's (~40 MB, no license click-through):
+
+```bash
+west blobs fetch hal_espressif
+```
+
 ```bash
 west build -b esp32s3_devkitc/esp32s3/procpu /path/to/QCRemote/firmware/app -d build-s3 --pristine
+west build -b esp32s3_devkitc/esp32s3/procpu /path/to/QCRemote/firmware/app -d build-s3 --pristine -- -DFILE_SUFFIX=nopsram   # no PSRAM
 west flash -d build-s3
 west espressif monitor
 ```
+
+Wi-Fi mode and credentials come from `wifi_credentials.conf`, the same as on the RW612 (see
+"Wi-Fi host/client mode" below). In AP mode the ESP32 driver, unlike NXP's, doesn't run a
+DHCPv4 server, so the app sets the AP's address and starts one itself
+(`CONFIG_QC_WIFI_AP_APP_DHCP_SERVER`, on automatically for non-NXP drivers; address
+`CONFIG_QC_WIFI_AP_IP_ADDRESS`, default 192.168.4.1, the same range as the RW612). The NXP
+driver's own Wi-Fi settings moved from `prj.conf` to `boards/frdm_rw612.conf`.
 
 Flash and log over the board's **UART** micro-USB port (CP2102N bridge, `zephyr,console` is
 UART0). If `west flash` doesn't find it, add `--esp-device /dev/tty.usbserial-XXXX`. The ROM
@@ -818,8 +851,9 @@ unit. The Quad Cortex draws no current from VBUS; it only needs it present.
   when the device disconnected then freed its buffer through the already-NULLed
   `claimed_udev`. It now holds a local copy. Not S3-specific; it just showed up there first.
 - **RAM**: the two 128 KiB message buffers (ADR 0007) don't fit the S3's internal RAM.
-  `CONFIG_QC_MESSAGE_CAPACITY` (app Kconfig, default 131072) sets both; the S3 board config
-  uses 65536, which still holds every message measured on the owner's unit (largest 22667).
+  `CONFIG_QC_MESSAGE_CAPACITY` (app Kconfig, default 131072) sets both. The PSRAM board
+  config keeps 131072 in PSRAM; the `nopsram` one uses 65536, which still holds every message
+  measured on the owner's unit (largest 22667).
 - **Heartbeat LED**: the board's own LED is addressable RGB, so the overlay puts `led0` on
   GPIO2 (J3 pin 5) - optional.
 
@@ -837,6 +871,283 @@ High Speed. The probe log then shows `Port speed (PSPD): 0` (Full; 2 = High).
 ```bash
 west build -b frdm_rw612 /path/to/QCRemote/firmware/app -d build-fs --pristine -- -DCONFIG_QC_USBH_FORCE_FULL_SPEED=y
 ```
+
+## Wi-Fi host/client mode and a web/WebSocket transport (issue #71)
+
+Issue #71 tests whether a web UI served from the board over Wi-Fi is viable enough that the
+owner would go with web UI + Wi-Fi instead of the planned JUCE + BLE macOS/iOS app (MVP2). See
+[ADR 0010](../docs/adr/0010-wifi-web-transport.md) for the full design and the feasibility
+findings (Zephyr 4.5 supports both Wi-Fi AP and station mode on `frdm_rw612` - confirmed
+against the Zephyr source tree and its own `samples/net/wifi/apsta_mode` sample, not assumed).
+This section covers setup, build/flash, and the exact hardware test for each mode.
+
+**Go: the owner has decided Wi-Fi is a viable transport, and MVP2 moves to a web UI over
+Wi-Fi.** That decision is based on this build's (`b735057`) station-mode hardware result: from
+a Mac, Quad Cortex Mini connected, the board joined the home network, the page loaded with the
+full 3-folder/48-preset catalog, and USB/handshake/heartbeat/`File` listing were unaffected (21
+messages, no drops) over about 3 minutes with no fault. See ADR 0010's "Hardware findings
+(`b735057`), and the go decision" section for the full writeup, including what this result
+does and doesn't cover - in particular: **access point mode last came up on an earlier build
+(`26bfec1`, a phone joined) and hasn't been retested since**, **no iPhone has been tested in
+either mode**, and **live WebSocket updates don't work** - a client gets the catalog on page
+load, but a preset change on the unit doesn't push a live update; that's split out to
+[issue #75](https://github.com/rrooding/QCRemote/issues/75) rather than blocking this one. The
+steps below are still the exact test to repeat for anything not yet covered by the result
+above.
+
+### Setup: Wi-Fi mode and credentials
+
+Copy the example file and edit it - it's gitignored (`firmware/.gitignore`) and picked up
+automatically by `app/CMakeLists.txt` as an extra Kconfig fragment, no extra `west` flag
+needed:
+
+```bash
+cp firmware/app/wifi_credentials.conf.example firmware/app/wifi_credentials.conf
+```
+
+Pick **one** mode and fill in real values (see the file's own comments):
+
+```kconfig
+# Access point - the board creates its own Wi-Fi network:
+CONFIG_WIFI_USAGE_MODE_AP=y
+CONFIG_QC_WIFI_AP_SSID="QCRemote"
+CONFIG_QC_WIFI_AP_PSK="pick-a-real-wpa2-passphrase"
+
+# Station - the board joins your existing Wi-Fi network:
+CONFIG_WIFI_USAGE_MODE_STA=y
+CONFIG_QC_WIFI_STA_SSID="YourNetworkName"
+CONFIG_QC_WIFI_STA_PSK="YourNetworkPassword"
+```
+
+**Never commit `wifi_credentials.conf`** - only the `.example` file is tracked. Leaving
+`CONFIG_QC_WIFI_AP_PSK` empty starts an *open* access point; this build defaults to a real
+WPA2 passphrase when one is set rather than defaulting to open (this firmware's own choice, not
+something issue #71 asked for specifically - the firmware logs a warning if it starts open
+anyway).
+
+The RW612's own Wi-Fi/BLE radio firmware is a licensed binary blob, fetched the same way ADR
+0002 already documents for BLE - if not already done:
+
+```bash
+west blobs fetch hal_nxp
+```
+
+### Build
+
+Same as the plain build above, once `wifi_credentials.conf` is in place:
+
+```bash
+west build -b frdm_rw612 firmware/app --pristine
+```
+
+Both modes build clean; see ADR 0010 for the measured RAM/flash cost (a real, large jump - the
+single biggest of any issue so far in this project, from bringing in Zephyr's networking
+stack, Wi-Fi driver, HTTP server, and mbedTLS).
+
+### Hardware test - access point mode
+
+1. Set `CONFIG_WIFI_USAGE_MODE_AP=y` in `wifi_credentials.conf` with a real SSID/passphrase,
+   build, and flash.
+2. Watch the serial console: `Wi-Fi AP "<SSID>" starting (DHCPv4 server is driver-managed...)`,
+   a `Startup summary: mode=AP ssid="<SSID>" http_server=listening port=80` line, then
+   `Wi-Fi AP enabled - waiting for a station to join` followed by a second
+   `Startup summary: mode=AP iface=up ip=192.168.4.1 dhcp=driver-managed ...
+   url=http://192.168.4.1/` line, and (once something joins) a
+   `Wi-Fi AP: station <MAC> joined` line. On `ac601b2` neither the enable-result nor the "AP
+   enabled" line ever appeared, and `nxp_wifi: DHCP Server start failed` did - see ADR 0010's
+   "Hardware findings" for the confirmed cause (an app-layer DHCPv4 server conflicting with the
+   driver's own) and the fix applied here. **Confirmed fixed on `26bfec1`**: "AP enabled" and
+   the second startup-summary line both appeared.
+3. On an iPhone and separately on a Mac: open Wi-Fi settings and look for the board's SSID in
+   the list before anything else - on `ac601b2` it never appeared at all. **Confirmed on
+   `26bfec1`**: "QCRemote" appeared and a phone joined. (Which device joined wasn't recorded at
+   the time; an iPhone specifically has not been confirmed in this mode - see step 4.)
+4. Open `http://192.168.4.1/` in a browser on each device. Expect the folder/preset listing
+   from the catalog (same content the serial console already prints, per issue #10) and a
+   `presets: N (generation G)` status line. On `26bfec1` this step crashed the board outright -
+   a USAGE FAULT / stack overflow on thread `rx_q[0]` - in both AP and station mode, with or
+   without a Quad Cortex attached. Root cause confirmed from source and fixed (this build raises
+   `CONFIG_NET_RX_STACK_SIZE`; see ADR 0010's "Hardware findings (`26bfec1`)"), and **confirmed
+   fixed on `b735057` in station mode** (see the go-decision result below) - but **AP mode's own
+   page load hasn't been retried against this fix**, since the owner's `b735057` run was station
+   mode only. This step, specifically, is the first thing to check on a fresh AP-mode run. If it
+   crashes with the same `rx_q[0]`/stack-overflow signature, paste the full fault register dump
+   (especially PC/LR) on the issue rather than re-guessing - it would mean the measured ~1136 B
+   call-chain estimate in that ADR section was still short.
+5. With the page open, change the active preset or folder on the Quad Cortex Mini itself.
+   **Known broken** ([issue #75](https://github.com/rrooding/QCRemote/issues/75)): the page
+   does not update live. The catalog it loaded on step 4 stays as-is until manually reloaded -
+   this is not the coexistence/stability check, just a known gap out of scope for this issue's
+   go/no-go decision.
+6. Leave it running for at least 10-15 minutes with the Quad Cortex Mini connected over USB
+   (handshake complete) and the web page open: watch for KeepAlive/File-stream behavior
+   unaffected by the AP running (`qc_heartbeat`'s usual ~200ms cadence, no new
+   `File stream limits:`/`Traffic drop/overflow:` lines), and for the Wi-Fi link itself
+   staying up (no repeated `Wi-Fi AP: station ... left` and `joined` for the same device,
+   which would mean it's dropping and reconnecting).
+
+**What each outcome means**: no "AP enabled"/second startup-summary line at all repeats
+`ac601b2`'s DHCP conflict - paste the console output and comment on the issue rather than
+guessing further. A page that loads once but never pushes updates points at the WebSocket path
+(`QcWifiWebTransport::broadcast()`); a client stuck with no IP despite "AP enabled" having
+logged points at the driver's own DHCP server rather than this firmware; any
+`qc_heartbeat`/`qc_dispatch`/USB-side regression while Wi-Fi is active (vs. a build with Wi-Fi
+disabled) would be the coexistence requirement failing, not just a Wi-Fi bug.
+
+### Hardware test - station mode
+
+1. Set `CONFIG_WIFI_USAGE_MODE_STA=y` with the real network's SSID/passphrase, build, and
+   flash.
+2. Watch the serial console: `Joining Wi-Fi network "<SSID>"`, then either
+   `Wi-Fi station connected: Connection successful` followed by a
+   `Startup summary: mode=STA iface=up ip=<ip> dhcp=Zephyr DHCPv4 client ... url=http://<ip>/`
+   line (Zephyr's own DHCPv4 client assigns that IP automatically -
+   `CONFIG_WIFI_STA_AUTO_DHCPV4`), or a `Wi-Fi station connect failed: <reason>` warning. On
+   `ac601b2`, this firmware logged "connected" even around a genuine
+   `nxp_wifi: WLAN: nxp_wlan_network authentication failed` warning - that was this firmware
+   not reading the event's own status (see ADR 0010's "Hardware findings"), now fixed; a
+   "connected" line should mean it actually connected.
+3. Find the board's IP address - easiest from the router's own client list (DHCP leases),
+   since nothing here advertises it, or from the `ip=` field in the startup-summary log line
+   above. (A follow-up issue could add mDNS/`.local` advertising if this test succeeds; out of
+   scope for this one.)
+4. From an iPhone and a Mac already on the **same** network, open `http://<that IP>/` in a
+   browser. **Verified on `b735057` from a Mac**: the page loads with the full catalog (3
+   folders, 48 presets). **Not tested**: an iPhone, in this mode or AP mode. **Known broken**
+   ([issue #75](https://github.com/rrooding/QCRemote/issues/75)): a preset change on the unit
+   does not push a live update over the WebSocket - the page stays as it loaded until manually
+   reloaded.
+5. Same 10-15 minute soak as AP mode: confirm KeepAlive/File-stream/USB behavior is unaffected,
+   and the station stays connected. A
+   `Wi-Fi station link dropped and is re-associating` warning here is the NXP stack reporting an
+   AP-initiated disassociation, not a credential problem - see "What each outcome means" below.
+
+**What each outcome means**: same as AP mode above, plus - `Wrong password`
+(`WIFI_STATUS_CONN_WRONG_PASSWORD`) is the *only* status the NXP stack has for a station
+losing its association, and it reports an AP-initiated disassociation/deauthentication with it
+just as readily as an actually-wrong passphrase: the middleware's
+`wlcm_process_disassoc_event()` calls `do_connect_failed(WLAN_REASON_NETWORK_AUTH_FAILED)`
+without ever looking at the 802.11 reason code (confirmed from source - see ADR 0010's
+`5068403` findings). Mid-session it is almost never a credential problem, and the stack
+re-associates on its own; this firmware now says so in the log rather than repeating the
+vendor wording. If the *underlying* 802.11 reason is ever needed, build with
+`CONFIG_WIFI_LOG_LEVEL_DBG=y`, which turns on the middleware's own
+`got event: disassociation, code=<N>` line. The owner has confirmed "Radioshack" is WPA2
+(not WPA3/mixed) on both bands under the same SSID, which rules out a security-type mismatch -
+this build's request was already using the matching `WIFI_SECURITY_TYPE_PSK`. A station that
+connects but the board never gets a reachable IP from the router's own DHCP pool is a
+network-side problem to check from the router, not this firmware.
+
+### Hardware results and the go decision
+
+**Verified on `b735057`**, station mode, from a Mac, Quad Cortex Mini connected: joined the
+home network and got an IP from DHCP; HTTP server listening; page loaded with the full
+catalog (3 folders, 48 presets); USB, handshake (`4.1.1`), heartbeat, and `File` listing
+unaffected (21 messages, no drops); about 3 minutes with no fault; a preset change arrived over
+USB as before. This is the result the owner's go decision - Wi-Fi is a viable transport, MVP2
+moves to a web UI over Wi-Fi - is based on. Full writeup: ADR 0010's "Hardware findings
+(`b735057`), and the go decision".
+
+**Not covered by that result, and still exactly as open as the sections above left it**:
+
+- Access point mode on this build - last came up on `26bfec1` (before the `rx_q[0]` fix this
+  build carries), not retried since.
+- An iPhone, in either mode - every result above is from a Mac.
+- The full 10-15 minute soak this section's own steps ask for - the verified run was ~3
+  minutes.
+- Live WebSocket updates - known broken, split out to
+  [issue #75](https://github.com/rrooding/QCRemote/issues/75), not part of this decision.
+
+**The cleaned-up build differs from `b735057`**: the commit this hardware result is pinned to
+(`b735057`) still carried `CONFIG_THREAD_ANALYZER` and its periodic stack-dump logging, added
+for this issue's own measure-and-report requirement. Those are removed in the current commit
+now that the measurements they produced (ADR 0010's stack-margin tables) are recorded - the
+underlying fix they helped verify (`CONFIG_NET_RX_STACK_SIZE=3072`) is unchanged. The smoke
+test below is what to re-run against the current commit before trusting it the same way.
+
+### Smoke test of `5068403`, and what it found
+
+The owner's smoke test of `5068403` found USB/handshake/`File` fine (21 messages, no drops, 3
+folders / 49 presets) and two problems - the page never showing presets, and a "Wrong password"
+warning 52 s into a working session on a correct passphrase. Both are now reproduced off-board
+and fixed; ADR 0010's "Hardware findings (`5068403`)" has the full trace. In short:
+
+- `GET /api/presets.json` answered with a status line of `HTTP/1.1 200` - no space, no reason
+  phrase - because Zephyr builds a *dynamic* resource's status line from
+  `"HTTP/1.1 %d%s%s\r\n"` and leaves both `%s` empty unless
+  `CONFIG_HTTP_SERVER_COMPLETE_STATUS_PHRASES` is on. RFC 9112 §4 requires that space. The
+  static page resource was never affected (it sends a hardcoded `HTTP/1.1 200 OK`), which is
+  exactly why the page loaded and its own fetch didn't. Fixed in `prj.conf`, and pinned by a new
+  Ztest suite - `firmware/app/tests/wifi_web_http` drives the real resources over a real socket
+  on the loopback interface with real browser headers, and fails without the option.
+- A newly connected WebSocket client used to receive nothing until the next publish (once per
+  device connect, or one throttled push per minute) - it now gets the catalog immediately.
+- The page itself had no error path and no retry. It now reports what failed in its own status
+  line, retries the fetch, and reconnects the WebSocket. The firmware logs every
+  `GET /api/presets.json` it answers (`Served GET /api/presets.json (<N> bytes)`) and every push
+  (`Pushed catalog to websocket client <fd> (<N> bytes)`).
+
+### Smoke test for this build
+
+1. Flash the current commit in station mode (`CONFIG_WIFI_USAGE_MODE_STA=y` with a real
+   SSID/passphrase), with the Quad Cortex Mini connected over USB.
+2. Confirm the usual boot/USB/handshake traces (see "Verify" above), then
+   `Joining Wi-Fi network "<SSID>"`, `Wi-Fi station connected: Connection successful`, and a
+   `Startup summary: ... ip=<ip> ... url=http://<ip>/` line.
+3. From a browser on the same network, open that URL. The page should show the real
+   folder/preset listing (49 presets on the owner's unit) **within a second or two**, and the
+   console should show the fetch being served and the WebSocket being pushed to, in either
+   order:
+
+   ```
+   <inf> main: Served GET /api/presets.json (NNNN bytes)
+   <inf> main: Websocket client connected (sock=N)
+   <inf> main: Pushed catalog to websocket client N (NNNN bytes)
+   ```
+
+   If the page still says `could not load presets (...)`, that message names the failure
+   (an HTTP status, or a JSON error) - paste it along with whether the `Served GET` line
+   appeared, which separates "the browser never asked" from "the firmware answered and the
+   browser rejected it".
+4. Leave it running a few minutes with the web page open: confirm no `LOG_ERR` lines, no
+   `qc_heartbeat`/`qc_dispatch`/USB-side regression, and the Wi-Fi link stays up. A
+   `Wi-Fi station link dropped and is re-associating` warning is the vendor-stack misreport
+   described above and is expected to be followed by `Wi-Fi station connected`; the page should
+   recover on its own (`websocket closed - reconnecting...` then the listing again).
+5. `Post-connect tally: command=33 count=<N>` stepping up once a minute is `GlobalTempo`
+   streaming at ~3/s, as `docs/PROTOCOL-NOTES.md` records - expected, not a preset change.
+
+### Known limitations of this test build
+
+- **Live WebSocket updates don't work** ([issue #75](https://github.com/rrooding/QCRemote/issues/75))
+  - a client gets the catalog when it connects, but a preset change on the unit doesn't push a
+  live update of its own; what does arrive once a minute is whatever the post-connect tally
+  bumped (usually `GlobalTempo`), which the page mislabels as a preset change. Out of scope for
+  this issue's go/no-go decision, tracked separately.
+- **Two browsers at once share one WebSocket receive buffer** (ADR 0011,
+  [issue #75](https://github.com/rrooding/QCRemote/issues/75)) - Zephyr's HTTP server hands the
+  resource's single `data_buffer` to every `websocket_register()`, so with
+  `CONFIG_WEBSOCKET_MAX_CONTEXTS=2` two clients can corrupt each other's partially received
+  frames. Not reachable from the pages this firmware serves today (they only ever receive), and
+  not fixable within Zephyr's API without dropping to a single client.
+- **No authentication** on the HTTP/WebSocket endpoints - matching issue #71's own stated
+  scope ("home use, not gigging... security can come later").
+- **Plain HTTP, not HTTPS** - also matching that stated scope; `CONFIG_HTTP_SERVER`'s TLS
+  support isn't enabled.
+- **AP mode is 2.4 GHz only** - the driver's auto-channel-select only reads the connect
+  request's band hint when picking a 5 GHz channel, and 5 GHz AP operation brings DFS/
+  regulatory channel-vacating requirements this firmware does nothing to handle; not something
+  the owner asked for. Station mode has no band restriction - confirmed by reading
+  `nxp_wifi_connect()` (the station connect path never reads the connect request's `band`
+  field at all), so an earlier version of this code setting it to 2.4 GHz for station mode was
+  always a no-op, not an actual restriction; issue #71's own text only says "2.4 GHz
+  reliability... [is] acceptable," not that 5 GHz should be refused.
+- **The page is deliberately minimal** - a folder/preset listing and a status line, nothing
+  resembling the real Quad Cortex's own UI yet (issue #71's own scope: prove the transport,
+  not design the product).
+- **AP and STA are build-time exclusive here** - Zephyr's own `apsta_mode` sample shows running
+  both at once is possible on this chip, but issue #71 only asks for build-time mode choice;
+  simultaneous AP+STA is a possible future enhancement, not built now.
 
 ## Not yet done
 

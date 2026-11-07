@@ -1,5 +1,8 @@
 /*
- * ESP32-S3-DevKitC-1 (issue #76, ADR 0009).
+ * ESP32-S3-DevKitC-1 with an 8 MB octal-PSRAM module (WROOM-1-N8R8/N16R8,
+ * the same PSRAM as RevA's N16R8) - issue #76, ADR 0009. For a module
+ * without PSRAM (N8/N16), build with -DFILE_SUFFIX=nopsram instead, which
+ * picks up esp32s3_devkitc_esp32s3_procpu_nopsram.{overlay,conf}.
  *
  * USB host: the board devicetree already labels the S3's OTG controller
  * zephyr_uhc0 and enables it, so nothing to change here. Its D-/D+ are fixed
@@ -25,4 +28,8 @@
 			gpios = <&gpio0 2 GPIO_ACTIVE_HIGH>;
 		};
 	};
+};
+
+&psram0 {
+	size = <DT_SIZE_M(8)>;
 };

@@ -77,3 +77,30 @@ proven out and a final form factor matters.
   lowest-level transport driver and its Kconfig/devicetree wiring will need replacing.
 - If NXP's host-side driver maturity stalls or a blocking gap turns up during MVP1 bring-up
   (#3), that's grounds to revisit this ADR — not to silently work around it.
+
+## 2026-11-01 note: the "likely ESP32-C3" intent above doesn't survive issue #71's Wi-Fi work
+
+Issue #71 (Wi-Fi web transport test) asked whether this design would carry over to an ESP32
+with both USB host and Wi-Fi, such as the S3, and flagged that the ESP32-C3 "appears not to
+have USB host" — this note confirms that and corrects the **Decision** section above, which
+still names ESP32-C3 as the anticipated future smaller board despite the Consequences section
+(written the same day) already noting the C3 "has no native USB-OTG silicon at all."
+
+Checked against Espressif's own current documentation (not re-derived from memory or carried
+forward unchecked): the ESP32-C3 has only a **USB-Serial-JTAG controller** — a device-side-only
+peripheral for firmware download/debug/serial — so it cannot be a USB host at all, full stop,
+independent of any Zephyr/ESP-IDF driver maturity question. **ESP32-S3** is the chip in this
+same product line with both a real USB-OTG peripheral (DWC_OTG core, host-mode-capable, 8 host
+channels) *and* Wi-Fi + BLE radios on one die — closer to RW612's own "one chip, both jobs"
+shape than the C3 ever was.
+
+This doesn't reopen ADR 0002's decision (RW612 now, a smaller board later) — it corrects what
+"later" should mean: **ESP32-S3 is the candidate that keeps USB host and gains Wi-Fi in a
+smaller package; ESP32-C3 isn't a candidate for this firmware's USB host role at all.** The
+RW612-to-other-chip USB transport rewrite cost already accepted above (same reasoning: RW612's
+EHCI driver and the S3's DWC2 driver are equally non-portable to a smaller chip) still applies
+either way — this note only corrects *which* chip that future migration could land on.
+
+**This finding should be confirmed against the ESP32-S3's own datasheet/technical reference
+manual before any future board-switch decision relies on it** — checked here against
+Espressif's current documentation pages, not the primary datasheet PDF itself.
