@@ -66,6 +66,33 @@ BLE (for MVP2) needs NXP's binary blobs — fetch them now so they're not a surp
 west blobs fetch hal_nxp
 ```
 
+### Or: use the pinned CI image (issue #46)
+
+CI (`.github/workflows/firmware.yml`) doesn't do any of the above per run — it runs inside
+`ghcr.io/rrooding/qcremote-firmware`, a container image (`ci/firmware/Dockerfile`) with the
+pinned v4.5.0 workspace, both toolchains, the Wi-Fi/BLE blobs, and the ESP32-S3 DWC2 patch
+(below) already baked in. You can use the exact same image locally instead of the one-time
+setup above — pull the tag `firmware.yml`'s `build-and-test` job currently pins:
+
+```bash
+docker pull ghcr.io/rrooding/qcremote-firmware:v4.5.0-1
+docker run --rm -v "$(pwd):/workspace" \
+  ghcr.io/rrooding/qcremote-firmware:v4.5.0-1 \
+  west build -b frdm_rw612 /workspace/firmware/app --pristine
+```
+
+The image's `WORKDIR` is already the Zephyr workspace, so `west build` just needs this repo
+bind-mounted in. If `docker pull` fails with an authentication error, either `docker login
+ghcr.io` with a personal access token that has `read:packages`, or ask whoever owns the
+`rrooding` GHCR namespace to make the `qcremote-firmware` package public (Package settings →
+Change visibility) — CI itself doesn't need this, since `GITHUB_TOKEN` already has read access
+to a package owned by the same account.
+
+**Bumping the pinned Zephyr version or toolchain** is the one deliberate place this drifts:
+edit `ZEPHYR_VERSION`/`--gnu-toolchains` in `ci/firmware/Dockerfile`, dispatch "publish
+firmware CI image" (Actions tab → that workflow → Run workflow) with a new `version` (e.g.
+`v4.6.0-1`), then update the image tag in both `firmware.yml` and the command above to match.
+
 ## Build
 
 ```bash
