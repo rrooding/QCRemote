@@ -68,11 +68,15 @@ west blobs fetch hal_nxp
 
 ### Or: use the pinned CI image (issue #46)
 
-CI (`.github/workflows/firmware.yml`) doesn't do any of the above per run — it runs inside
+CI (`.github/workflows/firmware.yml`) doesn't do any of the above per run — each of its
+jobs (`build-frdm-rw612`, `build-esp32s3`, `test-native-sim`, run in parallel) runs inside
 `ghcr.io/rrooding/qcremote-firmware`, a container image (`ci/firmware/Dockerfile`) with the
 pinned v4.5.0 workspace, both toolchains, the Wi-Fi/BLE blobs, and the ESP32-S3 DWC2 patch
-(below) already baked in. You can use the exact same image locally instead of the one-time
-setup above — pull the tag `firmware.yml`'s `build-and-test` job currently pins:
+(below) already baked in — 1.4 GB uncompressed (down from 2.75 GB after trimming the
+workspace's git history and pip's download cache, neither of which anything in the image
+reads again), pushed with zstd-compressed layers for a faster pull. You can use the exact
+same image locally instead of the one-time setup above — pull the tag `firmware.yml`'s
+jobs currently pin:
 
 ```bash
 docker pull ghcr.io/rrooding/qcremote-firmware:v4.5.0-1
