@@ -35,13 +35,29 @@ ENV ZEPHYR_WORKSPACE=/opt/zephyrproject
 
 # Same narrowed project list as firmware.yml's "Update Zephyr workspace and
 # SDK" step (issue #86) - keep both in sync if it ever changes.
+#
+# Issue #46 follow-up, data-driven: a real `du` measurement of this image
+# found `zephyr/.git` alone at 1020 MB (west init's manifest clone keeps full
+# history even though --narrow/--fetch-opt=--depth=1 below only shallow the
+# *other* projects), plus ~86 MB more across the narrowed modules' own .git
+# dirs, plus a 232 MB pip cache `west packages pip --install` leaves under
+# /root/.cache (unlike the plain `pip install west` above, it has no
+# --no-cache-dir equivalent). None of it is read again: the only things this
+# image's CI jobs run afterward are `west build`/`west twister`, which build
+# from the checked-out files already on disk, not git history, and
+# `west blobs fetch`/`git apply` below both work against a plain working
+# tree with no git metadata needed. Deleted in this same layer - deleting
+# either in a later layer wouldn't shrink the image, since the data would
+# still exist in this layer's blob.
 RUN west init -m https://github.com/zephyrproject-rtos/zephyr --mr "${ZEPHYR_VERSION}" "${ZEPHYR_WORKSPACE}" \
     && cd "${ZEPHYR_WORKSPACE}" \
     && west update --narrow -o=--depth=1 \
          hal_nxp hal_espressif hal_xtensa cmsis cmsis_6 \
          mbedtls tf-psa-crypto tf-psa-crypto-drivers picolibc \
     && west packages pip --install --ignore-venv-check \
-    && west sdk install --install-base /opt --gnu-toolchains arm-zephyr-eabi xtensa-espressif_esp32s3_zephyr-elf
+    && west sdk install --install-base /opt --gnu-toolchains arm-zephyr-eabi xtensa-espressif_esp32s3_zephyr-elf \
+    && find "${ZEPHYR_WORKSPACE}" -maxdepth 5 -name ".git" -exec rm -rf {} + \
+    && rm -rf /root/.cache/pip
 
 # Issue #71's Wi-Fi/BLE radio firmware blobs - same --allow-regex scope as
 # firmware.yml's "Fetch Wi-Fi/BLE radio firmware blobs" step (see that

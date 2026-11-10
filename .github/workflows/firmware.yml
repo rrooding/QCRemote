@@ -37,7 +37,7 @@ jobs:
   build-frdm-rw612:
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/rrooding/qcremote-firmware:tmp-measure-46
+      image: ghcr.io/rrooding/qcremote-firmware:v4.5.0-1
     steps:
       - name: Check out QCRemote
         uses: actions/checkout@v7
@@ -50,7 +50,7 @@ jobs:
   build-esp32s3:
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/rrooding/qcremote-firmware:tmp-measure-46
+      image: ghcr.io/rrooding/qcremote-firmware:v4.5.0-1
     steps:
       - name: Check out QCRemote
         uses: actions/checkout@v7
@@ -80,7 +80,7 @@ jobs:
   test-native-sim:
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/rrooding/qcremote-firmware:tmp-measure-46
+      image: ghcr.io/rrooding/qcremote-firmware:v4.5.0-1
     steps:
       - name: Check out QCRemote
         uses: actions/checkout@v7
