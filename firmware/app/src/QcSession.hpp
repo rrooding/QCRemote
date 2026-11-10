@@ -548,7 +548,13 @@ private:
                     for (size_t i = 0; i < entries.size(); ++i) {
                         const bool isNew = i >= postStreamLoggedEntryCount_;
                         const bool bumped = !isNew && entries[i].count != postStreamLoggedEntries_[i].count;
-                        if (isNew || (bumped && intervalDue)) {
+                        // Issue #75: a shared intervalDue window starved a
+                        // real preset switch behind GlobalTempo's own ~4/s
+                        // ticking - see shouldForwardTallyEntry()'s own
+                        // comment (QcMessageTally.hpp) for the full
+                        // reasoning and the 5068403 smoke-test symptom this
+                        // fixes.
+                        if (shouldForwardTallyEntry(isNew, bumped, intervalDue, entries[i].command)) {
                             postStreamEntries[postStreamEntryCount] = entries[i];
                             ++postStreamEntryCount;
                             postStreamChanged = true;

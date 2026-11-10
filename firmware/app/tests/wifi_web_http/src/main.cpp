@@ -16,6 +16,21 @@
 // wifi_credentials.conf in a firmware build.
 #define CONFIG_QC_WIFI_STA_SSID ""
 #define CONFIG_QC_WIFI_STA_PSK ""
+// Issue #75: this test app has no Kconfig of its own (unlike the real
+// firmware/app build, see ../../Kconfig), so QcWifiWebTransport.hpp's own
+// CONFIG_QC_WIFI_WEB_TICK_INTERVAL_MS reference needs a value the same way
+// the two above do. Shorter than the real 5000ms default, so
+// test_tick_is_sent_when_nothing_else_is doesn't have to wait that long -
+// but deliberately kept *above* receiveAll()'s own kRecvTimeoutSeconds
+// (2000ms): every other test in this suite reads a WebSocket response
+// with receiveAll(), which decides a response is complete once the socket
+// goes quiet for kRecvTimeoutSeconds - and once a client is connected,
+// this transport never *stops* being busy again on its own (that's the
+// heartbeat's whole point). Keeping the tick slower than that read timeout
+// is what lets those other tests still see a clean "quiet" after the one
+// message they're reading, instead of hanging until this suite's own
+// overall timeout.
+#define CONFIG_QC_WIFI_WEB_TICK_INTERVAL_MS 2500
 
 #include <cstdint>
 #include <cstdio>
@@ -184,6 +199,27 @@ bool contains(std::string_view haystack, std::string_view needle) {
     return haystack.find(needle) != std::string_view::npos;
 }
 
+// Issue #75: a minimal RFC 6455 client->server frame encoder - just enough
+// to send the one message this firmware recognizes (resync). Client
+// frames must be masked (section 5.3); the mask key can be anything, the
+// server is required to undo it the same way regardless of value.
+void sendWebSocketTextFrame(int sock, std::string_view payload) {
+    zassert_true(payload.size() < 126, "test payload too long for this helper's framing");
+    uint8_t frame[2 + 4 + 125];
+    size_t pos = 0;
+    frame[pos++] = 0x81;  // FIN=1, opcode=0x1 (text)
+    frame[pos++] = 0x80 | static_cast<uint8_t>(payload.size());  // MASK=1, payload length
+    const uint8_t maskKey[4] = {0x12, 0x34, 0x56, 0x78};
+    for (const uint8_t byte : maskKey) {
+        frame[pos++] = byte;
+    }
+    for (size_t i = 0; i < payload.size(); ++i) {
+        frame[pos++] = static_cast<uint8_t>(payload[i]) ^ maskKey[i % 4];
+    }
+    const ssize_t sent = zsock_send(sock, frame, pos, 0);
+    zassert_equal(sent, static_cast<ssize_t>(pos), "send() of websocket frame failed (%d)", errno);
+}
+
 void* setup(void) {
     g_qcWebPort = kServerPort;
     transport().startServer();
@@ -301,5 +337,96 @@ ZTEST(wifi_web_http, test_websocket_upgrade_pushes_the_current_catalog) {
                  "wrong Sec-WebSocket-Accept");
     zassert_true(contains(response, "\"presetCount\":49"),
                  "no catalog pushed to the new websocket client");
+    // Issue #75 / ADR 0011: the push is wrapped in the versioned envelope,
+    // as a "snapshot" (never a "patch" - a newly-connected client has no
+    // prior state to patch), with its own seq starting fresh at 0.
+    zassert_true(contains(response, R"("v":1,"t":"snapshot","seq":0,"catalog":)"),
+                 "catalog push isn't wrapped in a v1 snapshot envelope: %s", response.data());
     (void)zsock_close(sock);
+    // Issue #75: CONFIG_WEBSOCKET_MAX_CONTEXTS=1 means the next test's own
+    // connect only succeeds once the worker thread's own poll cycle
+    // (kPollIntervalMs, 1000ms) has noticed this socket closed and freed
+    // the one slot - give it that cycle before moving on.
+    k_msleep(1100);
+}
+
+// Issue #75: a preset-change event with no catalog change must reach the
+// client as a lean "patch" (just the envelope plus lastChange), not a
+// second full catalog resend - and its seq must continue from the
+// snapshot's.
+ZTEST(wifi_web_http, test_preset_change_is_pushed_as_a_patch_not_a_full_catalog) {
+    publishSmokeTestCatalog();
+    k_msleep(200);
+
+    const int sock = connectToServer();
+    sendRequest(sock, kWebsocketRequest);
+    const std::string_view snapshot = receiveAll(sock);
+    zassert_true(contains(snapshot, R"("t":"snapshot","seq":0,)"), "no initial snapshot: %s",
+                 snapshot.data());
+
+    transport().publishPresetChange(QcPresetChangeEvent{.command = 15, .count = 3});
+    k_msleep(200);
+    const std::string_view patch = receiveAll(sock);
+
+    zassert_true(contains(patch, R"({"v":1,"t":"patch","seq":1,"lastChange":{"command":15,)"
+                                 R"("count":3}})"),
+                 "preset change wasn't pushed as the expected patch envelope: %s", patch.data());
+    zassert_false(contains(patch, "folders"), "a patch must not resend the full catalog: %s",
+                  patch.data());
+    (void)zsock_close(sock);
+    k_msleep(1100);  // See test_websocket_upgrade_pushes_the_current_catalog's own comment.
+}
+
+// Issue #75 / ADR 0011: without a tick, an idle rig and a half-open socket
+// look the same. CONFIG_QC_WIFI_WEB_TICK_INTERVAL_MS is overridden (this
+// file's own #define above) so the test doesn't have to wait out the real
+// (5s) production cadence - see that #define's own comment for why it's
+// still kept above kRecvTimeoutSeconds rather than as short as possible.
+ZTEST(wifi_web_http, test_tick_is_sent_when_nothing_else_is) {
+    publishSmokeTestCatalog();
+    k_msleep(200);
+
+    const int sock = connectToServer();
+    sendRequest(sock, kWebsocketRequest);
+    const std::string_view snapshot = receiveAll(sock);
+    zassert_true(contains(snapshot, R"("t":"snapshot","seq":0,)"), "no initial snapshot: %s",
+                 snapshot.data());
+
+    // Comfortably past kTickIntervalMs (2500ms, this file's own #define
+    // above) plus the worker's own poll granularity (kPollIntervalMs,
+    // 1000ms) - sleeping *before* calling receiveAll() rather than
+    // relying on it to wait the tick out, since a tick this slow would
+    // otherwise exceed receiveAll()'s own per-call quiet timeout
+    // (kRecvTimeoutSeconds, 2s) before ever arriving.
+    k_msleep(3800);
+    const std::string_view tick = receiveAll(sock);
+    zassert_true(contains(tick, R"({"v":1,"t":"tick","seq":1})"), "no tick heartbeat arrived: %s",
+                 tick.data());
+    (void)zsock_close(sock);
+    k_msleep(1100);  // See test_websocket_upgrade_pushes_the_current_catalog's own comment.
+}
+
+// Issue #75: the client's own resync request (sent after it notices a seq
+// gap) must get a fresh "snapshot" back, not be silently ignored.
+ZTEST(wifi_web_http, test_resync_request_triggers_a_fresh_snapshot) {
+    publishSmokeTestCatalog();
+    k_msleep(200);
+
+    const int sock = connectToServer();
+    sendRequest(sock, kWebsocketRequest);
+    const std::string_view snapshot = receiveAll(sock);
+    zassert_true(contains(snapshot, R"("t":"snapshot","seq":0,)"), "no initial snapshot: %s",
+                 snapshot.data());
+
+    sendWebSocketTextFrame(sock, R"({"v":1,"t":"resync"})");
+    // Resync detection happens on the worker's own poll cadence
+    // (kPollIntervalMs, 1000ms) - give it comfortable margin.
+    k_msleep(1500);
+    const std::string_view resynced = receiveAll(sock);
+    zassert_true(contains(resynced, R"("t":"snapshot")"), "resync didn't produce a fresh snapshot: %s",
+                 resynced.data());
+    zassert_true(contains(resynced, "\"presetCount\":49"), "fresh snapshot missing the catalog: %s",
+                 resynced.data());
+    (void)zsock_close(sock);
+    k_msleep(1100);  // See test_websocket_upgrade_pushes_the_current_catalog's own comment.
 }

@@ -1119,17 +1119,9 @@ and fixed; ADR 0010's "Hardware findings (`5068403`)" has the full trace. In sho
 
 ### Known limitations of this test build
 
-- **Live WebSocket updates don't work** ([issue #75](https://github.com/rrooding/QCRemote/issues/75))
-  - a client gets the catalog when it connects, but a preset change on the unit doesn't push a
-  live update of its own; what does arrive once a minute is whatever the post-connect tally
-  bumped (usually `GlobalTempo`), which the page mislabels as a preset change. Out of scope for
-  this issue's go/no-go decision, tracked separately.
-- **Two browsers at once share one WebSocket receive buffer** (ADR 0011,
-  [issue #75](https://github.com/rrooding/QCRemote/issues/75)) - Zephyr's HTTP server hands the
-  resource's single `data_buffer` to every `websocket_register()`, so with
-  `CONFIG_WEBSOCKET_MAX_CONTEXTS=2` two clients can corrupt each other's partially received
-  frames. Not reachable from the pages this firmware serves today (they only ever receive), and
-  not fixable within Zephyr's API without dropping to a single client.
+- **Live WebSocket updates, and the shared-receive-buffer hazard** - both fixed by
+  [issue #75](https://github.com/rrooding/QCRemote/issues/75); see its own section below rather
+  than restating it here.
 - **No authentication** on the HTTP/WebSocket endpoints - matching issue #71's own stated
   scope ("home use, not gigging... security can come later").
 - **Plain HTTP, not HTTPS** - also matching that stated scope; `CONFIG_HTTP_SERVER`'s TLS
@@ -1148,6 +1140,129 @@ and fixed; ADR 0010's "Hardware findings (`5068403`)" has the full trace. In sho
 - **AP and STA are build-time exclusive here** - Zephyr's own `apsta_mode` sample shows running
   both at once is possible on this chip, but issue #71 only asks for build-time mode choice;
   simultaneous AP+STA is a possible future enhancement, not built now.
+
+## Live WebSocket updates (issue #75)
+
+Issue #71's own build already pushed the catalog to a connected browser on connect and on a
+throttled schedule (see the "Known limitations" note above, now resolved). This issue:
+
+1. **Root-caused why a *repeat* preset change still didn't reach the page within a couple of
+   seconds.** `QcSession::runHeartbeat()`'s post-connect tally forwards a *new* command
+   immediately, but gated every *repeat* bump behind one window shared across every tracked
+   command (`kPostStreamLogIntervalMs`, 60 s). `GlobalTempo` ticks ~4/s and resets that shared
+   window every time it's forwarded, so a real preset switch landing in between had to wait for
+   `GlobalTempo`'s own next forward to reopen it - up to a minute later. That's exactly the
+   `5068403` smoke test's `command=33 count=2` → `count=170` a minute apart, and the page's
+   `lastChange` mislabeling a `GlobalTempo` tick as "preset change". Fixed:
+   `QcMessageTally.hpp`'s new `shouldForwardTallyEntry()`/`isPresetChangeCommand()` let a
+   preset-identity command (`RecallPreset`, `Scene`, `Grid`, `RecentsFavorites`, `PresetDirty`,
+   `SetlistPosition` - this file's own pre-existing "preset-change pushes" list) forward on
+   *every* bump, never throttled, while a continuously-streaming command (`GlobalTempo`,
+   `MasterVolume`, ...) keeps the original once-per-minute behavior unchanged.
+2. **Adopted ADR 0011's envelope** (`QcLiveUpdateEnvelope.hpp`):
+   `{"v":1,"t":"<type>","seq":N,...}`, with the three outbound message types and the one inbound
+   one this issue needs:
+   - `snapshot` - the full catalog, sent to a newly-connected client and whenever the catalog
+     itself changed (`publishCatalog()`).
+   - `patch` - just `lastChange` (command/count), sent when a preset-change event arrived but the
+     catalog didn't (`publishPresetChange()`) - a few dozen bytes instead of resending the whole
+     ~2 KB listing.
+   - `tick` - liveness only, sent every `CONFIG_QC_WIFI_WEB_TICK_INTERVAL_MS` (5000 by default,
+     matching `web/poc/src/store.js`'s own assumption) when nothing else was sent in that window.
+   - `resync` (inbound) - sent by the page after it notices a `seq` gap; answered with a fresh
+     `snapshot`. The full message schema is #15; this firmware only emits/recognizes these four.
+3. **Fixed the shared WebSocket receive buffer** (ADR 0010/0011's "left to #75"). Re-confirmed
+   against the pinned v4.5.0 tree: Zephyr hands this resource's one static `data_buffer` to
+   `websocket_register()` on every upgrade, so two concurrently open browsers really would share
+   one receive buffer and could corrupt each other's partially received frames - and since this
+   issue adds a client-to-server message (`resync`), "the page never sends" stopped being a way
+   out of it. Fixed by capping it at one live client: `CONFIG_WEBSOCKET_MAX_CONTEXTS=1` (matching
+   `QcWifiWebTransport::kMaxWsClients=1`) makes Zephyr itself refuse a second concurrent upgrade
+   (`websocket_get()` finds no free context) before any of this firmware's own code runs - a
+   second static resource/buffer pair was the alternative, but it would need the page to know
+   which URL is free, for two-simultaneous-live-clients support nothing has asked for.
+
+### Verified
+
+`west twister -p qemu_cortex_m3 -p mps2/an385 -K -T firmware/app/tests`: all 11 suites pass on
+`mps2/an385` (234/234 cases, including the 2 new ones below). `qemu_cortex_m3` fails only on the
+new `live_updates` suite with a timeout - the same "too little RAM for a full
+`QcPresetCatalog`/`QcCatalogSnapshot` pair" limitation `preset_transport`'s own testcase.yaml
+already documents for that platform (both suites exclude it from their own `platform_allow` and
+only run there at all because of `-K`/`--force-platform`). `native_sim` couldn't be run locally
+(needs a Linux host - this was verified from a Mac); it's what CI actually gates on.
+
+Two new Ztest suites: `tests/live_updates` (pure-logic coverage for the envelope encoding, the
+`shouldForwardTallyEntry()`/`isPresetChangeCommand()` tally fix, and `resync` detection - no
+Zephyr networking needed) and four new cases added to `tests/wifi_web_http` (the enveloped
+snapshot push, a preset-change patch with no catalog resent, a tick after the configured
+interval, and a resync producing a fresh snapshot - all driven over the real HTTP/WebSocket
+resources on the loopback interface, same as that suite's existing cases).
+
+Clean builds with example credentials in a separate build tree (this worktree's real
+`wifi_credentials.conf` was never created, read or committed), compared against `595a0a3`
+(current master) built the same way:
+
+| Config | RAM (internal) before → after | Flash before → after |
+| --- | --- | --- |
+| `frdm_rw612`, STA | 734064 B / 74.67% → 734048 B / 74.67% (**-16 B**) | 719800 B → 722304 B (**+2504 B**) |
+| `frdm_rw612`, AP | 741368 B / 75.42% → 741352 B / 75.41% (**-16 B**) | 746444 B → 748948 B (**+2504 B**) |
+| ESP32-S3, with PSRAM | `dram0` 200624 B → 200536 B (**-88 B**) | `irom0`+`drom0` 543956 B → 546580 B (**+2624 B**) |
+| ESP32-S3, no PSRAM | `dram0` 333424 B → 333424 B (**unchanged**) | `irom0`+`drom0` 131396 B → 131460 B (**+64 B**) |
+
+RAM goes *down* everywhere Wi-Fi is on, despite this issue adding several new members
+(`wsSeq_`, `lastSendUptimeMs_`, `pendingInitialSnapshot_`, and `broadcastJson_` growing by
+`kEnvelopeOverhead` (64 B) to hold the envelope wrapper) - `CONFIG_WEBSOCKET_MAX_CONTEXTS`
+dropping from 2 to 1 (the buffer-sharing fix) shrinks Zephyr's own
+`contexts[CONFIG_WEBSOCKET_MAX_CONTEXTS]` array by more than that costs. The no-PSRAM config's
+RAM is unchanged outright: Wi-Fi is off there, so `QcWifiWebTransport` is never instantiated;
+only `QcSession`/`QcMessageTally`'s own small tally-forwarding fix links in, which is flash-only
+(a few new branches, no new storage).
+
+### What a second browser sees under the one-client policy
+
+Its WebSocket upgrade completes at the HTTP level (Zephyr has already sent
+`101 Switching Protocols` by the point `websocket_register()` fails), so the browser's own
+`WebSocket.onopen` fires - immediately followed by `onclose`, since the connection is torn down
+right after. The page's existing reconnect loop (`websocket closed - reconnecting…`) then retries
+with backoff indefinitely while the first browser stays connected; the second browser can still
+load the page itself and its one-time `GET /api/presets.json` fetch (so it isn't blank), it just
+never gets live pushes until the first browser disconnects. `Main.cpp`'s log shows only one
+`Websocket client connected` line at a time; no corruption, crash or `LOG_ERR` results from the
+second attempt.
+
+### Smoke test
+
+1. Flash in station mode, Quad Cortex Mini connected over USB, one browser open on the page.
+2. Switch presets on the unit (or change scene/setlist position). Within a couple of seconds,
+   confirm both of these:
+
+   ```
+   <inf> main: Post-connect tally: command=<N> count=<M>
+   <inf> main: Pushed patch to websocket client <fd> (<N> bytes)
+   ```
+
+   and the page's status line updating to `preset change (cmd <N>, #<M>)` without a reload.
+   Switch presets a second time a few seconds later (well under a minute) and confirm it updates
+   again just as quickly - this is the specific case that used to wait up to a minute.
+3. Leave the page open and idle (don't touch the unit) for a bit longer than
+   `CONFIG_QC_WIFI_WEB_TICK_INTERVAL_MS` (5 s by default). Confirm a `Pushed tick to websocket
+   client <fd> (<N> bytes)` line appears and the page doesn't show any error (a tick is silent on
+   the page by design).
+4. Open a **second** browser tab/window to the same URL while the first is still open. Confirm
+   the page loads (title, static listing) but its own console/network tab shows the WebSocket
+   opening then immediately closing, retrying on a backoff - matching "What a second browser
+   sees" above. The *first* browser's own updates (step 2) must keep working throughout.
+5. Close the first browser (or just its tab) and confirm the console shows
+   `Websocket client <fd> closed`/similar, then the second browser's next retry succeeds and it
+   starts receiving pushes normally.
+6. `Post-connect tally: command=33 count=<N>` stepping up roughly once a minute in the log is
+   `GlobalTempo` (unchanged from before - that tally log is QcSession's, independent of this
+   transport). Confirm it no longer produces a `Pushed patch to websocket client ...` line or a
+   page status change on its own - `QcWifiWebTransport::publishPresetChange()` now ignores any
+   command that isn't one of the preset-identity ones, so GlobalTempo's own tally bumps reach
+   this transport (same as before) but are simply not forwarded to the page at all, which is what
+   fixes the old "preset change (cmd 33, ...)" mislabeling.
 
 ## Not yet done
 

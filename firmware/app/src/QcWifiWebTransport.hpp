@@ -20,6 +20,8 @@
 
 #include "QcCatalogJson.hpp"
 #include "QcCatalogSnapshot.hpp"
+#include "QcLiveUpdateEnvelope.hpp"
+#include "QcMessageTally.hpp"
 #include "QcPresetTransport.hpp"
 #include "ScopedKMutex.hpp"
 
@@ -134,13 +136,26 @@ public:
     }
 
     void publishPresetChange(const QcPresetChangeEvent& event) override {
-        // PR #74 review: silently rebroadcasting the stored catalog JSON
-        // verbatim made a preset switch invisible on the page whenever it
-        // didn't also change the folder/preset list (render() would show
-        // the same names/count/generation as before). broadcast() now
-        // folds this event's command/count into the next message it sends
-        // as a "lastChange" field alongside the catalog, so the page can
-        // show something changed even when the listing itself didn't.
+        // Issue #75: QcSession's post-connect tally forwards every tracked
+        // command it sees, including continuously-streaming ones like
+        // GlobalTempo (QcMessageTally.hpp's own isPresetChangeCommand()
+        // lists the ones that actually mean a preset's identity/content
+        // changed). This page only ever shows a "preset change" label, so
+        // anything else is simply not this transport's concern - without
+        // this check, a GlobalTempo bump reaching here (as it does, once
+        // its own throttling window is due) used to get pushed as a patch
+        // and the page mislabeled it "preset change (cmd 33, ...)". A
+        // future BLE transport registered alongside this one still gets
+        // every event QcSession forwards; this filter is local to the web
+        // page's own interpretation, not the interface's contract.
+        if (!isPresetChangeCommand(event.command)) {
+            return;
+        }
+        // broadcast() sends this as its own lean "patch" envelope
+        // (QcLiveUpdateEnvelope.hpp) rather than resending the whole
+        // catalog - a preset-change event alone doesn't mean the folder/
+        // preset listing changed (that's publishCatalog()'s job, sent as a
+        // "snapshot"), just that something about the loaded preset did.
         {
             ScopedKMutex lock(dataMutex_);
             lastChangeEvent_ = event;
@@ -208,8 +223,9 @@ public:
             // opened after the catalog was already published sat empty for
             // up to a minute - which is what "the page shows only the
             // title and Loading..." looked like. Wake the worker so it
-            // sends the catalog it already has to this client right away.
-            instance_->requestInitialSend();
+            // sends a fresh "snapshot" (QcLiveUpdateEnvelope.hpp) to this
+            // client right away, with a seq of its own starting from 0.
+            instance_->requestFreshSnapshot();
         }
         return 0;
     }
@@ -217,13 +233,48 @@ public:
 private:
     static constexpr int kThreadPriority = 10;
     static constexpr size_t kJsonCapacity = 16384;
-    static constexpr size_t kMaxWsClients = 2;
+    // Issue #75 / ADR 0011: Zephyr's HTTP server hands this resource's one
+    // static data_buffer (g_qcWsDataBuffer, below) to websocket_register()
+    // on *every* upgrade (subsys/net/lib/http/http_server_ws.c:126-128 in
+    // the pinned v4.5.0 tree - the buffer comes from the resource's own
+    // http_resource_detail_websocket, not from anything per-connection),
+    // which only stores the pointer per-context
+    // (subsys/net/lib/websocket/websocket.c:1330) - so two concurrently
+    // upgraded clients on this one URL really would share one receive
+    // buffer and could corrupt each other's partially received frames.
+    // ADR 0010 first found this and left it for this issue; this issue
+    // adds a client-to-server message (resync), so "the page never sends"
+    // is no longer true either. The clean fix within Zephyr's API - a
+    // second static resource/buffer pair for a second URL - would still
+    // need the page to know which URL is free, for a feature (two
+    // simultaneous live clients) nothing has asked for. Capping this at
+    // one live client is simpler and provably safe instead:
+    // CONFIG_WEBSOCKET_MAX_CONTEXTS=1 (prj.conf) means Zephyr itself
+    // refuses a second concurrent upgrade - websocket_get() finds no free
+    // context and websocket_register() returns -ENOENT - before this
+    // class's own code ever runs, so there is structurally never more
+    // than one context sharing the buffer. See firmware/README.md for
+    // what a second browser sees under this policy.
+    static constexpr size_t kMaxWsClients = 1;
     // How often run() wakes even without a publish, to poll connected
     // sockets for control frames/EOF (PR #74 review: the worker only ever
     // woke on a broadcast, so a closed browser tab's socket was never
     // drained or unregistered until the next unrelated publish happened to
-    // fail a send to it).
+    // fail a send to it) and to check whether a tick heartbeat is due.
     static constexpr int kPollIntervalMs = 1000;
+    // Issue #75 / ADR 0011: without a heartbeat, an idle rig (nothing
+    // published) and a half-open socket after a Wi-Fi drop look identical
+    // to the page - silence either way. Chosen to match
+    // web/poc/src/store.js's own kTickIntervalMs (same ADR), so a future
+    // move to that reference client doesn't also have to change this
+    // number. Kconfig, not a bare constant, per CODING_STANDARDS.md
+    // ("feature toggles... go through Kconfig").
+    static constexpr int64_t kTickIntervalMs = CONFIG_QC_WIFI_WEB_TICK_INTERVAL_MS;
+    // Envelope overhead (QcLiveUpdateEnvelope.hpp) on top of the bare
+    // catalog JSON a "snapshot" wraps - {"v":1,"t":"snapshot","seq":<=10
+    // digits>,"catalog": plus a trailing "}". 64 leaves comfortable slack
+    // over the ~42 bytes that actually costs.
+    static constexpr size_t kEnvelopeOverhead = 64;
 
     static constexpr uint64_t kNetEventMask =
         (NET_EVENT_WIFI_CONNECT_RESULT | NET_EVENT_WIFI_DISCONNECT_RESULT |
@@ -241,45 +292,100 @@ private:
                 broadcast();
             }
             pollWsClients();
+            maybeSendTick();
         }
     }
 
-    // Encodes the latest snapshot (if publishCatalog() ran since the last
-    // broadcast) into catalogJson_ - moved here from publishCatalog() per
-    // PR #74 review, so the variable-length formatting work never runs on
-    // qc_heartbeat. Then copies into broadcastJson_ (never holding
-    // dataMutex_ across the actual socket sends below - same split as
-    // before) and pushes it to every connected client, folding in a
-    // pending preset-change event as a "lastChange" field when one hasn't
-    // been delivered yet.
+    // Decides what this wake sends - a full "snapshot" (a new client just
+    // connected, a resync asked for one, or the catalog itself changed) or
+    // a lean "patch" (only a preset-change event arrived, catalog
+    // unchanged) - encodes it into broadcastJson_ and hands off to
+    // sendEnvelopeToClients() for the actual socket I/O. See
+    // QcLiveUpdateEnvelope.hpp for both shapes.
     void broadcast() {
+        enum class Kind { None, Snapshot, Patch };
+        Kind kind = Kind::None;
         QcPresetChangeEvent change{};
-        bool includeChange = false;
-        size_t length = 0;
+
+        {
+            ScopedKMutex lock(dataMutex_);
+            const bool wantSnapshot = pendingInitialSnapshot_ || catalogDirty_;
+            // Moved here from publishCatalog() per PR #74 review, so the
+            // variable-length formatting work never runs on qc_heartbeat.
+            encodeIfDirtyLocked();
+
+            if (wantSnapshot) {
+                kind = Kind::Snapshot;
+                pendingInitialSnapshot_ = false;
+                // A snapshot already reports the full, current state, so a
+                // patch describing an older preset-change event right
+                // behind it would be redundant at best, stale at worst.
+                changePending_ = false;
+            } else if (changePending_) {
+                kind = Kind::Patch;
+                change = lastChangeEvent_;
+                changePending_ = false;
+            }
+
+            if (kind == Kind::None) {
+                return;  // Nothing actually pending - shouldn't normally
+                         // happen (run() only calls broadcast() when the
+                         // semaphore fired), harmless if it does.
+            }
+
+            if (kind == Kind::Snapshot) {
+                encodeSnapshotEnvelope(wsSeq_, catalogJson_, broadcastJson_);
+            } else {
+                encodePatchEnvelope(wsSeq_, change, broadcastJson_);
+            }
+        }
+
+        sendEnvelopeToClients(kind == Kind::Snapshot ? "snapshot" : "patch");
+    }
+
+    // A tick carries no payload beyond the envelope itself - just evidence
+    // the board is still there. Sent only once kTickIntervalMs has passed
+    // with nothing else sent to this client, so an active session's own
+    // snapshots/patches already satisfy the same liveness purpose without
+    // a redundant tick right next to them.
+    void maybeSendTick() {
         etl::vector<int, kMaxWsClients> sockets;
         {
             ScopedKMutex lock(dataMutex_);
-            encodeIfDirtyLocked();
-            if (changePending_) {
-                change = lastChangeEvent_;
-                includeChange = true;
-                changePending_ = false;
-            }
-            broadcastJson_.assign(catalogJson_.begin(), catalogJson_.end());
-            if (includeChange) {
-                appendLastChange(change, broadcastJson_);
-            }
-            length = broadcastJson_.size();
             sockets = wsSockets_;
+        }
+        if (sockets.empty()) {
+            return;
+        }
+        if (k_uptime_get() - lastSendUptimeMs_ < kTickIntervalMs) {
+            return;
+        }
+
+        {
+            ScopedKMutex lock(dataMutex_);
+            encodeTickEnvelope(wsSeq_, broadcastJson_);
+        }
+        sendEnvelopeToClients("tick");
+    }
+
+    // Sends whatever's currently in broadcastJson_ to every connected
+    // client (at most kMaxWsClients worth), bumping the shared seq counter
+    // and the liveness clock once per message - never holding dataMutex_
+    // across the actual socket sends (same split PR #74 review asked for:
+    // a wedged client must only ever delay this thread's own next send,
+    // never block it forever).
+    void sendEnvelopeToClients(const char* label) {
+        etl::vector<int, kMaxWsClients> sockets;
+        size_t length = 0;
+        {
+            ScopedKMutex lock(dataMutex_);
+            sockets = wsSockets_;
+            length = broadcastJson_.size();
+            ++wsSeq_;
+            lastSendUptimeMs_ = k_uptime_get();
         }
 
         for (const int sock : sockets) {
-            // Bounded timeout (not SYS_FOREVER_MS): a wedged client must
-            // only ever delay this thread's own next broadcast, never
-            // block it forever - this thread has no effect on usbh/
-            // qc_session/qc_heartbeat either way (see this class's own
-            // header comment), but an unbounded wait here would still
-            // starve the *other* connected client's updates.
             const int sent = websocket_send_msg(sock, reinterpret_cast<const uint8_t*>(broadcastJson_.data()),
                                                 length, WEBSOCKET_OPCODE_DATA_TEXT,
                                                 /*mask=*/false, /*final=*/true, 2000);
@@ -291,35 +397,19 @@ private:
                 // Same reason handlePresetsGet() logs its own response:
                 // the 5068403 smoke test had no way to tell a push that
                 // never happened from one the page failed to render.
-                LOG_INF("Pushed catalog to websocket client %d (%zu bytes)", sock, length);
+                LOG_INF("Pushed %s to websocket client %d (%zu bytes)", label, sock, length);
             }
         }
-    }
-
-    // Rewrites broadcastJson_'s trailing "}" into
-    // ,"lastChange":{"command":N,"count":M}} - broadcastJson_ is always a
-    // complete, non-empty JSON object at this point (encodeCatalogJson()'s
-    // own guarantee), so it always ends in "}".
-    template <size_t N>
-    static void appendLastChange(const QcPresetChangeEvent& event, etl::vector<char, N>& out) {
-        if (!out.empty()) {
-            out.pop_back();
-        }
-        detail::appendLiteral(",\"lastChange\":{\"command\":", out);
-        detail::appendUInt(event.command, out);
-        detail::appendLiteral(",\"count\":", out);
-        detail::appendUInt(event.count, out);
-        detail::appendLiteral("}}", out);
     }
 
     // PR #74 review: this worker previously only ever woke to broadcast,
     // so Zephyr handed it an upgraded socket (handleWsSetup()) that was
     // then never read from again - a closed browser tab left its slot
-    // occupied (both of kMaxWsClients' worth) until an unrelated broadcast
-    // happened to fail a send to it. Runs every run() wake (see
-    // kPollIntervalMs), draining any pending frame per connected socket
-    // without blocking, replying to pings, and unregistering anything
-    // closed or erroring.
+    // occupied until an unrelated broadcast happened to fail a send to
+    // it. Runs every run() wake (see kPollIntervalMs), draining any
+    // pending frame per connected socket without blocking, replying to
+    // pings, unregistering anything closed or erroring, and - issue #75 -
+    // recognizing the one inbound message this firmware understands.
     void pollWsClients() {
         etl::vector<int, kMaxWsClients> sockets;
         {
@@ -353,9 +443,19 @@ private:
                 (void)websocket_send_msg(sock, wsRecvBuffer_, static_cast<size_t>(received),
                                          WEBSOCKET_OPCODE_PONG, /*mask=*/false, /*final=*/true,
                                          2000);
+            } else if (messageType & WEBSOCKET_FLAG_TEXT) {
+                // Issue #75: the only inbound message this firmware
+                // recognizes - QcLiveUpdateEnvelope.hpp's
+                // isResyncMessage(). Anything else this doesn't recognize
+                // (or a frame fragment with no complete message in it) is
+                // simply ignored, same as before.
+                const std::string_view text(reinterpret_cast<const char*>(wsRecvBuffer_),
+                                            static_cast<size_t>(received));
+                if (isResyncMessage(text)) {
+                    LOG_INF("Websocket client %d asked for a resync", sock);
+                    requestFreshSnapshot();
+                }
             }
-            // Any other inbound frame (the page never sends data messages
-            // today) is simply drained above and otherwise ignored.
         }
     }
 
@@ -370,14 +470,30 @@ private:
         }
     }
 
-    // See handleWsSetup(): makes the worker thread's next broadcast()
-    // happen now rather than waiting for a publish, so a client that
-    // connects between publishes still gets the current listing.
-    void requestInitialSend() { k_sem_give(&broadcastSem_); }
+    // Forces the next broadcast() to send a full "snapshot" rather than
+    // whatever it would otherwise send, and restarts this connection's seq
+    // counter at 0 - used both when a client just connected
+    // (handleWsSetup()'s own comment) and when one asks for a resync after
+    // noticing a seq gap (pollWsClients()). Either way the client is about
+    // to get a fresh, complete baseline, so a fresh seq to count from is
+    // exactly as valid as continuing the old one, and simpler to test.
+    void requestFreshSnapshot() {
+        {
+            ScopedKMutex lock(dataMutex_);
+            wsSeq_ = 0;
+            pendingInitialSnapshot_ = true;
+        }
+        k_sem_give(&broadcastSem_);
+    }
 
     void addWsClient(int sock) {
         ScopedKMutex lock(dataMutex_);
         if (wsSockets_.full()) {
+            // Issue #75 / ADR 0011: shouldn't normally be reachable - see
+            // kMaxWsClients' own comment. Zephyr refuses a second
+            // concurrent upgrade before this callback ever runs; this is
+            // a defensive belt-and-braces check, not the actual
+            // enforcement.
             LOG_WRN("Max websocket clients (%zu) reached, rejecting", kMaxWsClients);
             return;
         }
@@ -723,19 +839,31 @@ private:
     // Member storage, not stack - see CODING_STANDARDS.md's "big objects
     // never go on a thread's stack" rule and ADR 0008's own reasoning.
     // catalogSnapshot_ is the source of truth QcSession hands us
-    // (publishCatalog()); catalogJson_ is its encoded form, re-derived on
-    // qc_wifi_web (broadcast()) and also what GET /api/presets.json
-    // serves (via its own responseJson_ copy - see handlePresetsGet());
-    // broadcastJson_ is the worker thread's own send copy, so a slow send
+    // (publishCatalog()); catalogJson_ is its encoded, *bare* form,
+    // re-derived on qc_wifi_web (broadcast()) and also what GET
+    // /api/presets.json serves (via its own responseJson_ copy - see
+    // handlePresetsGet()) - neither of those carries the WebSocket
+    // envelope (QcLiveUpdateEnvelope.hpp), since the HTTP endpoint's
+    // contract predates issue #75 and doesn't need it. broadcastJson_ is
+    // the worker thread's own send copy - enveloped, so sized
+    // kEnvelopeOverhead bytes larger than the other two - so a slow send
     // never holds dataMutex_.
     QcCatalogSnapshot catalogSnapshot_{};
     bool catalogDirty_ = false;
     etl::vector<char, kJsonCapacity> catalogJson_;
-    etl::vector<char, kJsonCapacity> broadcastJson_;
+    etl::vector<char, kJsonCapacity + kEnvelopeOverhead> broadcastJson_;
     etl::vector<char, kJsonCapacity> responseJson_;
     etl::vector<int, kMaxWsClients> wsSockets_;
     QcPresetChangeEvent lastChangeEvent_{};
     bool changePending_ = false;
+    // Issue #75: forces the next broadcast() to send a full "snapshot" -
+    // see requestFreshSnapshot().
+    bool pendingInitialSnapshot_ = false;
+    // This connection's own seq counter (QcLiveUpdateEnvelope.hpp) and the
+    // uptime (k_uptime_get()) of the last message actually sent to it -
+    // together, what maybeSendTick() needs to decide a tick is due.
+    uint32_t wsSeq_ = 0;
+    int64_t lastSendUptimeMs_ = 0;
     uint8_t wsRecvBuffer_[256]{};
 
     net_mgmt_event_callback netMgmtCb_{};
@@ -748,10 +876,13 @@ inline QcWifiWebTransport* QcWifiWebTransport::instance_ = nullptr;
 namespace detail {
 
 // Kept small and embedded on purpose (issue #71: "doesn't need to look
-// like the Quad Cortex yet") - fetches the catalog once on load, then
-// re-renders from either the fetch or any websocket push using the same
-// JSON shape (QcCatalogJson.hpp), plus an optional "lastChange" field a
-// websocket push may carry (see QcWifiWebTransport::appendLastChange()).
+// like the Quad Cortex yet") - fetches the catalog once on load (the bare
+// shape QcCatalogJson.hpp encodes), then re-renders from either that or
+// any websocket push. A websocket push is the issue #75 envelope
+// (QcLiveUpdateEnvelope.hpp: {"v":1,"t":"snapshot"|"patch"|"tick","seq":N,
+// ...}), not the bare catalog - this is still the smallest page that
+// understands it, not a step toward Lit/web/poc (ADR 0011's own "add a
+// build step when..." trigger hasn't fired).
 inline constexpr const char kIndexHtml[] = R"HTML(<!doctype html>
 <html><head><meta charset="utf-8"><title>QC Remote (Wi-Fi test)</title>
 <style>
@@ -765,6 +896,7 @@ ul{margin:0 0 0.5rem 1.2rem;padding:0}
 <div id="status">loading&hellip;</div>
 <div id="catalog"></div>
 <script>
+var lastChange=null;
 function render(d){
   var el=document.getElementById('catalog');
   var html='';
@@ -778,7 +910,7 @@ function render(d){
   el.innerHTML=html;
   var s='presets: '+d.presetCount+' (generation '+d.generation+')';
   if(d.incomplete){ s+=' - listing may be incomplete'; }
-  if(d.lastChange){ s+=' - preset change (cmd '+d.lastChange.command+', #'+d.lastChange.count+')'; }
+  if(lastChange){ s+=' - preset change (cmd '+lastChange.command+', #'+lastChange.count+')'; }
   document.getElementById('status').textContent=s;
 }
 function escapeHtml(s){
@@ -792,6 +924,7 @@ function escapeHtml(s){
 // Report what went wrong and keep trying - and do the same for the
 // WebSocket, which otherwise stayed dead after one failed upgrade.
 var loaded=false;
+var catalog=null;
 function note(s){
   if(!loaded){ document.getElementById('status').textContent=s; }
 }
@@ -799,15 +932,56 @@ function load(){
   fetch('/api/presets.json').then(function(r){
     if(!r.ok){ throw new Error('HTTP '+r.status); }
     return r.json();
-  }).then(function(d){ loaded=true; render(d); }).catch(function(e){
+  }).then(function(d){ loaded=true; catalog=d; render(d); }).catch(function(e){
     note('could not load presets ('+e.message+') - retrying…');
     setTimeout(load,2000);
   });
 }
+// Issue #75: seq continuity. null means "no baseline yet" (nothing
+// received since the last connect/resync) - the gap check below is
+// skipped in that state, which is what lets the very first message after
+// a connect carry any seq value at all.
+var expectedSeq=null;
+var ws=null;
+function send(msg){
+  if(ws && ws.readyState===WebSocket.OPEN){ ws.send(JSON.stringify(msg)); }
+}
+// A seq that isn't exactly one past the last one we saw means a message
+// was missed - our state is a guess from here, so ask the board for a
+// fresh "snapshot" rather than keep rendering it. Suppresses repeat
+// resync requests until the next snapshot re-establishes a baseline.
+function checkSeq(seq){
+  if(expectedSeq!==null && seq!==expectedSeq){
+    expectedSeq=null;
+    send({v:1,t:'resync'});
+    return;
+  }
+  expectedSeq=seq+1;
+}
 function connect(){
-  var ws=new WebSocket('ws://'+location.host+'/ws');
-  ws.onmessage=function(ev){ loaded=true; render(JSON.parse(ev.data)); };
+  ws=new WebSocket('ws://'+location.host+'/ws');
+  ws.onmessage=function(ev){
+    var msg;
+    try { msg=JSON.parse(ev.data); } catch(e){ return; }
+    if(msg.v!==1){ return; }
+    checkSeq(msg.seq);
+    if(msg.t==='snapshot'){
+      loaded=true;
+      catalog=msg.catalog;
+      lastChange=null;
+      render(catalog);
+    } else if(msg.t==='patch'){
+      if(msg.lastChange){ lastChange=msg.lastChange; }
+      if(catalog){ render(catalog); }
+    }
+    // 'tick' and any other/unknown type: nothing to render - a tick is
+    // liveness-only, and a v1 client must ignore message types it doesn't
+    // know (ADR 0011) rather than error on them. This page doesn't act on
+    // a missed tick itself (full reconnect-on-missed-tick logic is #20);
+    // onclose below still catches an actual dropped connection.
+  };
   ws.onclose=function(){
+    expectedSeq=null;
     note('websocket closed - reconnecting…');
     setTimeout(connect,2000);
   };
@@ -842,6 +1016,13 @@ inline http_resource_detail_dynamic g_qcPresetsResourceDetail{
     .user_data = nullptr,
 };
 
+// Issue #75 / ADR 0011: this one static buffer is what CONFIG_WEBSOCKET_
+// MAX_CONTEXTS=1 (prj.conf) makes safe to share - see kMaxWsClients' own
+// comment for the full mechanism. Zephyr hands this exact pointer to
+// websocket_register() on every upgrade
+// (subsys/net/lib/http/http_server_ws.c:126-128, pinned v4.5.0 tree), and
+// with at most one context ever in use, there is never a second
+// concurrent user of it to corrupt.
 inline uint8_t g_qcWsDataBuffer[256];
 
 inline http_resource_detail_websocket g_qcWsResourceDetail{
