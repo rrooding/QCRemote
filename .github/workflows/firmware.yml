@@ -11,210 +11,100 @@ on:
       - "firmware/**"
       - ".github/workflows/firmware.yml"
 
-# Pinned to the same Zephyr release firmware/README.md documents for local
-# setup - keep these in sync if that ever changes.
-env:
-  ZEPHYR_VERSION: v4.5.0
-
+# Issue #46: the Zephyr version, both toolchains, the pinned v4.5.0 workspace
+# (issue #86's narrowed `west update` project list), the Wi-Fi/BLE blobs and
+# the ESP32-S3 DWC2 patch are all baked into this image - see
+# ci/firmware/Dockerfile. No job here installs Zephyr itself anymore.
+#
+# This is the one deliberate place the pinned toolchain changes: bump
+# ZEPHYR_VERSION in ci/firmware/Dockerfile, dispatch "publish firmware CI
+# image" with a new version tag, then update every `image:` line below to
+# match. firmware/README.md documents running the same image locally.
+#
+# The `env` context isn't available in `jobs.<id>.container.image` (GitHub
+# Actions limitation - confirmed by a real run failing with "Unrecognized
+# named-value: 'env'"), so each job repeats the tag as a literal rather than
+# an env var substitution.
+#
+# Split into 3 parallel jobs (issue #86 looked at this and found splitting
+# not worth tripling the apt+cache+pip setup cost of ~3m10s for a ~3min
+# wall-clock win; the pinned image removes that setup entirely, leaving only
+# an image pull - ~1m30s - to repeat per job, which is a much better trade):
+# each job now pays one pull instead of the whole sequential build+test
+# chain, so wall clock drops to roughly pull + the slowest single job
+# instead of pull + all three summed.
 jobs:
-  build-and-test:
+  build-frdm-rw612:
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/rrooding/qcremote-firmware:v4.5.0-1
     steps:
       - name: Check out QCRemote
         uses: actions/checkout@v7
 
-      # Package list trimmed from Zephyr's own Ubuntu install docs
-      # (doc/develop/getting_started/installation_linux.rst) down to what
-      # our 3 builds + twister actually use (issue #86) - gcc-multilib/
-      # g++-multilib in particular are required for native_sim's 32-bit host
-      # build and aren't on a bare ubuntu-latest runner.
-      #
-      # Dropped vs. the doc list: libsdl2-dev (pulls ~50 MB of
-      # wayland/drm/glib dev packages for native_sim's optional SDL
-      # display driver - none of this firmware's Ztest suites enable
-      # CONFIG_SDL_DISPLAY), python3-tk (only used by Kconfig's optional
-      # Tkinter guiconfig GUI, never invoked here), dfu-util (only used by
-      # `west flash --runner dfu-util`, which this workflow never runs -
-      # no flash step, build + twister only) and wget (west's own SDK
-      # downloader is pure Python, not a wget shell-out). If a cold-cache
-      # run's SDK install step fails looking for one of these, that's the
-      # first place to look.
-      #
-      # Acquire::Retries/Acquire::http::Timeout handle a transient mirror
-      # outage; the `timeout` wrapper is the actual fix for issue #86's
-      # root cause - a mirror that is slow but still trickling bytes
-      # never trips apt's own stall timeout, so without this a bad mirror
-      # silently costs 25 min instead of failing fast enough to retry the
-      # job.
-      - name: Install Zephyr host dependencies
-        run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update
-          timeout 300 sudo apt-get -o Acquire::Retries=3 install --no-install-recommends -y \
-            git cmake ninja-build gperf ccache device-tree-compiler \
-            python3-dev python3-pip python3-setuptools python3-wheel xz-utils file \
-            make gcc gcc-multilib g++-multilib libmagic1
-
-      # ~/.cmake/packages is where `west sdk install` registers a CMake
-      # package config so find_package(Zephyr) can locate the toolchain -
-      # caching the SDK directory alone, without this, would make a
-      # cache-hit run skip reinstalling the SDK but still fail to find it.
-      # Confirmed working: a warm-cache run restored 4.7GB and finished in
-      # ~5 minutes (vs ~8.5 cold), with the SDK correctly found unreinstalled.
-      #
-      # Keyed on the Zephyr version and the installed toolchains - the
-      # workspace/SDK don't depend on our own source, so hashing it here would
-      # invalidate this cache (re-clone zephyr, re-download the SDK) on every
-      # commit, defeating the point of caching it at all. The toolchain list
-      # is in the key because a cache hit skips the SDK install entirely, so
-      # adding a toolchain (issue #76: the ESP32-S3's) needs a fresh cache.
-      - name: Cache Zephyr workspace and SDK
-        id: zephyr-cache
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/zephyrproject
-            ~/zephyr-sdk-*
-            ~/.cmake/packages
-          key: zephyr-${{ env.ZEPHYR_VERSION }}-${{ runner.os }}-arm-esp32s3
-
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-
-      - name: Install west
-        run: pip install west
-
-      - name: Initialize Zephyr workspace
-        run: |
-          if [ ! -d ~/zephyrproject/.west ]; then
-            west init -m https://github.com/zephyrproject-rtos/zephyr --mr "$ZEPHYR_VERSION" ~/zephyrproject
-          fi
-
-      # Issue #86: a full `west update` clones every HAL under modules/hal/
-      # (~30 vendor SDKs) plus every other always-active module (hostap,
-      # openthread, lvgl, ...) even though our 3 boards only ever compile
-      # against a handful of them. Narrowed to exactly what frdm_rw612,
-      # esp32s3_devkitc and the native_sim Ztest suites pull in via Kconfig:
-      #   - hal_nxp: RW612 SDK, drivers and the Wi-Fi/BLE blobs
-      #   - hal_espressif, hal_xtensa: ESP32-S3 SDK + its Xtensa core support
-      #   - cmsis, cmsis_6: Cortex-M core headers frdm_rw612 needs
-      #   - mbedtls, tf-psa-crypto, tf-psa-crypto-drivers: the PSA crypto
-      #     backend - CONFIG_WIFI + CONFIG_HTTP_SERVER_WEBSOCKET both select
-      #     PSA_WANT_ALG_* on all 3 targets, including native_sim's
-      #     wifi_web_http Ztest suite, so this isn't board-specific
-      #   - picolibc: the toolchain's default libc (CONFIG_REQUIRES_FULL_LIBCPP
-      #     in app/prj.conf selects GLIBCXX_LIBCPP against it)
-      # A project missing from this list fails loud (CMake can't find the
-      # module) rather than silently dropping a Kconfig select, but if a
-      # future board/feature needs one not listed here, add it rather than
-      # falling back to a full `west update`.
-      #
-      # --narrow + --fetch-opt=--depth=1 skip fetching tags/history we never
-      # use - both are west's own documented combination for a shallow,
-      # single-revision fetch.
-      #
-      # Skipped entirely on a cache hit: same Zephyr version and toolchain
-      # list (the cache key below) means the same manifest and the same
-      # pinned revisions, so there is nothing for `west update` to change.
-      - name: Update Zephyr workspace
-        if: steps.zephyr-cache.outputs.cache-hit != 'true'
-        run: |
-          cd ~/zephyrproject
-          west update --narrow -o=--depth=1 \
-            hal_nxp hal_espressif hal_xtensa cmsis cmsis_6 \
-            mbedtls tf-psa-crypto tf-psa-crypto-drivers picolibc
-
-      # Not covered by the cache below (fresh Python venv every run) - runs
-      # unconditionally, since `west blobs fetch` below needs it (requests,
-      # jsonschema) even on a cache hit that skips the update above
-      # entirely. Must run after `west update`, not before: on a cold
-      # cache, hal_espressif's own requirements (esptool) aren't on disk
-      # until `west update` fetches that module - confirmed by run
-      # 42356496529 failing cmake configure with "esptool>=5.0.2 not found
-      # in PATH" when this ran before `west update`. Must also run before
-      # `west sdk install` below, since that needs patoolib from these
-      # requirements - confirmed by run 42356316058 (a forced cache-miss
-      # test) hitting "ModuleNotFoundError: No module named 'patoolib'"
-      # when this ran after `west sdk install` instead of before it.
-      - name: Install Zephyr Python requirements
-        run: |
-          cd ~/zephyrproject
-          west packages pip --install --ignore-venv-check
-
-      - name: Install Zephyr SDK
-        if: steps.zephyr-cache.outputs.cache-hit != 'true'
-        run: |
-          cd ~/zephyrproject
-          if ! compgen -G "$HOME/zephyr-sdk-*" > /dev/null; then
-            west sdk install --install-base ~ --gnu-toolchains arm-zephyr-eabi xtensa-espressif_esp32s3_zephyr-elf
-          fi
-
-      # Issue #71 (Wi-Fi) needs the RW612's own Wi-Fi radio firmware blob,
-      # the same one ADR 0002 already documents fetching for BLE
-      # (rw61x_sb_ble_a2.bin, same hal_nxp module/license). Without this
-      # the frdm_rw612 build fails at CMake configure time looking for
-      # modules/hal/nxp/zephyr/blobs/rw61x/rw61x_sb_wifi_a2_compressed.bin.
-      #
-      # Scoped with --allow-regex to only the rw61x_sb_{wifi,ble}_a2 blobs
-      # this build actually needs - a plain `west blobs fetch hal_nxp`
-      # (tried first) fetches hal_nxp's *entire* blob list, which includes
-      # unrelated blobs that DO require interactive click-through (e.g.
-      # imx-boot-firmware's imx95-evk blob) - confirmed as a real CI
-      # failure (EOFError on input(), not a hypothetical one), not
-      # something to work around with --auto-accept, since that would
-      # accept a license on the user's behalf without them reading it.
-      # The rw61x_sb_{wifi,ble}_a2 blobs this regex selects have no
-      # click-through field in hal_nxp's module.yml at all (west's
-      # blobs.py schema defaults that to false when absent - see
-      # zephyr/scripts/zephyr_module.py), so this fetch is a plain
-      # non-interactive download, no license being auto-accepted.
-      - name: Fetch Wi-Fi/BLE radio firmware blobs
-        run: |
-          cd ~/zephyrproject
-          west blobs fetch hal_nxp --allow-regex '^rw61x/rw61x_sb_(wifi|ble)_a2'
-
       - name: Build frdm_rw612
         run: |
-          cd ~/zephyrproject
+          cd "$ZEPHYR_WORKSPACE"
           west build -b frdm_rw612 "$GITHUB_WORKSPACE/firmware/app" --pristine
-          # Nothing downstream needs this build tree, and a cold cache (SDK/
-          # workspace reinstall after a cache-key change) leaves this runner
-          # disk-constrained by the time the ESP32-S3 builds below run -
-          # confirmed as a real failure, not a hypothetical one: GH run
-          # 41834770616 hit "Free space left: 89 MB" partway through the
-          # second ESP32-S3 build and cmake's Ninja generator silently wrote
-          # an incomplete build.ninja, which then failed as "No such file or
-          # directory" instead of a clear disk-full error. Freeing each
-          # --pristine build's tree before the next one starts keeps that
-          # from recurring.
-          rm -rf ~/zephyrproject/build
 
-      # Issue #76 / ADR 0009. The DWC2 driver patch is a runtime fix and the
-      # build passes without it, but build what actually runs on the board.
-      # The workspace is cached, so the patch may already be applied from an
-      # earlier run - apply only if it isn't.
+  build-esp32s3:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/rrooding/qcremote-firmware:v4.5.0-1
+    steps:
+      - name: Check out QCRemote
+        uses: actions/checkout@v7
+
+      # Issue #76 / ADR 0009's DWC2 driver patch and the Wi-Fi/BLE blobs are
+      # already baked into the image (ci/firmware/Dockerfile) - nothing to
+      # apply or fetch here.
       - name: Build esp32s3_devkitc
         run: |
-          cd ~/zephyrproject
-          patch="$GITHUB_WORKSPACE/firmware/patches/zephyr/0001-uhc_dwc2-start-late-periodic-channels.patch"
-          if ! git -C zephyr apply --reverse --check "$patch" 2>/dev/null; then
-            git -C zephyr apply "$patch"
-          fi
+          cd "$ZEPHYR_WORKSPACE"
           # Default board config: PSRAM module, Wi-Fi on (issue #71). The ESP
           # Wi-Fi driver needs hal_espressif's blobs (~40 MB, every chip);
           # BUILD_ONLY_NO_BLOBS is Zephyr's own switch for building it in CI
           # without them - the image links but isn't meant to run.
           west build -b esp32s3_devkitc/esp32s3/procpu "$GITHUB_WORKSPACE/firmware/app" -d build-esp32s3 --pristine \
             -- -DCONFIG_BUILD_ONLY_NO_BLOBS=y
-          # See the disk-space comment on the frdm_rw612 step above - same
-          # reason, between these two --pristine builds instead of after.
-          rm -rf ~/zephyrproject/build-esp32s3
+          # Both builds still share this one job/runner, so the disk-space
+          # reasoning from before the matrix split still applies between
+          # them - confirmed as a real failure, not a hypothetical one: GH
+          # run 41834770616 hit "Free space left: 89 MB" partway through the
+          # second of these two builds.
+          rm -rf "$ZEPHYR_WORKSPACE/build-esp32s3"
           # Module without PSRAM: USB only, Wi-Fi off.
           west build -b esp32s3_devkitc/esp32s3/procpu "$GITHUB_WORKSPACE/firmware/app" -d build-esp32s3-nopsram --pristine \
             -- -DFILE_SUFFIX=nopsram
 
+  test-native-sim:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/rrooding/qcremote-firmware:v4.5.0-1
+    steps:
+      - name: Check out QCRemote
+        uses: actions/checkout@v7
+
       - name: Run firmware Ztest suites (native_sim)
         run: |
-          cd ~/zephyrproject
+          cd "$ZEPHYR_WORKSPACE"
           west twister -p native_sim -T "$GITHUB_WORKSPACE/firmware/app/tests"
+
+  # Single aggregate gate for the 3 jobs above. Master's branch protection
+  # doesn't require a named status check today (confirmed via the GitHub
+  # API), but a PR/push is still easier to read with one pass/fail signal
+  # than three, and this is the job to point a future required check at.
+  firmware-ci:
+    name: firmware CI
+    needs: [build-frdm-rw612, build-esp32s3, test-native-sim]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check matrix result
+        run: |
+          echo 'needs context: ${{ toJSON(needs) }}'
+          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ] || \
+             [ "${{ contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "One or more firmware CI jobs did not succeed."
+            exit 1
+          fi
