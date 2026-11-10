@@ -331,6 +331,40 @@ shape this section describes, not yet as shipped fact, until that lands.
 
 ---
 
+## Web UI (Lit, no build step)
+
+See [ADR 0011](docs/adr/0011-web-ui-stack.md) for the full reasoning; this section is the
+quick reference. The real UI lives in [`web/ui/`](web/ui/README.md).
+[`web/poc/`](web/poc/README.md) is a frozen research artifact from that ADR - don't add
+to it.
+
+- **No build step.** Plain ES modules, Lit's own `html`/`css` tagged templates, served
+  as-is. Don't introduce bundling, minification, TypeScript or JSX under `web/ui/` -
+  ADR 0011 decision 2 names the specific triggers for revisiting that, and none of them
+  have fired.
+- **Lit is vendored, not fetched.** `web/ui/vendor/lit.js` is a single pinned bundle,
+  regenerated only on a Lit upgrade by `web/ui/tools/vendor-lit.mjs` (needs `npm`/`esbuild`,
+  run by hand, never by CI or by `west build`). **Firmware CI must never gain a Node
+  dependency** - the asset pipeline that actually ships the UI
+  (`firmware/app/tools/embed_assets.py`) is Python standard library only.
+- **Our own drawing, always.** No Neural DSP artwork, icons, typeface or colour values -
+  system font stack, a palette written from scratch, CSS/SVG shapes we drew. This is a
+  hard rule, not a style preference: it's the thing that keeps this project clearly
+  distinct from Neural DSP's own software.
+- **Native feel.** `display: standalone` in the manifest, `viewport-fit=cover` +
+  `env(safe-area-inset-*)`, `100dvh` not `vh`, `touch-action: manipulation` (never
+  `user-scalable=no`), `color-scheme: dark`, and real tap targets (~44px minimum, prefer
+  larger) on anything interactive.
+- **The client store speaks exactly what the board sends** - ground any protocol code in
+  `firmware/app/src/QcLiveUpdateEnvelope.hpp` and `firmware/README.md`'s "Live WebSocket
+  updates" section, not in `web/poc/`'s own (richer, never-shipped) research protocol.
+  Unknown message types are ignored, per the versioned envelope.
+- **Formatting**: 2-space indent, single quotes, semicolons, matching the existing
+  `web/ui/` and `web/poc/` sources - no linter/formatter config is checked in yet; match
+  the surrounding file by eye until one is.
+
+---
+
 ## Workflow
 
 `master` is a protected branch: no direct pushes, no force-pushes, no deletion, enforced even

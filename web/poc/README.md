@@ -1,5 +1,11 @@
 # Web UI proof of concept (issue #84)
 
+**Superseded by [`web/ui/`](../ui/README.md) (issue #88).** This tree is now a frozen
+research artifact - kept for ADR 0011's own record, not updated further. Its protocol
+(a `current` preset, `link.qcConnected`) was a proposal; the board's real envelope
+(issue #75) turned out leaner - see `web/ui/src/store.js`'s own header comment. Don't add
+features here; add them to `web/ui/`.
+
 The proof of concept behind [ADR 0011](../../docs/adr/0011-web-ui-stack.md): the preset list
 and a live-updated current preset, rendered with the recommended stack, driven by a mock board
 on the Mac. It is **not** firmware, nothing under `firmware/` references it, and it has never

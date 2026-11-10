@@ -1,0 +1,92 @@
+{
+  "note": "Invented preset names in the shape the board actually reports (3 folders / 48 presets, ADR 0008). Not copied from a Quad Cortex factory set. Command ids below match QcMessageTally.hpp's real preset-identity list (e.g. 15 = RecallPreset) for realism, but the counts are invented for this fixture.",
+  "initial": {
+    "catalog": {
+      "generation": 7,
+      "presetCount": 48,
+      "incomplete": false,
+      "folders": [
+        {
+          "name": "My Presets",
+          "presets": [
+            { "index": 0, "name": "Clean Chime" },
+            { "index": 1, "name": "Edge Crunch" },
+            { "index": 2, "name": "Rhythm Stack" },
+            { "index": 3, "name": "Lead Boost" },
+            { "index": 4, "name": "Plexi Mids" },
+            { "index": 5, "name": "Bright Spring" },
+            { "index": 6, "name": "Tweed Low" },
+            { "index": 7, "name": "Fuzz Bloom" },
+            { "index": 8, "name": "Octave Pad" },
+            { "index": 9, "name": "Slapback Twang" },
+            { "index": 10, "name": "Dirty Verb" },
+            { "index": 11, "name": "Tape Lead" },
+            { "index": 12, "name": "Doom Low" },
+            { "index": 13, "name": "Modern High Gain" },
+            { "index": 14, "name": "Acoustic Sim" },
+            { "index": 15, "name": "Bass DI" },
+            { "index": 16, "name": "Chorus Clean" },
+            { "index": 17, "name": "Phase Rhythm" },
+            { "index": 18, "name": "Tremolo Picked" },
+            { "index": 19, "name": "Wah Funk" },
+            { "index": 20, "name": "Shimmer Pad" },
+            { "index": 21, "name": "Ambient Swell" },
+            { "index": 22, "name": "Dual Amp Wide" },
+            { "index": 23, "name": "Direct Monitor" }
+          ]
+        },
+        {
+          "name": "Live Set",
+          "presets": [
+            { "index": 24, "name": "Opener" },
+            { "index": 25, "name": "Verse 1" },
+            { "index": 26, "name": "Chorus Big" },
+            { "index": 27, "name": "Bridge Clean" },
+            { "index": 28, "name": "Solo 1" },
+            { "index": 29, "name": "Solo 2" },
+            { "index": 30, "name": "Breakdown" },
+            { "index": 31, "name": "Outro Swell" },
+            { "index": 32, "name": "Ballad Clean" },
+            { "index": 33, "name": "Ballad Lead" },
+            { "index": 34, "name": "Encore Crunch" },
+            { "index": 35, "name": "Acoustic Set" },
+            { "index": 36, "name": "Talk Mute" },
+            { "index": 37, "name": "Click Only" },
+            { "index": 38, "name": "Spare Lead" },
+            { "index": 39, "name": "Spare Rhythm" }
+          ]
+        },
+        {
+          "name": "Downloads",
+          "presets": [
+            { "index": 40, "name": "Shared Rhythm" },
+            { "index": 41, "name": "Shared Lead" },
+            { "index": 42, "name": "Amp Test A" },
+            { "index": 43, "name": "Amp Test B" },
+            { "index": 44, "name": "Cab Compare" },
+            { "index": 45, "name": "IR Blend" },
+            { "index": 46, "name": "Pedal Stack" },
+            { "index": 47, "name": "Scratch Pad" }
+          ]
+        }
+      ]
+    }
+  },
+  "script": [
+    {
+      "atMs": 4000,
+      "note": "footswitch preset change at the unit (RecallPreset)",
+      "lastChange": { "command": 15, "count": 1 }
+    },
+    {
+      "atMs": 9000,
+      "note": "another preset change a few seconds later - must update just as quickly, not wait a minute (issue #75's whole point)",
+      "lastChange": { "command": 15, "count": 2 }
+    },
+    {
+      "atMs": 16000,
+      "note": "a scene change at the unit (command 13)",
+      "lastChange": { "command": 13, "count": 1 }
+    }
+  ]
+}

@@ -76,3 +76,9 @@ target_link_libraries(app PRIVATE etl::etl)
 # that file's own comment for why this is required, not optional, wiring.
 zephyr_linker_sources(SECTIONS sections-rom.ld)
 zephyr_linker_section(NAME http_resource_desc_qcWebService KVMA RAM_REGION GROUP RODATA_REGION)
+
+# Issue #88 / ADR 0011: gzips web/ui into a generated header of static HTTP
+# resources - see cmake/EmbedWebAssets.cmake for what this wires up.
+# QcWifiWebTransport.hpp #includes the result unconditionally.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedWebAssets.cmake)
+qc_embed_web_assets(app)

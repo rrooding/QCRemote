@@ -35,10 +35,12 @@ namespace qcbridge {
 inline uint16_t g_qcWebPort = 80;
 
 // Issue #71's concrete Wi-Fi/web transport: implements QcPresetTransport by
-// serving a small embedded page and a WebSocket over Zephyr's HTTP server
-// (zephyr/net/http/server.h), on top of a Wi-Fi interface brought up either
-// as an access point or a station, per CONFIG_WIFI_USAGE_MODE_AP/STA
-// (chosen at build time - see Kconfig/wifi_credentials.conf.example).
+// serving the real web UI (issue #88, ADR 0011: Lit, build-time gzipped
+// assets - see web/ui/ and the generated header this file #includes below)
+// and a WebSocket over Zephyr's HTTP server (zephyr/net/http/server.h), on
+// top of a Wi-Fi interface brought up either as an access point or a
+// station, per CONFIG_WIFI_USAGE_MODE_AP/STA (chosen at build time - see
+// Kconfig/wifi_credentials.conf.example).
 //
 // QcSession/QcPresetCatalog never include this header or anything it pulls
 // in - they only know QcPresetTransport.hpp. This class is the only place
@@ -206,7 +208,8 @@ public:
         // Issue #71's smoke test could not tell "the browser never asked"
         // from "the firmware answered and the browser rejected it" - one
         // line per request settles that, and the page's own status line
-        // reports its side (see kIndexHtml).
+        // reports its side (see web/ui/src/store.js's own
+        // #fetchInitialCatalog(), issue #88).
         LOG_INF("Served GET /api/presets.json (%zu bytes)", instance_->responseJson_.size());
         return 0;
     }
@@ -873,138 +876,6 @@ private:
 
 inline QcWifiWebTransport* QcWifiWebTransport::instance_ = nullptr;
 
-namespace detail {
-
-// Kept small and embedded on purpose (issue #71: "doesn't need to look
-// like the Quad Cortex yet") - fetches the catalog once on load (the bare
-// shape QcCatalogJson.hpp encodes), then re-renders from either that or
-// any websocket push. A websocket push is the issue #75 envelope
-// (QcLiveUpdateEnvelope.hpp: {"v":1,"t":"snapshot"|"patch"|"tick","seq":N,
-// ...}), not the bare catalog - this is still the smallest page that
-// understands it, not a step toward Lit/web/poc (ADR 0011's own "add a
-// build step when..." trigger hasn't fired).
-inline constexpr const char kIndexHtml[] = R"HTML(<!doctype html>
-<html><head><meta charset="utf-8"><title>QC Remote (Wi-Fi test)</title>
-<style>
-body{font-family:sans-serif;margin:1rem;color:#222}
-h3{margin:0.8rem 0 0.2rem}
-ul{margin:0 0 0.5rem 1.2rem;padding:0}
-#status{color:#666;margin-bottom:1rem}
-</style></head>
-<body>
-<h1>QC Remote &ndash; Wi-Fi test</h1>
-<div id="status">loading&hellip;</div>
-<div id="catalog"></div>
-<script>
-var lastChange=null;
-function render(d){
-  var el=document.getElementById('catalog');
-  var html='';
-  (d.folders||[]).forEach(function(f){
-    html+='<h3>'+escapeHtml(f.name)+'</h3><ul>';
-    (f.presets||[]).forEach(function(p){
-      html+='<li>['+p.index+'] '+escapeHtml(p.name)+'</li>';
-    });
-    html+='</ul>';
-  });
-  el.innerHTML=html;
-  var s='presets: '+d.presetCount+' (generation '+d.generation+')';
-  if(d.incomplete){ s+=' - listing may be incomplete'; }
-  if(lastChange){ s+=' - preset change (cmd '+lastChange.command+', #'+lastChange.count+')'; }
-  document.getElementById('status').textContent=s;
-}
-function escapeHtml(s){
-  return String(s).replace(/[&<>]/g,function(c){
-    return c==='&'?'&amp;':c==='<'?'&lt;':'&gt;';
-  });
-}
-// Issue #71's 5068403 smoke test: the page used to fetch once, with no
-// .catch and no retry, so any single failed request left it reading
-// "loading..." forever with nothing on screen or in the log to say why.
-// Report what went wrong and keep trying - and do the same for the
-// WebSocket, which otherwise stayed dead after one failed upgrade.
-var loaded=false;
-var catalog=null;
-function note(s){
-  if(!loaded){ document.getElementById('status').textContent=s; }
-}
-function load(){
-  fetch('/api/presets.json').then(function(r){
-    if(!r.ok){ throw new Error('HTTP '+r.status); }
-    return r.json();
-  }).then(function(d){ loaded=true; catalog=d; render(d); }).catch(function(e){
-    note('could not load presets ('+e.message+') - retrying…');
-    setTimeout(load,2000);
-  });
-}
-// Issue #75: seq continuity. null means "no baseline yet" (nothing
-// received since the last connect/resync) - the gap check below is
-// skipped in that state, which is what lets the very first message after
-// a connect carry any seq value at all.
-var expectedSeq=null;
-var ws=null;
-function send(msg){
-  if(ws && ws.readyState===WebSocket.OPEN){ ws.send(JSON.stringify(msg)); }
-}
-// A seq that isn't exactly one past the last one we saw means a message
-// was missed - our state is a guess from here, so ask the board for a
-// fresh "snapshot" rather than keep rendering it. Suppresses repeat
-// resync requests until the next snapshot re-establishes a baseline.
-function checkSeq(seq){
-  if(expectedSeq!==null && seq!==expectedSeq){
-    expectedSeq=null;
-    send({v:1,t:'resync'});
-    return;
-  }
-  expectedSeq=seq+1;
-}
-function connect(){
-  ws=new WebSocket('ws://'+location.host+'/ws');
-  ws.onmessage=function(ev){
-    var msg;
-    try { msg=JSON.parse(ev.data); } catch(e){ return; }
-    if(msg.v!==1){ return; }
-    checkSeq(msg.seq);
-    if(msg.t==='snapshot'){
-      loaded=true;
-      catalog=msg.catalog;
-      lastChange=null;
-      render(catalog);
-    } else if(msg.t==='patch'){
-      if(msg.lastChange){ lastChange=msg.lastChange; }
-      if(catalog){ render(catalog); }
-    }
-    // 'tick' and any other/unknown type: nothing to render - a tick is
-    // liveness-only, and a v1 client must ignore message types it doesn't
-    // know (ADR 0011) rather than error on them. This page doesn't act on
-    // a missed tick itself (full reconnect-on-missed-tick logic is #20);
-    // onclose below still catches an actual dropped connection.
-  };
-  ws.onclose=function(){
-    expectedSeq=null;
-    note('websocket closed - reconnecting…');
-    setTimeout(connect,2000);
-  };
-}
-load();
-connect();
-</script>
-</body></html>
-)HTML";
-
-}  // namespace detail
-
-inline http_resource_detail_static g_qcIndexResourceDetail{
-    .common = {
-        .bitmask_of_supported_http_methods = BIT(HTTP_GET),
-        .type = HTTP_RESOURCE_TYPE_STATIC,
-        .content_encoding = nullptr,
-        .content_type = "text/html",
-    },
-    .static_data = detail::kIndexHtml,
-    .static_data_len = sizeof(detail::kIndexHtml) - 1,
-};
-
 inline http_resource_detail_dynamic g_qcPresetsResourceDetail{
     .common = {
         .bitmask_of_supported_http_methods = BIT(HTTP_GET),
@@ -1054,9 +925,17 @@ inline http_resource_detail_websocket g_qcWsResourceDetail{
 extern "C" {
 HTTP_SERVICE_DEFINE(qcWebService, nullptr, &g_qcWebPort, CONFIG_HTTP_SERVER_MAX_CLIENTS, 4, nullptr,
                     nullptr, nullptr);
-HTTP_RESOURCE_DEFINE(qcIndexResource, qcWebService, "/", &g_qcIndexResourceDetail);
 HTTP_RESOURCE_DEFINE(qcPresetsResource, qcWebService, "/api/presets.json", &g_qcPresetsResourceDetail);
 HTTP_RESOURCE_DEFINE(qcWsResource, qcWebService, "/ws", &g_qcWsResourceDetail);
 }
+
+// Issue #88 / ADR 0011: the real web UI (web/ui/), embedded at build time
+// by firmware/app/tools/embed_assets.py (see
+// firmware/app/cmake/EmbedWebAssets.cmake) as gzipped static resources on
+// this same qcWebService - including "/", which used to be this file's own
+// hand-written kIndexHtml. Generated, not committed; depends on
+// qcWebService (just above) and g_qcWebPort/BIT/HTTP_GET (already in scope
+// from this file's own includes).
+#include "qc_web_assets_generated.hpp"
 
 }  // namespace qcbridge

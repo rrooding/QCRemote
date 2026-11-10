@@ -1503,6 +1503,94 @@ Flash in **station** mode with the Quad Cortex Mini connected over USB, and open
 6. Leave it a few minutes with the page open: no `LOG_ERR` lines, USB/handshake normal,
    `Post-connect tally: command=33 count=<N>` stepping up about once a minute (`GlobalTempo`,
    expected and unchanged).
+## Lit web UI (issue #88)
+
+ADR 0011's own research prototype (issue #84, `web/poc/`) is now the board's real UI:
+`QcWifiWebTransport.hpp`'s inline `kIndexHtml` test page is gone, replaced by
+[`web/ui/`](../web/ui/README.md) - plain ES modules, Lit 3, no build step - served from
+flash as build-time, pre-gzipped static resources.
+
+1. **Asset pipeline.** `firmware/app/tools/embed_assets.py` gzips every file in `web/ui/`
+   deterministically (mtime 0, so an unchanged UI produces a byte-identical generated
+   header) into a `constexpr uint8_t[]` per asset, plus the
+   `http_resource_detail_static`/`HTTP_RESOURCE_DEFINE` pair that serves each one on
+   `qcWebService` with `Content-Encoding: gzip` and the right `Content-Type`.
+   `firmware/app/cmake/EmbedWebAssets.cmake` wires this into both `firmware/app`'s own
+   build and `tests/wifi_web_http` (which links the same header) as a CMake custom
+   command, depended on by the `app` target - so **editing a file under `web/ui/` needs no
+   firmware code change at all**, just a rebuild. Nothing is committed; the generated
+   header lives under the build directory.
+2. **`GET /api/presets.json` and `/ws` are unchanged** - still hand-written resources in
+   `QcWifiWebTransport.hpp`, independent of the embed step. Only `/` moved from the old
+   inline page onto the generated static resources (it's just one more entry in the same
+   table).
+3. **The client store speaks the board's real envelope**, not the richer one `web/poc/`
+   proposed: `web/ui/src/store.js` consumes exactly `snapshot`/`patch`/`tick` as
+   `QcLiveUpdateEnvelope.hpp` actually emits them (see "Live WebSocket updates" above) -
+   there's no "currently loaded preset" on this wire yet, so the UI shows the catalog plus
+   the last preset-change event's command/count, same as the inline page it replaces. A
+   second browser tab, refused a live WebSocket under the one-client policy, now falls
+   back to the same one-shot `GET /api/presets.json` the old inline page made, instead of
+   showing a blank list.
+4. **Vendored Lit** (`web/ui/vendor/lit.js`, `web/ui/tools/vendor-lit.mjs`) is this tree's
+   own pinned bundle, separate from `web/poc/vendor/lit.js` - firmware CI still needs no
+   Node; regenerating it is a manual, rarely-run step.
+
+### Dev loop
+
+```sh
+node web/ui/tools/mock-server.mjs              # http://localhost:8080/
+node web/ui/tools/mock-server.mjs --max-ws-clients 1   # exercise the second-tab fallback
+```
+
+Edit a file under `web/ui/`, reload - no reflash. `?board=<ip>` points the page's
+WebSocket (and its HTTP fallback fetch) at a real board while still serving the UI from
+the Mac. See `web/ui/README.md`.
+
+### Size report
+
+```sh
+python3 firmware/app/tools/embed_assets.py --ui-dir web/ui --out /tmp/qc_web_assets.hpp
+```
+
+Measured 2026-11-10, gzip level 9, 9 assets: **17 096 B total** (vendored Lit 3.3.3 alone:
+7 053 B) - under ADR 0011's 20 221 B PoC-era estimate, mostly because this tree ships one
+fewer component (no Milestone 3 knob probe) and a 4-symbol Lit bundle instead of 8.
+
+### Verified
+
+`west twister -p qemu_cortex_m3 -p mps2/an385 -K -T firmware/app/tests` and board builds:
+RAM/flash deltas against `fd08b49` (current master) to be filled in after this issue's own
+build pass - see the PR for the up-to-date table.
+
+New Ztest coverage in `tests/wifi_web_http`: the generated asset table is present and
+sane (every entry starts with the gzip magic, `/` and `/vendor/lit.js` both present), `/`
+is served with `Content-Encoding: gzip` and actually inflates (via
+`qcbridge::gzip::inflate()`, the same decoder the firmware uses for compressed device
+messages) to the real page, and `/vendor/lit.js` likewise.
+
+### Smoke test (owner - can't run hardware or a browser myself)
+
+1. Flash in either mode. On a **Mac browser**, load the board's URL: the full preset
+   catalog renders (folders, 48 presets), and the status line reads "Waiting for a preset
+   change…" until the first one arrives.
+2. Switch presets on the unit: within a couple of seconds the status line updates to
+   "Preset change (cmd N, #M)" without a reload - same timing bar as issue #75's own smoke
+   test (a *second* change a few seconds later must update just as fast, not wait up to a
+   minute).
+3. On an **iPhone** (Safari), load the same URL, then **Share → Add to Home Screen**.
+   Reopen from the home screen icon: confirm it opens `display: standalone` (no Safari
+   chrome), the status bar area isn't drawn over by the header, there's no
+   double-tap-to-zoom delay on the list, and no rubber-band bounce at the top/bottom of
+   the page.
+4. Open a **second browser tab/window** to the same URL while the first stays open:
+   confirm it shows the full catalog immediately (via its own `GET /api/presets.json`,
+   not a blank list) even though its WebSocket never connects (same retry-on-backoff
+   behaviour issue #75 already documented above). Close the first tab; the second's next
+   retry should connect and start showing live updates.
+5. Confirm the page still looks and behaves as before for anything issue #75's own smoke
+   test already covered (tick heartbeat with no console error, `GlobalTempo` never showing
+   up as a false preset change).
 
 ## Not yet done
 

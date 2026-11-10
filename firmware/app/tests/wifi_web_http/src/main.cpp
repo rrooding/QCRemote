@@ -2,6 +2,8 @@
 // over a real TCP socket on Zephyr's loopback interface, doing what a
 // browser actually does: GET / and then GET /api/presets.json (both on one
 // keep-alive connection and on a fresh one), plus a WebSocket upgrade.
+// Issue #88 / ADR 0011 added coverage for the embed step's generated
+// static resources (the real web UI, pre-gzipped) alongside these.
 //
 // This exists because the 5068403 smoke test's "the page shows only the
 // title and Loading..." could not be reproduced or ruled out anywhere -
@@ -35,6 +37,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <span>
 #include <string_view>
 
 #include <zephyr/kernel.h>
@@ -48,6 +51,7 @@ LOG_MODULE_REGISTER(wifi_web_http_test, LOG_LEVEL_INF);
 #include <zephyr/net/socket.h>
 #include <zephyr/ztest.h>
 
+#include "QcGzip.hpp"
 #include "QcPresetCatalog.hpp"
 #include "QcWifiWebTransport.hpp"
 
@@ -79,6 +83,22 @@ constexpr const char kNavigationRequest[] =
 
 constexpr const char kFetchRequest[] =
     "GET /api/presets.json HTTP/1.1\r\n"
+    "Host: 192.168.1.233\r\n"
+    "Accept: */*\r\n"
+    "Referer: http://192.168.1.233/\r\n"
+    "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/18.0 Safari/605.1.15\r\n"
+    "Accept-Language: en-GB,en;q=0.9\r\n"
+    "Accept-Encoding: gzip, deflate\r\n"
+    "Connection: keep-alive\r\n"
+    "\r\n";
+
+// Issue #88 / ADR 0011: same shape as kFetchRequest, for one of the real
+// web UI's own vendored assets - confirms the embed step's generated
+// resources (firmware/app/tools/embed_assets.py) are reachable by path,
+// not just present in the generated header's own table.
+constexpr const char kVendorLitRequest[] =
+    "GET /vendor/lit.js HTTP/1.1\r\n"
     "Host: 192.168.1.233\r\n"
     "Accept: */*\r\n"
     "Referer: http://192.168.1.233/\r\n"
@@ -199,6 +219,28 @@ bool contains(std::string_view haystack, std::string_view needle) {
     return haystack.find(needle) != std::string_view::npos;
 }
 
+// Issue #88 / ADR 0011: a static resource's response has no chunked
+// framing (unlike the dynamic /api/presets.json one tested above) - just
+// status line, headers, then the body back to back - so the body is
+// everything after the blank line that ends the headers (RFC 9112
+// section 2.1). receiveAll() already captured any embedded NUL bytes the
+// gzip body contains correctly (it bounds by byte count, not strlen), and
+// this just slices off the HTTP framing in front of them.
+std::string_view bodyOf(std::string_view httpResponse) {
+    constexpr std::string_view kHeaderEnd = "\r\n\r\n";
+    const size_t pos = httpResponse.find(kHeaderEnd);
+    zassert_true(pos != std::string_view::npos, "no end-of-headers marker in response");
+    return httpResponse.substr(pos + kHeaderEnd.size());
+}
+
+// Scratch space for qcbridge::gzip::inflate() in the tests below - static
+// for the same reason g_responseBuffer is: too big for a test function's
+// own stack. Sized against the largest asset's *raw* (uncompressed) size -
+// the vendored Lit bundle is ~18 KB minified - not its gzipped size (the
+// whole UI gzips to under 20 KB total, see web/ui/README.md); matches
+// QcGzip.hpp's own kMaxInflatedSize headroom.
+uint8_t g_inflateBuffer[32768];
+
 // Issue #75: a minimal RFC 6455 client->server frame encoder - just enough
 // to send the one message this firmware recognizes (resync). Client
 // frames must be masked (section 5.3); the mask key can be anything, the
@@ -236,7 +278,14 @@ ZTEST_SUITE(wifi_web_http, NULL, setup, NULL, NULL, NULL);
 // The page itself: a browser's navigation request has to come back as a
 // complete HTTP/1.1 response with a Content-Length, or the browser never
 // considers the document finished and never runs its script at all.
-ZTEST(wifi_web_http, test_index_page_is_served_with_content_length) {
+//
+// Issue #88 / ADR 0011: "/" is now one of the embed step's generated
+// static resources (firmware/app/tools/embed_assets.py over web/ui/),
+// served pre-gzipped - the body below is a gzip stream, not plaintext, so
+// this inflates it (qcbridge::gzip::inflate(), the same decoder the
+// firmware uses for compressed device messages) to confirm the round
+// trip actually produced the real page, not just well-formed headers.
+ZTEST(wifi_web_http, test_index_page_is_served_gzipped_with_content_length) {
     publishSmokeTestCatalog();
     const int sock = connectToServer();
     sendRequest(sock, kNavigationRequest);
@@ -246,9 +295,71 @@ ZTEST(wifi_web_http, test_index_page_is_served_with_content_length) {
                  response.data());
     zassert_true(contains(response, "Content-Type: text/html"), "wrong content type");
     zassert_true(contains(response, "Content-Length: "), "no Content-Length");
-    zassert_true(contains(response, "QC Remote"), "page body missing");
-    zassert_true(contains(response, "/api/presets.json"), "page is not fetching the catalog");
+    zassert_true(contains(response, "Content-Encoding: gzip"), "page isn't served pre-gzipped");
+
+    const std::string_view gzipped = bodyOf(response);
+    zassert_true(qcbridge::gzip::hasMagic(
+                     std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(gzipped.data()),
+                                              gzipped.size())),
+                 "body doesn't start with the gzip magic");
+
+    const auto inflated = qcbridge::gzip::inflate(
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(gzipped.data()), gzipped.size()),
+        std::span<uint8_t>(g_inflateBuffer));
+    zassert_true(inflated.has_value(), "inflate failed: %s",
+                 inflated.has_value() ? "" : qcbridge::gzip::toString(inflated.error()));
+    const std::string_view page(reinterpret_cast<const char*>(inflated->data()), inflated->size());
+    zassert_true(contains(page, "QC Remote"), "page title missing from inflated body");
+    zassert_true(contains(page, "src/main.js"), "page isn't loading the UI's module entry");
     (void)zsock_close(sock);
+}
+
+// Issue #88 / ADR 0011: one of the UI's own served files, not the shell
+// page - confirms the embed step's generated resources cover more than
+// just "/", and that the vendored Lit bundle (web/ui/vendor/lit.js) is
+// reachable at the path the page's own ES module imports use.
+ZTEST(wifi_web_http, test_vendor_lit_js_is_served_gzipped) {
+    const int sock = connectToServer();
+    sendRequest(sock, kVendorLitRequest);
+    const std::string_view response = receiveAll(sock);
+
+    zassert_true(contains(response, "HTTP/1.1 200 OK"), "no 200 status line in: %.64s",
+                 response.data());
+    zassert_true(contains(response, "Content-Type: text/javascript"), "wrong content type");
+    zassert_true(contains(response, "Content-Encoding: gzip"), "lit.js isn't served pre-gzipped");
+
+    const std::string_view gzipped = bodyOf(response);
+    const auto inflated = qcbridge::gzip::inflate(
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(gzipped.data()), gzipped.size()),
+        std::span<uint8_t>(g_inflateBuffer));
+    zassert_true(inflated.has_value(), "inflate failed");
+    const std::string_view bundle(reinterpret_cast<const char*>(inflated->data()), inflated->size());
+    zassert_true(contains(bundle, "lit.dev"), "doesn't look like the vendored Lit bundle");
+    (void)zsock_close(sock);
+}
+
+// Issue #88's own "done when": a build check that the generated header is
+// present and its sizes are sane, independent of the HTTP tests above -
+// this would fail to compile at all if firmware/app/tools/embed_assets.py
+// hadn't run, and fail this assertion if it emitted something malformed.
+ZTEST(wifi_web_http, test_generated_web_asset_table_is_sane) {
+    size_t foundIndex = 0;
+    size_t foundVendorLit = 0;
+    for (const auto& asset : qcbridge::webassets::kAssets) {
+        zassert_true(asset.gzippedLength > 0, "%s has a zero-length payload", asset.path);
+        zassert_true(asset.gzippedLength >= 3, "%s too short to hold a gzip header", asset.path);
+        const auto bytes = std::span<const uint8_t>(asset.gzipped, asset.gzippedLength);
+        zassert_true(qcbridge::gzip::hasMagic(bytes), "%s isn't a gzip stream", asset.path);
+        if (std::string_view(asset.path) == "/") {
+            ++foundIndex;
+            zassert_equal(std::string_view(asset.contentType), "text/html");
+        }
+        if (std::string_view(asset.path) == "/vendor/lit.js") {
+            ++foundVendorLit;
+        }
+    }
+    zassert_equal(foundIndex, 1u, "no (or more than one) \"/\" entry in the generated asset table");
+    zassert_equal(foundVendorLit, 1u, "no vendored Lit bundle in the generated asset table");
 }
 
 // The regression the 5068403 smoke test hit: with the page open, the

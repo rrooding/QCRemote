@@ -1,0 +1,9 @@
+{
+  "name": "QC Remote",
+  "short_name": "QC Remote",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#121316",
+  "theme_color": "#121316",
+  "start_url": "./"
+}
