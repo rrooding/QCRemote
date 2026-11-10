@@ -1559,15 +1559,41 @@ fewer component (no Milestone 3 knob probe) and a 4-symbol Lit bundle instead of
 
 ### Verified
 
-`west twister -p qemu_cortex_m3 -p mps2/an385 -K -T firmware/app/tests` and board builds:
-RAM/flash deltas against `fd08b49` (current master) to be filled in after this issue's own
-build pass - see the PR for the up-to-date table.
+`west twister -p qemu_cortex_m3 -p mps2/an385 -K -T firmware/app/tests`: all 22
+configurations build; 21 pass, and the one that doesn't -
+`firmware.live_updates` on `qemu_cortex_m3` - is the same pre-existing RAM-limitation
+timeout issue #75's own build already has on that platform (not caused by this issue;
+`mps2/an385` and `native_sim` are what CI actually gates on). `wifi_web_http` itself:
+10/10 new and existing cases pass.
 
 New Ztest coverage in `tests/wifi_web_http`: the generated asset table is present and
 sane (every entry starts with the gzip magic, `/` and `/vendor/lit.js` both present), `/`
 is served with `Content-Encoding: gzip` and actually inflates (via
 `qcbridge::gzip::inflate()`, the same decoder the firmware uses for compressed device
 messages) to the real page, and `/vendor/lit.js` likewise.
+
+Clean builds with example credentials in a separate build tree (this worktree's real
+`wifi_credentials.conf` was never created, read or committed), compared against `fd08b49`
+(PR #90's tip, current master) rebuilt the same way in the same local environment:
+
+| Config | RAM/dram0 before → after | Flash/(irom0+drom0) before → after |
+| --- | --- | --- |
+| `frdm_rw612`, STA | 734048 B / 74.67% → 734048 B / 74.67% (**unchanged**) | 722304 B → 736096 B (**+13 792 B**) |
+| `frdm_rw612`, AP | 741352 B / 75.41% → 741352 B / 75.41% (**unchanged**) | 748948 B → 762740 B (**+13 792 B**) |
+| ESP32-S3, with PSRAM (`CONFIG_BUILD_ONLY_NO_BLOBS=y`, matching CI) | `dram0` 195464 B → 195688 B (**+224 B**) | `irom0`+`drom0` 538276 B → 551844 B (**+13 568 B**) |
+| ESP32-S3, no PSRAM | `dram0` 333424 B (unchanged) | `irom0`+`drom0` 131460 B (unchanged) |
+
+RAM barely moves anywhere (the no-PSRAM config not at all: Wi-Fi is off there, so
+`QcWifiWebTransport` - and the generated web asset header it `#include`s - is never
+compiled in at all). The ~13.6-13.8 KB flash increase on every Wi-Fi-enabled config is
+consistent across boards and close to the generated header's own 17 096 B of gzipped
+payload minus the inline `kIndexHtml` page it replaced - exactly ADR 0011's own claim that
+this decision "costs flash and no RAM" (static resources send straight from flash). The
+ESP32-S3 PSRAM baseline measured here (538 276 B) differs slightly from PR #90's own
+CI-measured 546 580 B - environment/toolchain drift between this local build and CI's
+pinned SDK, confirmed unrelated to this issue by rebuilding `fd08b49` itself locally first
+and diffing against that, not against PR #90's own numbers directly. The `frdm_rw612`
+numbers, by contrast, reproduce PR #90's CI figures exactly.
 
 ### Smoke test (owner - can't run hardware or a browser myself)
 
