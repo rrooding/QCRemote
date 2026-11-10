@@ -34,6 +34,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       # A push trigger (Dockerfile changed on master, no explicit version
       # input) tags with the run number so it's still unique and traceable;
       # firmware.yml should be repinned to a deliberate `version` tag from a
@@ -47,10 +50,15 @@ jobs:
             echo "tag=untagged-${{ github.run_number }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build and push
+      # zstd-compressed layers measurably speed up the cold pull every
+      # firmware.yml job pays (issue #46 follow-up: a real run measured
+      # 1m1s vs 1m13s for this same image gzip-compressed) and every current
+      # GitHub-hosted runner's Docker pulls them fine - confirmed by a real
+      # run, not assumed from docs.
+      - name: Build and push (zstd-compressed layers)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ci/firmware/Dockerfile
-          push: true
+          outputs: type=image,name=ghcr.io/rrooding/qcremote-firmware,push=true,compression=zstd,force-compression=true
           tags: ghcr.io/rrooding/qcremote-firmware:${{ steps.tag.outputs.tag }}
