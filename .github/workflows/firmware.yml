@@ -11,26 +11,33 @@ on:
       - "firmware/**"
       - ".github/workflows/firmware.yml"
 
+# Issue #46: the Zephyr version, both toolchains, the pinned v4.5.0 workspace
+# (issue #86's narrowed `west update` project list), the Wi-Fi/BLE blobs and
+# the ESP32-S3 DWC2 patch are all baked into this image - see
+# ci/firmware/Dockerfile. No job here installs Zephyr itself anymore.
+#
+# This is the one deliberate place the pinned toolchain changes: bump
+# ZEPHYR_VERSION in ci/firmware/Dockerfile, dispatch "publish firmware CI
+# image" with a new version tag, then update every `image:` line below to
+# match. firmware/README.md documents running the same image locally.
+#
+# The `env` context isn't available in `jobs.<id>.container.image` (GitHub
+# Actions limitation - confirmed by a real run failing with "Unrecognized
+# named-value: 'env'"), so each job repeats the tag as a literal rather than
+# an env var substitution.
+#
+# Split into 3 parallel jobs (issue #86 looked at this and found splitting
+# not worth tripling the apt+cache+pip setup cost of ~3m10s for a ~3min
+# wall-clock win; the pinned image removes that setup entirely, leaving only
+# an image pull - ~1m30s - to repeat per job, which is a much better trade):
+# each job now pays one pull instead of the whole sequential build+test
+# chain, so wall clock drops to roughly pull + the slowest single job
+# instead of pull + all three summed.
 jobs:
-  build-and-test:
+  build-frdm-rw612:
     runs-on: ubuntu-latest
-    # Issue #46: the Zephyr version, both toolchains, the pinned v4.5.0
-    # workspace (issue #86's narrowed `west update` project list), the
-    # Wi-Fi/BLE blobs and the ESP32-S3 DWC2 patch are all baked into this
-    # image - see ci/firmware/Dockerfile. Nothing here installs Zephyr
-    # itself anymore.
-    #
-    # This is the one deliberate place the pinned toolchain changes: bump
-    # ZEPHYR_VERSION in ci/firmware/Dockerfile, dispatch "publish firmware
-    # CI image" with a new version tag, then update this tag to match.
-    # firmware/README.md documents running the same image locally.
-    #
-    # The `env` context isn't available in `jobs.<id>.container.image`
-    # (GitHub Actions limitation - confirmed by a real run failing with
-    # "Unrecognized named-value: 'env'"), so this has to be a literal
-    # rather than an env var substitution.
     container:
-      image: ghcr.io/rrooding/qcremote-firmware:v4.5.0-1
+      image: ghcr.io/rrooding/qcremote-firmware:tmp-measure-46
     steps:
       - name: Check out QCRemote
         uses: actions/checkout@v7
@@ -39,16 +46,14 @@ jobs:
         run: |
           cd "$ZEPHYR_WORKSPACE"
           west build -b frdm_rw612 "$GITHUB_WORKSPACE/firmware/app" --pristine
-          # Nothing downstream needs this build tree, and keeping it around
-          # left the runner disk-constrained by the time the ESP32-S3 builds
-          # below run - confirmed as a real failure, not a hypothetical one:
-          # GH run 41834770616 hit "Free space left: 89 MB" partway through
-          # the second ESP32-S3 build and cmake's Ninja generator silently
-          # wrote an incomplete build.ninja, which then failed as "No such
-          # file or directory" instead of a clear disk-full error. Freeing
-          # each --pristine build's tree before the next one starts keeps
-          # that from recurring.
-          rm -rf "$ZEPHYR_WORKSPACE/build"
+
+  build-esp32s3:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/rrooding/qcremote-firmware:tmp-measure-46
+    steps:
+      - name: Check out QCRemote
+        uses: actions/checkout@v7
 
       # Issue #76 / ADR 0009's DWC2 driver patch and the Wi-Fi/BLE blobs are
       # already baked into the image (ci/firmware/Dockerfile) - nothing to
@@ -62,14 +67,44 @@ jobs:
           # without them - the image links but isn't meant to run.
           west build -b esp32s3_devkitc/esp32s3/procpu "$GITHUB_WORKSPACE/firmware/app" -d build-esp32s3 --pristine \
             -- -DCONFIG_BUILD_ONLY_NO_BLOBS=y
-          # See the disk-space comment on the frdm_rw612 step above - same
-          # reason, between these two --pristine builds instead of after.
+          # Both builds still share this one job/runner, so the disk-space
+          # reasoning from before the matrix split still applies between
+          # them - confirmed as a real failure, not a hypothetical one: GH
+          # run 41834770616 hit "Free space left: 89 MB" partway through the
+          # second of these two builds.
           rm -rf "$ZEPHYR_WORKSPACE/build-esp32s3"
           # Module without PSRAM: USB only, Wi-Fi off.
           west build -b esp32s3_devkitc/esp32s3/procpu "$GITHUB_WORKSPACE/firmware/app" -d build-esp32s3-nopsram --pristine \
             -- -DFILE_SUFFIX=nopsram
 
+  test-native-sim:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/rrooding/qcremote-firmware:tmp-measure-46
+    steps:
+      - name: Check out QCRemote
+        uses: actions/checkout@v7
+
       - name: Run firmware Ztest suites (native_sim)
         run: |
           cd "$ZEPHYR_WORKSPACE"
           west twister -p native_sim -T "$GITHUB_WORKSPACE/firmware/app/tests"
+
+  # Single aggregate gate for the 3 jobs above. Master's branch protection
+  # doesn't require a named status check today (confirmed via the GitHub
+  # API), but a PR/push is still easier to read with one pass/fail signal
+  # than three, and this is the job to point a future required check at.
+  firmware-ci:
+    name: firmware CI
+    needs: [build-frdm-rw612, build-esp32s3, test-native-sim]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check matrix result
+        run: |
+          echo 'needs context: ${{ toJSON(needs) }}'
+          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ] || \
+             [ "${{ contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "One or more firmware CI jobs did not succeed."
+            exit 1
+          fi
