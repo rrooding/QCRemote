@@ -59,11 +59,17 @@ namespace qcbridge {
 // usable protoBytes to hand over, so onInflateFailed() goes to the sink
 // instead - still worth counting for a command like File mid-stream.
 //
-// Same open question as QcDispatcher.hpp on whether one slot is enough:
-// inflate is real CPU work (unlike a plain memcpy), so it's the more
-// plausible of the two to actually fall behind the File stream's arrival
-// rate - but there's still no hardware measurement of either side of that
-// comparison. droppedCount() is how that gets answered empirically.
+// Issue #94 answered that question for QcDispatcher.hpp - one slot was not
+// enough there, and it now carries a bounded queue (QcMessageQueue.hpp).
+// This class keeps its single slot deliberately: every hardware run so far,
+// including the preset-change bursts of #94, reports `gzip=0` drops, because
+// the only commonly compressed message this firmware sees is RecallPreset
+// and the device sends one per preset change, never back to back. The
+// counter is reported on the same line as the dispatcher's
+// (QcSession::checkTrafficHealth()), so a run where that stops being true
+// shows up as evidence rather than silence - and then the fix is to give
+// this class the same queue, which is why QcMessageQueue.hpp is a
+// standalone, Zephyr-free template rather than private to the dispatcher.
 class QcGzipInflater {
 public:
     QcGzipInflater() { k_sem_init(&itemReadySem_, 0, 1); }
@@ -116,11 +122,27 @@ public:
     }
 
 private:
-    // Between the handshake thread's priority (7) and the heartbeat
-    // thread's (5, see QcSession.hpp) - a stalled inflate shouldn't be
-    // able to starve the KeepAlive heartbeat, but it's also not as
-    // latency-critical as the heartbeat is.
-    static constexpr int kThreadPriority = 6;
+    // Below the dispatcher thread's priority (6, QcDispatcher.hpp) as of
+    // issue #94, and level with the handshake thread's (7, QcSession.hpp).
+    // It used to be 6, equal to the dispatcher - and an inflate is the one
+    // piece of work in this firmware that is genuinely CPU-bound for
+    // milliseconds (a 14-23 KB RecallPreset payload), never blocking in the
+    // middle. Zephyr's default CONFIG_TIMESLICE_SIZE is 20 ms, longer than
+    // the whole inflate, so time slicing never broke that up: at equal
+    // priority the dispatcher could not run at all until the inflate *and*
+    // its synchronous CONFIG_LOG_MODE_IMMEDIATE log line had finished,
+    // which is the stall the owner's preset-change burst was being dropped
+    // into. Running an inflate one step below dispatch costs it nothing
+    // that matters (it is already off the critical path, and nothing waits
+    // on an inflated RecallPreset today) and keeps preset-identity
+    // messages moving while it runs - what #15/#78 need.
+    //
+    // Still above nothing that matters and still below the heartbeat
+    // thread's 5: a stalled inflate must not be able to starve the
+    // KeepAlive heartbeat (issue #8). The handshake thread shares 7, which
+    // is harmless - it spends its life blocked on a semaphore or in
+    // k_msleep().
+    static constexpr int kThreadPriority = 7;
 
     static void threadEntryTrampoline(void* p1, void*, void*) { static_cast<QcGzipInflater*>(p1)->run(); }
 

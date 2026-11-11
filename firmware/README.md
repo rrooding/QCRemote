@@ -26,10 +26,13 @@ firmware/
     │   ├── HidReassembler.hpp      # qc-mcp framing: reports in, one logical message out
     │   ├── HidChunker.hpp          # qc-mcp framing: a message in, reports out
     │   ├── QcGzip.hpp              # issue #6: gzip detection + inflate (ADR 0005)
-    │   └── QcGzipInflater.hpp      # issue #6: runs QcGzip.hpp off the usbh thread
+    │   ├── QcGzipInflater.hpp      # issue #6: runs QcGzip.hpp off the usbh thread
+    │   └── QcMessageQueue.hpp      # issue #94: bounded SPSC hand-off from the usbh thread
     └── tests/
         ├── hid_framing/            # Ztest suite for HidReassembler/HidChunker - no hardware needed
         ├── gzip_inflate/           # Ztest suite for QcGzip.hpp, with real gzip fixtures
+        ├── dispatch_queue/         # Ztest suite for QcMessageQueue/QcDispatcher, including a
+        │                           # real preset-change burst on real threads
         └── wifi_web_http/          # Ztest suite driving the real HTTP/WebSocket resources over
                                     # the loopback interface - no Wi-Fi driver or board needed
 ```
@@ -577,14 +580,16 @@ eventual sizing work.
 undercount what the device actually sent, and both are counted and folded into the summary
 instead of only showing up as scattered log lines:
 
-- `QcDispatcher` and `QcGzipInflater` each have a single in-flight mailbox slot (see their own
-  header comments) - a message arriving while the previous one on that path is still being
-  processed, or one too big for the 4096-byte mailbox, is dropped. Both count every drop
+- `QcDispatcher` and `QcGzipInflater` each had a single in-flight mailbox slot (see their own
+  header comments) - a message arriving while the previous one on that path was still being
+  processed, or one too big for the mailbox, was dropped. Both count every drop
   (`droppedCount()`, a lifetime total); `QcSession` snapshots that count when the File stream
   starts and diffs it at the end, so the summary's `dispatcherDropped`/`gzipDropped` report only
   what was lost *during this stream*. **Measured on real hardware (commit `0d1edcc`): both 0**
-  across a 551-message, ~12s stream - the single-slot design kept up at this device's actual
-  arrival rate; no evidence yet to justify a bounded queue.
+  across a 551-message, ~12s stream - one slot kept up with the File stream's own arrival rate.
+  It did **not** keep up with a preset-change burst: see
+  ["Dispatch queue (issue #94)"](#dispatch-queue-issue-94) below, where `QcDispatcher`'s slot
+  became a bounded queue. `QcGzipInflater` still has one slot, deliberately.
 - A File folder message that overflows `QcHidBridge`'s `kReassemblyCapacity` (4096 bytes) is
   dropped by `HidReassembler` *before* `handleMessage()` ever sees a command id, so - unlike the
   two drops above - it can't be attributed to the File stream specifically; the same goes for a
@@ -704,10 +709,12 @@ lines.
 
 What a few of the summary fields mean, for issue #33's sizing work:
 
-- **`DD`/`DG` (dispatcherDropped/gzipDropped) above 0**: the single-slot mailbox in
-  `QcDispatcher`/`QcGzipInflater` couldn't keep up with the device's arrival rate during this
+- **`DD`/`DG` (dispatcherDropped/gzipDropped) above 0**: `QcDispatcher`'s queue or
+  `QcGzipInflater`'s single slot couldn't keep up with the device's arrival rate during this
   stream. 0 on the hardware run above; `N` is then a lower bound on what the device actually sent
-  if this is ever nonzero on a future run.
+  if this is ever nonzero on a future run. Both counts on this line are scoped to the stream;
+  `checkTrafficHealth()`'s own warning reports lifetime totals plus a per-warning delta - see
+  ["Dispatch queue (issue #94)"](#dispatch-queue-issue-94).
 - **`RO`/`RM` (reassemblyOverflowCount/reassemblyMalformedCount) above 0**: confirmed nonzero on
   real hardware (31/2850) - see "Hardware results" above.
 - **`MW`/`MI` (maxWireBytes/maxInflatedBytes)**: the largest single message actually seen,
@@ -1294,6 +1301,208 @@ second attempt.
    command that isn't one of the preset-identity ones, so GlobalTempo's own tally bumps reach
    this transport (same as before) but are simply not forwarded to the page at all, which is what
    fixes the old "preset change (cmd 33, ...)" mislabeling.
+
+## Dispatch queue (issue #94)
+
+The owner's hardware run of PR #90 (`53b98ee`, `frdm_rw612`, station mode, 2026-11-11) found
+**every preset change on the unit dropping 1-7 USB messages on the dispatch path**, with the
+count climbing all session:
+
+```
+[00:05:07.547,004] <inf> main: Inflated command 15: 2362 -> 22881 bytes
+[00:05:07.569,788] <wrn> main: Traffic drop/overflow: dropped (dispatch=12 gzip=0), ...
+[00:05:27.079,123] <inf> main: Inflated command 15: 2005 -> 20036 bytes
+[00:05:27.169,812] <wrn> main: Traffic drop/overflow: dropped (dispatch=19 gzip=0), ...
+```
+
+### Root cause: the producer outranks the consumer, and the slot was one deep
+
+A preset change makes the device push a burst: a gzipped `RecallPreset` (command 15, inflating
+to 14-23 KB) and then `Grid` (1), `SetlistPosition` (2), `Scene` (13), `RecentsFavorites` (20)
+and `PresetDirty` (34), on top of `GlobalTempo`'s continuous ~4/s stream. The first four of
+those land in `QcDispatcher`'s mailbox, which held exactly one message.
+
+That mailbox can always be beaten, and not because dispatch work is slow. It's a scheduling
+fact, read out of the pinned Zephyr v4.5.0 tree:
+
+| Thread | Priority | Preemptible? | Source |
+|---|---|---|---|
+| `usbh` (calls `submit()`) | `K_PRIO_COOP(9)` = **-7** | **no** | `subsys/usb/host/usbh_core.c:205` |
+| `net_tc` rx/tx, HTTP server | `K_PRIO_COOP(15)` = **-1** | **no** | `subsys/net/ip/net_tc.c`, `subsys/net/lib/http/http_server_core.c:38` |
+| `qc_heartbeat` | 5 | yes | `QcSession.hpp` |
+| `qc_dispatch` | 6 | yes | `QcDispatcher.hpp` |
+| `qc_gzip_inflate` | **was 6**, now 7 | yes | `QcGzipInflater.hpp` |
+| `qc_session` (handshake) | 7 | yes | `QcSession.hpp` |
+
+The producer is a *cooperative* thread at -7. The scheduler always picks it ahead of any
+preemptible thread, and it is never preempted by one. So the consumer only ever runs in the
+gaps where `usbh` is blocked on `k_msgq_get()` **and** nothing else is holding the CPU — and
+every such stretch that gets stolen is a stretch where the next message in the burst finds the
+slot busy and is discarded. Three things steal those stretches, all visible in the owner's log:
+
+1. **The inflate, at the same priority as dispatch.** `gzip::inflate()` on a 14-23 KB payload is
+   the one genuinely CPU-bound stretch in this firmware, and it never blocks part-way.
+   `qc_gzip_inflate` and `qc_dispatch` both sat at priority 6; Zephyr's default
+   `CONFIG_TIMESLICE_SIZE` is **20 ms** (`kernel/Kconfig:591`), longer than a whole inflate, so
+   time slicing never broke it up. The consumer could not run *at all* until the inflate
+   finished. This is why the drop warning always follows an `Inflated command 15: ...` line by
+   20-110 ms in the log — the burst arrived inside that window.
+2. **The `Inflated command 15` log line itself.** `CONFIG_LOG_MODE_IMMEDIATE=y`, so that
+   `LOG_INF` formats and writes to the UART synchronously on the inflater's own thread, extending
+   the same stall by milliseconds.
+3. **Wi-Fi.** `net_tc`'s rx/tx threads and Zephyr's HTTP server thread are *also* cooperative
+   (priority -1), so while one of them runs, neither `usbh` nor the consumer runs; and when it
+   yields, `usbh` at -7 is served before the consumer at 6. More Wi-Fi work overlapping the burst
+   means more messages delivered per turn the consumer actually gets.
+
+**This is also the best available explanation for the owner's reconnect observation** — no drop
+on the first preset change, drops on every change after the Wi-Fi reconnect. Factor 3 only
+applies once a browser is actually connected: after the reconnect the page re-fetched
+`/api/presets.json` and re-opened its WebSocket, so from then on every preset change overlapped
+real HTTP/WebSocket work on those cooperative threads. **It is not proven from source**, and two
+other readings fit the same log equally well: the 00:04:40 change may simply have been a smaller
+`RecallPreset` (a shorter inflate, so a shorter stall), or it may have dropped messages that are
+already inside the `dispatch=12` the first pasted line shows — that counter was 0 when the File
+stream finished, so 12 drops did accumulate earlier in the session, and the pasted excerpt starts
+too late to say whether the first change contributed. **What would settle it**: the full console
+log from boot (not trimmed), so each `Traffic drop/overflow` line can be matched to the preset
+change and the Wi-Fi event before it. The fix below doesn't depend on which reading is right —
+it removes the loss for all three factors at once — so this is recorded rather than chased.
+
+### The fix
+
+**A bounded lock-free SPSC queue** ([`QcMessageQueue.hpp`](app/src/QcMessageQueue.hpp)) replaces
+the single slot. Deeper queueing is the only structural answer here: raising the consumer's
+priority cannot help on its own, because a cooperative producer at -7 outranks any priority a
+preemptible consumer can be given.
+
+The depth is affordable because the queue is a **32-entry descriptor ring over one shared byte
+arena**, not 32 worst-case buffers. The arena stays at the existing 128 KiB
+(`kReassemblyCapacity`/ADR 0007, `CONFIG_QC_MESSAGE_CAPACITY` on the no-PSRAM S3), so the whole
+depth costs ~640 bytes of descriptors:
+
+- Records stay **contiguous** in the arena, so the consumer hands a `std::span` straight into it
+  to `QcSession::onMessage()` — no second copy, which is what keeps a 128 KiB `File` message
+  affordable. A record that would straddle the end is placed at offset 0 and charged the skipped
+  tail as padding, freed with it.
+- An **empty arena rewinds to offset 0**, so a message needing the entire arena (ADR 0007's
+  worst-case fully-named 256-slot folder) still fits wherever the write offset happened to be —
+  the single slot always took one, and that mustn't regress.
+- Both ends are wait-free; the producer side is one bounded `memcpy` plus two monotonic atomic
+  stores, which is all `usbh` is allowed to do (CODING_STANDARDS.md's time-sensitive-code rule
+  names a fixed-capacity ring plus a signalling semaphore as exactly the right shape here).
+
+**`QcGzipInflater` drops to priority 7**, below `qc_dispatch`'s 6. The queue bounds the loss;
+the priority ordering keeps the queue shallow and, more importantly, stops an inflate from
+delaying the preset-*identity* messages by milliseconds — which is what #15 (current preset in
+the snapshot) and #78 (confirmed preset switching) need. An inflate has nothing waiting on it
+today, so it loses nothing by yielding. It stays above nothing that matters and below
+`qc_heartbeat`'s 5, so a stalled inflate still can't delay a KeepAlive (issue #8).
+
+`QcGzipInflater` keeps its **single slot** on purpose: `gzip=0` on every hardware run so far,
+including these bursts, because `RecallPreset` is the only commonly compressed message and the
+device sends one per preset change, never back to back. If that ever stops being true the
+counter says so, and `QcMessageQueue.hpp` is a standalone Zephyr-free template precisely so the
+same queue can be dropped in.
+
+What is **not** fixed here: a single `File` message larger than the whole arena still blocks the
+next one, exactly as the old slot did. That's issue #66's full plugin listing (113 KB+ single
+messages), whose answer is a streaming decoder, not a bigger buffer. `oversizedCount()` now
+counts those apart from a transiently full queue so the two can't be confused.
+
+### What the log says now
+
+The drop warning prints the **delta since the previous warning** next to each lifetime total,
+instead of leaving the owner to difference `12 → 19 → 24` by hand:
+
+```
+<wrn> main: Traffic drop/overflow, new since last warning (total since boot): dispatch=+3 (15, of which oversized 0), gzip=+0 (0), reassembly overflow=+0 (0, largest 0) malformed=+0 (0) - a listing or push in progress may be incomplete
+```
+
+and a new line reports peak queue occupancy, **once per increase** — monotonic, so it settles
+after the first few bursts rather than logging per message:
+
+```
+<inf> main: Dispatch queue high-water: 6 of 32 records, 1536 of 131072 bytes
+```
+
+That line is the point of the exercise: with the drops gone, it's the only thing that still
+reports anything, and it turns "how big is a real preset-change burst on this device" into a
+measured number. If it settles at 6-8 records, 32 has 4x margin; if it ever reaches 32, the
+depth is the thing to raise.
+
+### Verified
+
+- `west twister -p qemu_cortex_m3 -p mps2/an385 -K -T firmware/app/tests` — **243/245 cases
+  pass**, 1 blocked. The one failure is `firmware.live_updates` timing out on `qemu_cortex_m3`,
+  which is pre-existing and expected: that suite's own `testcase.yaml` excludes
+  `qemu_cortex_m3` (64 KB RAM, same reason `preset_transport` gives) and an explicit `-p`
+  overrides `platform_allow`. Nothing this change touches is compiled into that suite.
+- The new `dispatch_queue` suite (11 cases) covers the queue's ordering, arena wrap-around,
+  padding accounting, both drop paths, and a full 24-round preset-change burst through the real
+  `QcDispatcher` on real Zephyr threads, with the producer at a **cooperative** priority so the
+  consumer provably cannot run until it blocks — the same scheduling fact that caused the bug.
+  **It fails on the old behaviour**: forcing the depth back to 1 makes it report
+  `expected no dispatch drops across 24 preset-change bursts, got 96` — 4 lost per 5-message
+  burst, matching the hardware shape — and it passes at depth 32 with zero drops.
+- Clean builds, with example credentials in separate build trees (the real
+  `app/wifi_credentials.conf` was never read, written or built against): `frdm_rw612` station
+  and AP mode, `esp32s3_devkitc/esp32s3/procpu` with and without PSRAM.
+
+RAM/flash deltas against `53b98ee`, same toolchain and same build flags:
+
+| Target | Flash | RAM |
+|---|---|---|
+| `frdm_rw612`, station | 722304 → 722968 B (**+664**) | 734048 → 734712 B, 74.67% → **74.74%** (**+664**) |
+| `frdm_rw612`, AP | 748964 → 749620 B (**+656**) | 741352 → 742016 B, 75.41% → **75.48%** (**+664**) |
+| ESP32-S3, PSRAM | 667108 → 667268 B (**+160**) | `ext_dram` 2108720 → 2109376 B (**+656**); `dram0` unchanged |
+| ESP32-S3, no PSRAM | 146532 → 146692 B (**+160**) | `dram0` 333424 → 334080 B, 83.54% → **83.71%** (**+656**) |
+
+The RAM cost is the 32 descriptors and a handful of atomics. The message arena itself is
+unchanged on every target — including the no-PSRAM S3, where `CONFIG_QC_MESSAGE_CAPACITY`
+already shrinks it to 64 KiB and the queue follows it.
+
+**Not verified**: none of this has run on a board.
+
+### Smoke test for this build
+
+Flash in **station** mode with the Quad Cortex Mini connected over USB, and open the page.
+
+1. Boot, USB claim, handshake and the `File` listing as usual. The listing summary now reads
+   `File stream limits: max wire=... during this stream: dropped (dispatch=0 gzip=0) ...` —
+   both still 0.
+2. Shortly after the first messages flow you should see one line like:
+
+   ```
+   <inf> main: Dispatch queue high-water: N of 32 records, M of 131072 bytes
+   ```
+
+   and then it should repeat only when `N` or `M` grows. **Please paste every one of these
+   lines** — `N` is the real burst size, and it's the number the depth of 32 should be judged
+   against.
+3. **Change the preset on the unit 20+ times in a row**, with the page open, leaving a second or
+   two between changes. Expected, per change:
+
+   ```
+   <inf> main: Inflated command 15: NNNN -> NNNNN bytes
+   <inf> main: Post-connect tally: command=15 count=N
+   <inf> main: Pushed patch to websocket client N (NNN bytes)
+   ```
+
+   and **no `Traffic drop/overflow` line at all**. That is the pass condition for this issue.
+4. **Force a Wi-Fi reconnect in the middle of it** (toggle the AP, or walk out of range and
+   back). Expect `Wi-Fi station link dropped and is re-associating ...` then
+   `Wi-Fi station connected`, the page recovering on its own, and then another 10+ preset
+   changes with still **no** `Traffic drop/overflow` line. This step is the one that reproduced
+   the original report, so it's the one that matters most.
+5. If a `Traffic drop/overflow` line *does* appear, paste it whole. It now carries the per-event
+   delta, the lifetime total, and the `of which oversized` count, and together with the
+   high-water line above those four numbers say which of "the burst is bigger than 32", "a
+   single message is bigger than the arena" and "something else is stalling the consumer" it
+   actually is — which the old line couldn't distinguish.
+6. Leave it a few minutes with the page open: no `LOG_ERR` lines, USB/handshake normal,
+   `Post-connect tally: command=33 count=<N>` stepping up about once a minute (`GlobalTempo`,
+   expected and unchanged).
 
 ## Not yet done
 

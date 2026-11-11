@@ -1,0 +1,12 @@
+tests:
+  firmware.dispatch_queue:
+    # mps2/an385, not qemu_cortex_m3: this suite instantiates a real
+    # QcDispatcher, whose message arena is sized exactly as it is on
+    # frdm_rw612 hardware (128 KiB, ADR 0007) and so can't fit
+    # qemu_cortex_m3's 64 KB of RAM - same reason ../preset_transport and
+    # ../wifi_web_http give. mps2/an385 is the same Cortex-M3 family under
+    # QEMU with 4 MB of RAM.
+    platform_allow:
+      - native_sim
+      - mps2/an385
+    tags: firmware
