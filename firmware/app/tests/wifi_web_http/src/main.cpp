@@ -318,6 +318,13 @@ int tryConnectToServer() {
 // has copied it by the time this returns.
 char g_requestBuffer[512];
 
+// Sends a literal, already-formed request (the WebSocket upgrade), without
+// sendRequest()'s zassert - same reason tryConnectToServer() exists.
+bool sendAssetRequestRaw(int sock, const char* request) {
+    const size_t length = strlen(request);
+    return zsock_send(sock, request, length, 0) == static_cast<ssize_t>(length);
+}
+
 bool sendAssetRequest(int sock, const char* path) {
     const int length = snprintf(
         g_requestBuffer, sizeof(g_requestBuffer),
@@ -847,4 +854,99 @@ ZTEST(wifi_web_http, test_every_page_asset_loads_over_parallel_connections) {
     zassert_equal(connected, kBrowserConnections, "only %zu of %zu connections were accepted",
                   connected, kBrowserConnections);
     assertAllFetchesSucceeded(fetches, kAssetCount, "full page load");
+}
+
+// PR #92 follow-up, the owner's second hardware round: with the poll fix in
+// place Chrome loaded the page fine, but Safari was very slow and some
+// modules still never arrived - and the coordinator's parallel curl check
+// came back *serialised in ~1s steps* (0.115, 0.115, 1.12, 1.16, 2.04,
+// 2.05, 3.07, 3.09, 4.09s) with browser tabs still open. That ladder is
+// client-side SYN retransmission, not a timer on the board: once the
+// server has no free client slot it stops accepting (handle_listen_pollin()
+// zeroes the listening socket's poll events at num_clients >= concurrent),
+// and once the listening socket's own TCP backlog is also full Zephyr drops
+// further SYNs outright (tcp.c's tcp_backlog_is_full() - "same behavior as
+// on Linux", retransmitted SYNs may succeed later). The client then retries
+// about once a second, and gets in only as fast as slots free up.
+//
+// What fills those slots is the thing this test is about: a browser that
+// has *finished* loading the page does not close its connections. Zephyr's
+// server never sends Connection: close, so each one holds a client slot
+// until CONFIG_HTTP_SERVER_CLIENT_INACTIVITY_TIMEOUT expires. So the
+// question was never "how many connections does one page load need" - it is
+// "how many are still parked when the next page load starts". Two browsers
+// open at once (the owner had Chrome and Safari), or one browser reloading,
+// needs twice the per-browser cap.
+//
+// Also asserted here, because ADR 0011 claimed it and the fix depends on
+// it: a WebSocket does *not* hold an HTTP client slot.
+// handle_http1_to_websocket_upgrade() calls websocket_register() and then
+// http_server_release_client() (subsys/net/lib/http/http_server_ws.c), so
+// the live-update socket is handed to the application and the slot goes
+// back. Chrome's open WebSocket is therefore not part of the pressure; its
+// six idle keep-alive connections are.
+ZTEST(wifi_web_http, test_a_second_browsers_page_load_is_not_locked_out) {
+    publishSmokeTestCatalog();
+    k_msleep(200);
+
+    // Browser 1: six connections, one asset on each, then left open and
+    // idle - exactly the state a browser sits in after the page has
+    // loaded.
+    int parked[kBrowserConnections];
+    AssetFetch first[kBrowserConnections]{};
+    size_t parkedCount = 0;
+    for (size_t i = 0; i < kBrowserConnections; ++i) {
+        parked[i] = tryConnectToServer();
+        if (parked[i] >= 0) {
+            ++parkedCount;
+        }
+        first[i].path = qcbridge::webassets::kAssets[i].path;
+    }
+    fetchAssetsInParallel(parked, first, kBrowserConnections);
+
+    // Browser 1's live-update socket, upgraded and left open too.
+    const int wsSock = tryConnectToServer();
+    bool upgraded = false;
+    if (wsSock >= 0 && sendAssetRequestRaw(wsSock, kWebsocketRequest)) {
+        upgraded = contains(receiveAll(wsSock), "HTTP/1.1 101 Switching Protocols");
+    }
+
+    // Browser 2 arrives while every one of browser 1's connections is
+    // still open. Nothing here may wait on browser 1's idle connections
+    // timing out.
+    int second[kBrowserConnections];
+    AssetFetch secondFetches[kBrowserConnections]{};
+    size_t secondCount = 0;
+    for (size_t i = 0; i < kBrowserConnections; ++i) {
+        second[i] = tryConnectToServer();
+        if (second[i] >= 0) {
+            ++secondCount;
+        }
+        secondFetches[i].path = qcbridge::webassets::kAssets[i].path;
+    }
+    fetchAssetsInParallel(second, secondFetches, kBrowserConnections);
+
+    for (size_t i = 0; i < kBrowserConnections; ++i) {
+        if (parked[i] >= 0) {
+            (void)zsock_close(parked[i]);
+        }
+        if (second[i] >= 0) {
+            (void)zsock_close(second[i]);
+        }
+    }
+    if (wsSock >= 0) {
+        (void)zsock_close(wsSock);
+    }
+
+    zassert_equal(parkedCount, kBrowserConnections,
+                  "first browser: only %zu of %zu connections were accepted", parkedCount,
+                  kBrowserConnections);
+    assertAllFetchesSucceeded(first, kBrowserConnections, "first browser's page load");
+    zassert_true(upgraded, "first browser's websocket upgrade was refused");
+    zassert_equal(secondCount, kBrowserConnections,
+                  "second browser: only %zu of %zu connections were accepted", secondCount,
+                  kBrowserConnections);
+    assertAllFetchesSucceeded(secondFetches, kBrowserConnections, "second browser's page load");
+
+    k_msleep(1100);  // See test_websocket_upgrade_pushes_the_current_catalog's own comment.
 }
