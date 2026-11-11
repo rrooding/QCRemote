@@ -92,4 +92,14 @@ config QC_MESSAGE_CAPACITY
 	  (ADR 0007). Boards with less internal RAM can lower it at the cost
 	  of dropping messages larger than this.
 
+config QC_WIFI_WEB_TICK_INTERVAL_MS
+	int "WebSocket tick heartbeat interval, in milliseconds"
+	default 5000
+	help
+	  How often QcWifiWebTransport sends a liveness-only "tick" envelope
+	  (issue #75 / ADR 0011) to a connected WebSocket client when nothing
+	  else was sent in that window. Without it, an idle rig and a
+	  half-open socket after a Wi-Fi drop look identical - silence either
+	  way. Matches web/poc/src/store.js's own assumed cadence (same ADR).
+
 source "Kconfig.zephyr"

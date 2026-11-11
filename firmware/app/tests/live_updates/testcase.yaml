@@ -1,0 +1,11 @@
+tests:
+  firmware.live_updates:
+    # Pure C++, no Zephyr networking/HTTP stack - but one static
+    # QcPresetCatalog/QcCatalogSnapshot pair is still held to build a real
+    # catalog to wrap (same ~20KB-each types ../preset_transport uses),
+    # so qemu_cortex_m3's 64KB RAM is excluded for the same reason that
+    # suite's own testcase.yaml gives.
+    platform_allow:
+      - native_sim
+      - mps2/an385
+    tags: firmware

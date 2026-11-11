@@ -512,5 +512,18 @@ it a "preset change". That is misleading rather than broken, and belongs with th
   Confirmed, but **not** part of the "Loading…" bug (one browser, one WebSocket), and not fixable
   within Zephyr's API without dropping to a single client — left to
   [#75](https://github.com/rrooding/QCRemote/issues/75).
+
+  **Resolved by #75**: re-confirmed against the same pinned tree —
+  `handle_http1_to_websocket_upgrade()` (`subsys/net/lib/http/http_server_ws.c:126-128`) passes
+  `ws_detail->data_buffer` (the *resource's* one static buffer) to `websocket_register()` on every
+  upgrade regardless of how many contexts already exist, so the hazard is real for any two
+  contexts sharing one resource, not just a `CONFIG_WEBSOCKET_MAX_CONTEXTS=2` configuration
+  specifically. #75 adds a client-to-server message (`resync`), so "the page never sends" stopped
+  being true; a second static resource/buffer pair would still need the page to know which URL is
+  free, for two-simultaneous-clients support nothing has asked for. Fixed by capping
+  `CONFIG_WEBSOCKET_MAX_CONTEXTS=1` (and `QcWifiWebTransport::kMaxWsClients=1` to match) — Zephyr
+  itself then refuses a second concurrent upgrade (`websocket_get()` finds no free context,
+  `websocket_register()` returns `-ENOENT`) before any of this firmware's own code runs, which is
+  provably safe rather than merely safe-in-practice.
 - Everything the `b735057` section lists as uncovered: AP mode on a current build, an iPhone, and
   a 10-15 minute soak.
