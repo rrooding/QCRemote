@@ -1568,7 +1568,8 @@ Two separate limits, both now in `app/prj.conf` with the arithmetic written out 
    host (Safari's and Chrome's own cap) and keeps them alive. With four client slots the
    other two connections sit unaccepted in the TCP backlog, and since nothing closes a
    keep-alive connection, they wait out
-   `CONFIG_HTTP_SERVER_CLIENT_INACTIVITY_TIMEOUT` (10 s) rather than being served. This
+   `CONFIG_HTTP_SERVER_CLIENT_INACTIVITY_TIMEOUT` (10 s then, 5 now - see round two below)
+   rather than being served. This
    one is independently reproducible: with `ZVFS_POLL_MAX` fixed and `MAX_CLIENTS` left at
    4, `tests/wifi_web_http`'s six-connection test still fails with exactly two of its six
    assets never answered (`errno 11`, nothing received). ADR 0011's assumption that
@@ -1598,43 +1599,127 @@ deliberately *larger* than the app's: both ends of the loopback connection live 
 same image, so those pools have to hold six client sockets as well as the server's share.
 `CONFIG_ZVFS_POLL_MAX` and `CONFIG_HTTP_SERVER_MAX_CLIENTS` do mirror the app exactly -
 only the server polls and only the server accepts, so those are the app's real values
-under test.
+under test. **This is why the bug was invisible off-board in the first place**: the suite
+had all five raised to the values Zephyr's own `tests/net/lib/http_server/core` uses, so it
+was exercising Zephyr's sample limits rather than this firmware's.
+
+The values quoted in this subsection are the ones round one landed on
+(`ZVFS_POLL_MAX=10`, `MAX_CLIENTS=6`, `NET_MAX_CONTEXTS=12`, `NET_MAX_CONN=16`); round two
+below raises four of them again and explains why. `firmware/app/prj.conf` is always
+authoritative.
+
+#### Round two: parked keep-alive connections
+
+The fix above got Chrome loading the page, and the owner's next hardware round showed the
+rest of the problem. **Chrome: fine.** **Safari: very slow, with `vendor/lit.js`,
+`store-controller.js`, `qc-status.js` and `qc-preset-list.js` still stuck pending** (two of
+them eventually completing, two never). The coordinator's parallel curl check, run while
+browser tabs were still open, came back *serialised in roughly one-second steps*: 0.115,
+0.115, 1.12, 1.16, 2.04, 2.05, 3.07, 3.09, 4.09 s - two connections served per second.
+
+That ladder is **client-side SYN retransmission**, not a timer on the board - no poll
+timeout, no `CONFIG_HTTP_SERVER_RESTART_DELAY`, no `k_sleep` of ours is involved. The chain:
+
+1. A browser that has *finished* loading does not close its connections. The server never
+   sends `Connection: close` (ADR 0011 noted this), so each of a browser's six connections
+   holds an HTTP client slot until `CONFIG_HTTP_SERVER_CLIENT_INACTIVITY_TIMEOUT` expires -
+   the timer is armed in `init_client_ctx()` and restarted on every data event
+   (`http_client_timer_restart()`), so an *idle* connection keeps its slot for the full
+   timeout after its last request.
+2. While every slot is taken, `handle_listen_pollin()` sets the listening socket's poll
+   events to 0 and the server stops accepting at all.
+3. Once the listening socket's own TCP backlog fills too, Zephyr stops even completing
+   handshakes: `tcp_backlog_is_full()` makes it **drop further SYNs outright** ("same
+   behavior as on Linux. Retransmitted SYN attempts may be successful later",
+   `subsys/net/ip/tcp.c`).
+4. So the client retransmits its SYN about once a second and gets in only as fast as slots
+   free up - exactly two per second in the measurement above, which is how many slots were
+   actually free behind the open browsers.
+
+Sizing `CONFIG_HTTP_SERVER_MAX_CLIENTS` to "what one page load needs" was the mistake in
+round one. The question is **how many connections are still parked when the next page load
+starts**: the owner had Chrome and Safari open at once (6 + 6), and a single browser
+reloading is the same shape. Chrome got its six in first and loaded fine; Safari queued
+behind them. That is the whole Chrome-vs-Safari difference - it is about arrival order and
+how many connections are already parked, not about either browser's HTTP implementation.
+(The coordinator's probe of six *silent* connections followed by a fast `main.js` fetch is
+consistent: connections that never send a request are accepted but their slots were
+evidently not all still held when that fetch went out.)
+
+One thing this fix depends on, confirmed in source and now asserted in the suite: **a
+WebSocket does not hold an HTTP client slot.**
+`handle_http1_to_websocket_upgrade()` calls `websocket_register()` and then
+`http_server_release_client()` (`subsys/net/lib/http/http_server_ws.c`), so the upgraded
+socket is handed to the application and the slot goes straight back. ADR 0011 claimed this
+and it holds. Chrome's open live-update socket is therefore *not* part of the pressure -
+only its six idle HTTP connections are. An upgrade does occupy a slot transiently, until
+that handoff, which is what the `+1` below is for.
+
+Two settings, and both levers were measured rather than guessed:
+
+| Setting | Was | Now | Why |
+| --- | --- | --- | --- |
+| `CONFIG_HTTP_SERVER_MAX_CLIENTS` | 6 | **13** | 6 (first browser) + 6 (second, or the same one reloading) + 1 transient upgrade |
+| `CONFIG_HTTP_SERVER_CLIENT_INACTIVITY_TIMEOUT` | 10 | **5** | a parked slot recycles twice as fast - the backstop for a third client |
+| `CONFIG_ZVFS_POLL_MAX` | 10 | **16** | 1 + 1 + 13, same arithmetic as above |
+| `CONFIG_NET_MAX_CONTEXTS` | 12 | **20** | 1 listener + 13 accepted + DHCPv4, plus `TIME_WAIT` headroom |
+| `CONFIG_NET_MAX_CONN` | 16 | **24** | same, one 5-tuple handler per connection |
+
+**Why the timeout isn't cut further, which is the interesting result.** Shortening it alone
+(to 2 s, leaving `MAX_CLIENTS` at 6) *does* make the new test pass - but the second
+browser's WebSocket still waits a full timeout (2.46 s, versus 0.69 s with 13 slots), so
+the page is still visibly slow; and it **breaks
+`test_presets_json_on_same_keep_alive_connection` outright**, because the server now drops
+the connection in the gap between the page request and the script's own `fetch()` on it.
+That is a real keep-alive regression, not a test artifact. Hence slots as the primary fix,
+and 5 s (Zephyr's own `HTTP_SERVER_VERSION_3` default, comfortably longer than any gap
+inside one page load on a LAN) as the backstop rather than 2 s.
+
+Off-board coverage: `test_a_second_browsers_page_load_is_not_locked_out` parks six
+keep-alive connections *and* a WebSocket, then brings a second browser's six connections
+and six assets in while all of them are still open. At 6 slots the second browser's
+upgrade only gets in after a full 10 s inactivity timeout and the test fails; at 13 it
+connects in **0.69 s** with nothing waiting on a timer.
 
 #### Cost
 
-Against `65c710d` (this branch's previous tip) rebuilt the same way in the same local
-environment, with example credentials in a separate build tree:
+Against `940271f` - this branch immediately before the parallel-connection work, rebased
+onto the same master (`80d2289`, so #94's dispatch queue is in both) - rebuilt the same way
+in the same local environment, with example credentials in a separate build tree:
 
 | Config | RAM/dram0 before → after | Flash before → after |
 | --- | --- | --- |
-| `frdm_rw612`, STA | 734 048 B / 74.67% → 743 040 B / 75.59% (**+8 992 B**) | 736 084 B → 736 084 B (**unchanged**) |
-| `frdm_rw612`, AP | 741 352 B / 75.41% → 750 400 B / 76.33% (**+9 048 B**) | 762 736 B → 762 736 B (**unchanged**) |
-| ESP32-S3, with PSRAM | `dram0` 219 504 B / 55.00% → 228 544 B / 57.26% (**+9 040 B**) | `irom0`+`drom0` 1 006 148 B → 1 006 180 B (**+32 B**) |
-| ESP32-S3, no PSRAM | `dram0` 333 424 B (**unchanged**) | **unchanged** |
+| `frdm_rw612`, STA | 734 712 B / 74.74% → 761 672 B / 77.48% (**+26 960 B**) | 736 748 B → 736 780 B (**+32 B**) |
+| `frdm_rw612`, AP | 742 016 B / 75.48% → 769 080 B / 78.23% (**+27 064 B**) | 763 392 B → 763 416 B (**+24 B**) |
+| ESP32-S3, with PSRAM | `dram0` 219 504 B / 55.00% → 246 600 B / 61.79% (**+27 096 B**) | `irom0`+`drom0` 1 007 028 B → 1 007 092 B (**+64 B**) |
+| ESP32-S3, no PSRAM | `dram0` 334 080 B (**unchanged**) | **unchanged** |
 
 Every byte of the `frdm_rw612` STA delta is accounted for, from `nm` on the two
 `zephyr.elf`s:
 
 | Symbol | Delta | Why |
 | --- | --- | --- |
-| `_k_mem_slab_buf_tcp_conns_slab` | +4 128 B | 6 more `struct tcp` @ 688 B - `NET_MAX_CONTEXTS` 6 → 12 |
-| `server_ctx` | +2 848 B | 2 more `struct http_client_ctx` @ 1 424 B - `HTTP_SERVER_MAX_CLIENTS` 4 → 6 |
-| `contexts` | +1 152 B | 6 more `struct net_context` @ 192 B - same knob as the slab |
-| `conns` | +576 B | 8 more `struct net_conn` @ 72 B - `NET_MAX_CONN` 8 → 16 |
-| `fdtable` | +288 B | 6 more fd slots @ 48 B - derived from `NET_MAX_CONTEXTS` |
-| **total** | **+8 992 B** | matches the measured RAM delta exactly |
+| `server_ctx` | +12 816 B | 9 more `struct http_client_ctx` @ 1 424 B - `MAX_CLIENTS` 4 → 13 |
+| `_k_mem_slab_buf_tcp_conns_slab` | +9 632 B | 14 more `struct tcp` @ 688 B - `NET_MAX_CONTEXTS` 6 → 20 |
+| `contexts` | +2 688 B | 14 more `struct net_context` @ 192 B - same knob |
+| `conns` | +1 152 B | 16 more `struct net_conn` @ 72 B - `NET_MAX_CONN` 8 → 24 |
+| `fdtable` | +672 B | 14 more fd slots @ 48 B - derived from `NET_MAX_CONTEXTS` |
+| **total** | **+26 960 B** | matches the measured RAM delta exactly |
 
-`CONFIG_ZVFS_POLL_MAX` - the actual root cause - costs **no static RAM at all**: it sizes
-a stack array inside whichever thread calls `poll()` (~20 B per entry on Cortex-M), which
-is why its new value carries margin. The no-PSRAM ESP32-S3 config doesn't move because it
-never enables networking in the first place (`prj_nopsram.conf`).
+`CONFIG_ZVFS_POLL_MAX` - the original root cause - and
+`CONFIG_HTTP_SERVER_CLIENT_INACTIVITY_TIMEOUT` both cost **no static RAM at all**: the
+first sizes a stack array inside whichever thread calls `poll()` (~20 B per entry on
+Cortex-M), the second is a `k_timeout_t`. That is why `ZVFS_POLL_MAX` carries margin. The
+no-PSRAM ESP32-S3 config doesn't move because it never enables networking in the first
+place (`prj_nopsram.conf`).
 
 ADR 0010's RAM tables are unaffected in their conclusions: the `frdm_rw612` still has
-~228 KB of its 960 KB free, and the PSRAM ESP32-S3 ~167 KB of `dram0`. So the alternative
+~216 KB of its 960 KB free, and the PSRAM ESP32-S3 ~149 KB of `dram0`. So the alternative
 of serving fewer files (ADR 0011 decision 2's bundler, which the embed step's contract
-makes a one-line CMake change) is **not needed here** - the nine-file page load fits with
-room to spare, and bundling would not have fixed either limit anyway: one bundle plus the
-page is still two parallel requests, which the stock `ZVFS_POLL_MAX=3` already breaks.
+makes a one-line CMake change) is **not needed here**, and would not have fixed either
+limit: one bundle plus the page is still two parallel requests, which the stock
+`ZVFS_POLL_MAX=3` breaks just as thoroughly as nine, and two parked keep-alive connections
+hold slots just as long as six.
 
 ### Dev loop
 
@@ -1659,21 +1744,21 @@ fewer component (no Milestone 3 knob probe) and a 4-symbol Lit bundle instead of
 
 ### Verified
 
-`west twister -p qemu_cortex_m3 -p mps2/an385 -K -T firmware/app/tests`: all 22
-configurations build; 21 pass, and the one that doesn't -
-`firmware.live_updates` on `qemu_cortex_m3` - is the same pre-existing RAM-limitation
-timeout issue #75's own build already has on that platform (not caused by this issue;
-that suite has its own `prj.conf`, untouched by the settings above, and `mps2/an385` and
-`native_sim` are what CI actually gates on). `wifi_web_http` itself: **12/12** cases pass
-on `mps2/an385` (it's skipped on `qemu_cortex_m3` for RAM overflow, as `preset_transport`
-already is).
+`west twister -p qemu_cortex_m3 -p mps2/an385 -K -T firmware/app/tests` (on the
+rebase onto `80d2289`): all 24 configurations build, 248 of 250 cases pass, and the only
+failure is `firmware.live_updates` on `qemu_cortex_m3`, the same
+pre-existing RAM-limitation timeout issue #75's own build already has on that platform
+(not caused by this issue; that suite has its own `prj.conf`, untouched by the settings
+above, and `mps2/an385` and `native_sim` are what CI actually gates on).
+`wifi_web_http` itself: **13/13** cases pass on `mps2/an385` (it's skipped on
+`qemu_cortex_m3` for RAM overflow, as `preset_transport` and `dispatch_queue` are).
 
 New Ztest coverage in `tests/wifi_web_http`: the generated asset table is present and
 sane (every entry starts with the gzip magic, `/` and `/vendor/lit.js` both present), `/`
 is served with `Content-Encoding: gzip` and actually inflates (via
 `qcbridge::gzip::inflate()`, the same decoder the firmware uses for compressed device
-messages) to the real page, and `/vendor/lit.js` likewise. Plus the two parallel-connection
-tests described under "Parallel connections" above.
+messages) to the real page, and `/vendor/lit.js` likewise. Plus the three
+connection-concurrency tests described under "Parallel connections" above.
 
 Clean builds with example credentials in a separate build tree (this worktree's real
 `wifi_credentials.conf` was never created, read or committed), compared against `fd08b49`
@@ -1712,26 +1797,42 @@ numbers, by contrast, reproduce PR #90's CI figures exactly.
    done; wait
    ```
 
-   All nine lines must read `200`. Before the fix most came back `000` (curl exit 56/52/7).
-2. On a **Mac browser**, load the board's URL: the full preset catalog renders (folders,
-   48 presets), and the status line reads "Waiting for a preset change…" until the first
-   one arrives. In Safari's Web Inspector → Network, all nine files must reach
-   "Completed" - none left pending, which is how the blocker showed up.
-3. Switch presets on the unit: within a couple of seconds the status line updates to
+   All nine lines must read `200`. In round one most came back `000` (curl exit 56/52/7);
+   in round two they came back `200` but **serialised in ~1 s steps**, so check the times
+   too - every line should land inside a few hundred milliseconds of the others, not in
+   pairs a second apart. Run this with **no browser tabs open on the board**, then again
+   with one browser tab open, since parked keep-alive connections were the round-two
+   cause.
+2. **Safari alone, no other browser open.** Quit Chrome (or close its board tabs) first,
+   then load the board's URL in Safari: the full preset catalog renders (folders, 48
+   presets) and the status line reads "Waiting for a preset change…" until the first one
+   arrives. In Web Inspector → Network, all nine files must reach **Completed** - none
+   left pending, and no file sitting for seconds. Reload once with the inspector open
+   (that closes and reopens a whole browser's worth of connections at once, which
+   exercises the `TIME_WAIT` headroom).
+3. **Safari with Chrome also open on the board** - this is the round-two case, and the one
+   that was broken. Load the board in Chrome first and leave the tab open (it holds six
+   keep-alive connections plus the live WebSocket), *then* load it in Safari. Safari must
+   still render the full catalog promptly with all nine files Completed. Then reload
+   Chrome's tab while Safari stays open, and confirm Chrome recovers the same way. If
+   either browser is slow or leaves files pending, grab the board's log for the window -
+   `Websocket client ... connected`/`closed` lines and their timestamps show whether
+   something is waiting out an inactivity timeout.
+4. Switch presets on the unit: within a couple of seconds the status line updates to
    "Preset change (cmd N, #M)" without a reload - same timing bar as issue #75's own smoke
    test (a *second* change a few seconds later must update just as fast, not wait up to a
    minute).
-4. On an **iPhone** (Safari), load the same URL, then **Share → Add to Home Screen**.
+5. On an **iPhone** (Safari), load the same URL, then **Share → Add to Home Screen**.
    Reopen from the home screen icon: confirm it opens `display: standalone` (no Safari
    chrome), the status bar area isn't drawn over by the header, there's no
    double-tap-to-zoom delay on the list, and no rubber-band bounce at the top/bottom of
    the page.
-5. Open a **second browser tab/window** to the same URL while the first stays open:
+6. Open a **second browser tab/window** to the same URL while the first stays open:
    confirm it shows the full catalog immediately (via its own `GET /api/presets.json`,
    not a blank list) even though its WebSocket never connects (same retry-on-backoff
    behaviour issue #75 already documented above). Close the first tab; the second's next
    retry should connect and start showing live updates.
-6. Confirm the page still looks and behaves as before for anything issue #75's own smoke
+7. Confirm the page still looks and behaves as before for anything issue #75's own smoke
    test already covered (tick heartbeat with no console error, `GlobalTempo` never showing
    up as a false preset change).
 

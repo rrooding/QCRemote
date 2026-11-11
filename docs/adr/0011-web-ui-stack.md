@@ -64,16 +64,23 @@ Checked against the pinned tree (`~/zephyrproject/zephyr`), not assumed:
   `CONFIG_HTTP_SERVER_CLIENT_INACTIVITY_TIMEOUT` (default 10 s, `Kconfig:240`). With
   `CONFIG_HTTP_SERVER_MAX_CLIENTS=4`, a browser that opens its usual six parallel connections
   simply has two of them wait in the TCP backlog - slower, not broken.
-  **Corrected by hardware testing (PR #92, issue #88): this was wrong on both counts.**
-  Waiting in the backlog is not "slower" when the connections ahead are keep-alive ones
-  nothing closes - the two extra requests wait out the 10 s inactivity timeout instead of
-  being served. And the effective parallel limit was never 4: Zephyr's own
-  `CONFIG_ZVFS_POLL_MAX` default of 3 left the server's single `zsock_poll()` call room for
-  the eventfd, the listener and exactly **one** client, and a `poll()` failure makes
-  `http_server_run()` close every socket it owns. See firmware/README.md's "Parallel
-  connections" section for the full chain and the fix (`ZVFS_POLL_MAX=10`,
-  `HTTP_SERVER_MAX_CLIENTS=6`, plus the `NET_MAX_CONTEXTS`/`NET_MAX_CONN` pools a
-  six-connection load also exhausted), which costs ~9 KB of RAM.
+  **Corrected by hardware testing (PR #92, issue #88): this was wrong on both counts, and
+  the sentence above it - that a WebSocket does not occupy a client slot - is the only part
+  that survived.**
+  First, the effective parallel limit was never 4: Zephyr's own `CONFIG_ZVFS_POLL_MAX`
+  default of 3 left the server's single `zsock_poll()` call room for the eventfd, the
+  listener and exactly **one** client, and a `poll()` failure makes `http_server_run()`
+  close every socket it owns, listener included.
+  Second, waiting in the backlog is not "slower" when the connections ahead are keep-alive
+  ones nothing closes: the extra connections wait out the inactivity timeout, and once the
+  listening socket's backlog fills too, Zephyr drops further SYNs outright
+  (`tcp_backlog_is_full()`), so the client falls back to ~1 s SYN retransmits. And the
+  relevant count is not "six per page load" but how many connections are still *parked*
+  when the next page load starts - two browsers open at once, or one reloading, is twelve.
+  See firmware/README.md's "Parallel connections" section for the measured chain and the
+  fix (`ZVFS_POLL_MAX=16`, `HTTP_SERVER_MAX_CLIENTS=13`,
+  `CLIENT_INACTIVITY_TIMEOUT` 10 → 5, plus the `NET_MAX_CONTEXTS`/`NET_MAX_CONN` pools a
+  multi-browser load also exhausted), which costs ~27 KB of RAM.
 - **A WebSocket does not occupy an HTTP client slot.** `handle_http1_to_websocket_upgrade()`
   calls `websocket_register()` and then `http_server_release_client()`
   (`subsys/net/lib/http/http_server_ws.c:35-140`), so the upgraded socket is handed to the
@@ -350,9 +357,10 @@ The proof of concept lives in **`web/poc/`** (see its README). It is not firmwar
   `CONFIG_HTTP_SERVER_MAX_CLIENTS=4` the two over-limit connections would just wait in the
   TCP backlog, slower but not broken - **did not survive hardware testing**; see the
   correction under "What Zephyr v4.5.0's HTTP server will and won't do" above. The real
-  limits are now set explicitly in `firmware/app/prj.conf` and cost ~9 KB of RAM; decision
-  2's bundler trigger is unaffected, since bundling would not have fixed either limit (one
-  bundle plus the page is still two parallel requests).
+  limits are now set explicitly in `firmware/app/prj.conf` and cost ~27 KB of RAM;
+  decision 2's bundler trigger is unaffected, since bundling would not have fixed any of
+  those limits (one bundle plus the page is still two parallel requests, and two parked
+  keep-alive connections hold their slots exactly as long as six).
 - **Flash cost is 20 221 B today** for the whole UI, against 64 MB. RAM cost of serving it is
   zero: static resources send straight from flash. The existing three 16 KB JSON buffers in
   `QcWifiWebTransport` are ADR 0010's cost, not this one's - though decision 6's patches should
