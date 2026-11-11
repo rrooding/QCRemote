@@ -623,8 +623,12 @@ private:
         // necessarily specific to File messages for the reassembly counters
         // (they're counted before a command id is known), but real evidence
         // of loss during this stream's window either way.
-        LOG_INF("File stream limits: max wire=%zu max inflated=%zu, dropped (dispatch=%u gzip=%u), "
-                "reassembly (overflow=%u malformed=%u), transfers=%u",
+        // Every count on this line is scoped to this one stream (diffed
+        // against the snapshot taken at its start), unlike
+        // checkTrafficHealth()'s lifetime totals - issue #94 asked for that
+        // distinction to be readable from the log itself.
+        LOG_INF("File stream limits: max wire=%zu max inflated=%zu, during this stream: dropped "
+                "(dispatch=%u gzip=%u), reassembly (overflow=%u malformed=%u), transfers=%u",
                 summary.maxWireBytes, summary.maxInflatedBytes, summary.dispatcherDropped,
                 summary.gzipDropped, summary.reassemblyOverflowCount, summary.reassemblyMalformedCount,
                 totalInTransfersThisStream);
@@ -690,6 +694,23 @@ private:
         const uint32_t reassemblyOverflowMax = reassemblyOverflowMaxSize_.load(std::memory_order_relaxed);
         const uint32_t reassemblyMalformed = reassemblyMalformedCount_.load(std::memory_order_relaxed);
 
+        // Issue #94's sizing evidence. Monotonic, so this settles after the
+        // first few bursts instead of repeating - one LOG_INF per increase,
+        // never one per message, and it's the only thing that still reports
+        // anything once the drops are gone (which is the point: "no drops"
+        // alone can't tell a fixed queue from a queue that was never
+        // tested). See QcMessageQueue.hpp.
+        const uint32_t dispatchPeakRecords = dispatcher_.maxRecordsInFlight();
+        const uint32_t dispatchPeakBytes = dispatcher_.maxBytesInFlight();
+        if (dispatchPeakRecords > lastReportedDispatchPeakRecords_ ||
+            dispatchPeakBytes > lastReportedDispatchPeakBytes_) {
+            LOG_INF("Dispatch queue high-water: %u of %u records, %u of %u bytes",
+                    dispatchPeakRecords, QcDispatcher::queueDepth(), dispatchPeakBytes,
+                    QcDispatcher::arenaCapacity());
+            lastReportedDispatchPeakRecords_ = dispatchPeakRecords;
+            lastReportedDispatchPeakBytes_ = dispatchPeakBytes;
+        }
+
         if (dispatcherDropped == lastReportedDispatcherDropped_ &&
             gzipDropped == lastReportedGzipDropped_ &&
             reassemblyOverflow == lastReportedReassemblyOverflow_ &&
@@ -697,9 +718,23 @@ private:
             return;
         }
 
-        LOG_WRN("Traffic drop/overflow: dropped (dispatch=%u gzip=%u), reassembly (overflow=%u "
-                "largest=%u malformed=%u) - a listing or push in progress may be incomplete",
-                dispatcherDropped, gzipDropped, reassemblyOverflow, reassemblyOverflowMax,
+        // Issue #94: the owner's hardware log read `dispatch=12`, then 19,
+        // 24, 25, 31 and had to be differenced by hand to see that each
+        // preset change cost 1-7 messages. Every number on this line is a
+        // lifetime total, so say so, and print the delta since the previous
+        // warning next to it - that delta is the per-event cost, which is
+        // the number that actually says how bad one burst was.
+        // `dispatch-oversized` is the part of the dispatch total that no
+        // queue depth could have absorbed (a single message larger than the
+        // whole arena, i.e. issue #66's territory).
+        LOG_WRN("Traffic drop/overflow, new since last warning (total since boot): "
+                "dispatch=+%u (%u, of which oversized %u), gzip=+%u (%u), reassembly overflow=+%u "
+                "(%u, largest %u) malformed=+%u (%u) - a listing or push in progress may be "
+                "incomplete",
+                dispatcherDropped - lastReportedDispatcherDropped_, dispatcherDropped,
+                dispatcher_.oversizedCount(), gzipDropped - lastReportedGzipDropped_, gzipDropped,
+                reassemblyOverflow - lastReportedReassemblyOverflow_, reassemblyOverflow,
+                reassemblyOverflowMax, reassemblyMalformed - lastReportedReassemblyMalformed_,
                 reassemblyMalformed);
 
         lastReportedDispatcherDropped_ = dispatcherDropped;
@@ -836,6 +871,8 @@ private:
     uint32_t lastReportedGzipDropped_ = 0;
     uint32_t lastReportedReassemblyOverflow_ = 0;
     uint32_t lastReportedReassemblyMalformed_ = 0;
+    uint32_t lastReportedDispatchPeakRecords_ = 0;
+    uint32_t lastReportedDispatchPeakBytes_ = 0;
 
     // A new command id is always logged the moment it's first seen; a
     // count bump on an already-logged command is throttled to at most
