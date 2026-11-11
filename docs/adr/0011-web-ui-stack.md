@@ -64,6 +64,16 @@ Checked against the pinned tree (`~/zephyrproject/zephyr`), not assumed:
   `CONFIG_HTTP_SERVER_CLIENT_INACTIVITY_TIMEOUT` (default 10 s, `Kconfig:240`). With
   `CONFIG_HTTP_SERVER_MAX_CLIENTS=4`, a browser that opens its usual six parallel connections
   simply has two of them wait in the TCP backlog - slower, not broken.
+  **Corrected by hardware testing (PR #92, issue #88): this was wrong on both counts.**
+  Waiting in the backlog is not "slower" when the connections ahead are keep-alive ones
+  nothing closes - the two extra requests wait out the 10 s inactivity timeout instead of
+  being served. And the effective parallel limit was never 4: Zephyr's own
+  `CONFIG_ZVFS_POLL_MAX` default of 3 left the server's single `zsock_poll()` call room for
+  the eventfd, the listener and exactly **one** client, and a `poll()` failure makes
+  `http_server_run()` close every socket it owns. See firmware/README.md's "Parallel
+  connections" section for the full chain and the fix (`ZVFS_POLL_MAX=10`,
+  `HTTP_SERVER_MAX_CLIENTS=6`, plus the `NET_MAX_CONTEXTS`/`NET_MAX_CONN` pools a
+  six-connection load also exhausted), which costs ~9 KB of RAM.
 - **A WebSocket does not occupy an HTTP client slot.** `handle_http1_to_websocket_upgrade()`
   calls `websocket_register()` and then `http_server_release_client()`
   (`subsys/net/lib/http/http_server_ws.c:35-140`), so the upgraded socket is handed to the
@@ -336,9 +346,13 @@ The proof of concept lives in **`web/poc/`** (see its README). It is not firmwar
 - **The firmware build stays Python-only.** That is the main thing this decision buys and the
   main thing it spends: no minification of our own source, no TypeScript, no tree-shaking, and
   ten served files instead of three. Measured, that costs 6.6 KB of flash (0.01%) and seven
-  extra requests on a first load. With `CONFIG_HTTP_SERVER_MAX_CLIENTS=4` and a browser opening
-  up to six connections, two of those requests wait in the TCP backlog rather than failing -
-  slower, not broken, and the trigger in decision 2 exists for when that stops being true.
+  extra requests on a first load. The claim that followed here - that with
+  `CONFIG_HTTP_SERVER_MAX_CLIENTS=4` the two over-limit connections would just wait in the
+  TCP backlog, slower but not broken - **did not survive hardware testing**; see the
+  correction under "What Zephyr v4.5.0's HTTP server will and won't do" above. The real
+  limits are now set explicitly in `firmware/app/prj.conf` and cost ~9 KB of RAM; decision
+  2's bundler trigger is unaffected, since bundling would not have fixed either limit (one
+  bundle plus the page is still two parallel requests).
 - **Flash cost is 20 221 B today** for the whole UI, against 64 MB. RAM cost of serving it is
   zero: static resources send straight from flash. The existing three 16 KB JSON buffers in
   `QcWifiWebTransport` are ADR 0010's cost, not this one's - though decision 6's patches should

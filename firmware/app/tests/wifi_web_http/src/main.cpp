@@ -36,6 +36,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <string_view>
@@ -260,6 +261,223 @@ void sendWebSocketTextFrame(int sock, std::string_view payload) {
     }
     const ssize_t sent = zsock_send(sock, frame, pos, 0);
     zassert_equal(sent, static_cast<ssize_t>(pos), "send() of websocket frame failed (%d)", errno);
+}
+
+// Issue #88 (PR #92's hardware blocker): a browser does not fetch the
+// page's files one after another - Safari and Chrome both open up to six
+// TCP connections per host and fetch over all of them at once. The board
+// served every asset correctly when curl asked for them sequentially, and
+// reset/refused almost all of them as soon as two or more connections were
+// open at the same time, so the page never got its module graph. The two
+// tests at the end of this file are that request pattern, which nothing
+// here exercised before: the suite's other tests all use one connection at
+// a time.
+//
+// Six, because that is the real per-host cap both browsers use (and the
+// number the owner's curl check reproduces the failure with); the UI ships
+// nine assets, so a browser fetches them in two waves over these six
+// connections, which is what test_every_page_asset_loads_over_parallel_
+// connections below does.
+constexpr size_t kBrowserConnections = 6;
+
+// Like connectToServer()/sendRequest() above but without the zassert: the
+// failure being tested is one where connect() and send() themselves fail
+// (the server had closed its listening socket), and a zassert there would
+// abort the test before it could say how many of the connections got
+// through, and before it could close the ones that did.
+int tryConnectToServer() {
+    const int sock = zsock_socket(NET_AF_INET, NET_SOCK_STREAM, NET_IPPROTO_TCP);
+    if (sock < 0) {
+        return -1;
+    }
+
+    const timeval timeout{.tv_sec = kRecvTimeoutSeconds, .tv_usec = 0};
+    if (zsock_setsockopt(sock, ZSOCK_SOL_SOCKET, ZSOCK_SO_RCVTIMEO, &timeout, sizeof(timeout)) <
+        0) {
+        (void)zsock_close(sock);
+        return -1;
+    }
+
+    net_sockaddr_in address{};
+    address.sin_family = NET_AF_INET;
+    address.sin_port = net_htons(kServerPort);
+    if (zsock_inet_pton(NET_AF_INET, kServerAddress, &address.sin_addr.s_addr) != 1) {
+        (void)zsock_close(sock);
+        return -1;
+    }
+    if (zsock_connect(sock, reinterpret_cast<net_sockaddr*>(&address), sizeof(address)) < 0) {
+        (void)zsock_close(sock);
+        return -1;
+    }
+    return sock;
+}
+
+// One asset request, with the same header set kFetchRequest/
+// kVendorLitRequest use, for an arbitrary path from the generated asset
+// table. Reused for every request below, which is safe because send()
+// has copied it by the time this returns.
+char g_requestBuffer[512];
+
+bool sendAssetRequest(int sock, const char* path) {
+    const int length = snprintf(
+        g_requestBuffer, sizeof(g_requestBuffer),
+        "GET %s HTTP/1.1\r\n"
+        "Host: 192.168.1.233\r\n"
+        "Accept: */*\r\n"
+        "Referer: http://192.168.1.233/\r\n"
+        "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+        "(KHTML, like Gecko) Version/18.0 Safari/605.1.15\r\n"
+        "Accept-Language: en-GB,en;q=0.9\r\n"
+        "Accept-Encoding: gzip, deflate\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n",
+        path);
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(g_requestBuffer)) {
+        return false;
+    }
+    return zsock_send(sock, g_requestBuffer, static_cast<size_t>(length), 0) ==
+           static_cast<ssize_t>(length);
+}
+
+// What one parallel asset fetch came back as. Only the start of the
+// response is kept (enough for the status line) plus the body's byte
+// count - with six connections in flight, keeping every body would cost
+// more static RAM than this suite has any reason to, and the assertions
+// below are about *whether* each asset arrived complete, not about its
+// bytes (which the single-connection tests above already inflate and
+// check).
+struct AssetFetch {
+    const char* path;
+    bool complete;
+    int error;  // errno from the failing recv/send, or 0
+    char head[80];
+    size_t expectedBodyLength;
+    size_t bodyLength;
+};
+
+// Drain space for the bodies read by readStaticResponse() - one shared
+// buffer, since responses are read one socket at a time.
+char g_drainBuffer[512];
+
+// Reads one complete static-resource response: the headers, then exactly
+// Content-Length body bytes.
+//
+// Deliberately not receiveAll(): that one reads until the socket goes
+// quiet, which on these keep-alive connections (the server never closes
+// them on its own - a browser's connections stay open) costs
+// kRecvTimeoutSeconds per connection and, worse, cannot tell a response
+// that arrived in full from one that was cut short. Reading to the
+// declared length makes "this connection's asset never finished" an
+// immediate, attributable result. Every static resource sends a
+// Content-Length - see
+// test_index_page_is_served_gzipped_with_content_length.
+bool readStaticResponse(int sock, AssetFetch& out) {
+    char header[384];
+    size_t headerLength = 0;
+    size_t headerEnd = 0;
+    bool haveHeaders = false;
+
+    while (!haveHeaders && headerLength < sizeof(header)) {
+        const ssize_t received =
+            zsock_recv(sock, header + headerLength, sizeof(header) - headerLength, 0);
+        if (received <= 0) {
+            out.error = (received < 0) ? errno : 0;
+            break;
+        }
+        headerLength += static_cast<size_t>(received);
+        const size_t pos = std::string_view(header, headerLength).find("\r\n\r\n");
+        if (pos != std::string_view::npos) {
+            haveHeaders = true;
+            headerEnd = pos + 4;
+        }
+    }
+
+    const size_t kept = headerLength < sizeof(out.head) - 1 ? headerLength : sizeof(out.head) - 1;
+    memcpy(out.head, header, kept);
+    out.head[kept] = '\0';
+    // So a status line in the message reads as one line even when the
+    // headers that follow it got cut off mid-way.
+    for (size_t i = 0; i < kept; ++i) {
+        if (out.head[i] == '\r' || out.head[i] == '\n') {
+            out.head[i] = ' ';
+        }
+    }
+
+    if (!haveHeaders) {
+        return false;
+    }
+
+    constexpr std::string_view kContentLength = "Content-Length: ";
+    const size_t pos = std::string_view(header, headerEnd).find(kContentLength);
+    if (pos == std::string_view::npos) {
+        return false;
+    }
+    // strtol stops at the "\r" that ends the header line.
+    const long declared = strtol(header + pos + kContentLength.size(), nullptr, 10);
+    if (declared < 0) {
+        return false;
+    }
+    out.expectedBodyLength = static_cast<size_t>(declared);
+    out.bodyLength = headerLength - headerEnd;
+
+    while (out.bodyLength < out.expectedBodyLength) {
+        size_t want = out.expectedBodyLength - out.bodyLength;
+        if (want > sizeof(g_drainBuffer)) {
+            want = sizeof(g_drainBuffer);
+        }
+        const ssize_t received = zsock_recv(sock, g_drainBuffer, want, 0);
+        if (received <= 0) {
+            out.error = (received < 0) ? errno : 0;
+            return false;
+        }
+        out.bodyLength += static_cast<size_t>(received);
+    }
+
+    out.complete = true;
+    return true;
+}
+
+// Sends one asset request per already-open connection, then reads them
+// all back. Requests go out before any response is read, so all of them
+// are genuinely in flight at once - a send/read pair per connection would
+// serialise the thing under test.
+void fetchAssetsInParallel(const int* sockets, AssetFetch* fetches, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        if (sockets[i] < 0) {
+            fetches[i].error = ENOTCONN;
+            continue;
+        }
+        if (!sendAssetRequest(sockets[i], fetches[i].path)) {
+            fetches[i].error = errno;
+        }
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (sockets[i] < 0 || fetches[i].error != 0) {
+            continue;
+        }
+        (void)readStaticResponse(sockets[i], fetches[i]);
+    }
+}
+
+// Turns the per-asset outcomes into one assertion message that names
+// every asset that didn't come back, rather than failing on whichever
+// one happened to be checked first.
+void assertAllFetchesSucceeded(const AssetFetch* fetches, size_t count, const char* what) {
+    size_t failed = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const AssetFetch& fetch = fetches[i];
+        const bool ok = fetch.complete &&
+                        std::string_view(fetch.head).find("HTTP/1.1 200 OK") == 0;
+        if (ok) {
+            continue;
+        }
+        ++failed;
+        TC_PRINT("%s: %s FAILED - errno %d, %zu/%zu body bytes, response starts: \"%s\"\n", what,
+                 fetch.path, fetch.error, fetch.bodyLength, fetch.expectedBodyLength,
+                 fetch.head);
+    }
+    zassert_equal(failed, 0u, "%s: %zu of %zu assets failed over %zu parallel connections", what,
+                  failed, count, kBrowserConnections);
 }
 
 void* setup(void) {
@@ -540,4 +758,93 @@ ZTEST(wifi_web_http, test_resync_request_triggers_a_fresh_snapshot) {
                  resynced.data());
     (void)zsock_close(sock);
     k_msleep(1100);  // See test_websocket_upgrade_pushes_the_current_catalog's own comment.
+}
+
+// PR #92's hardware blocker, reproduced off-board: six connections open at
+// the same time, one asset requested on each. Before the fix this failed
+// with the exact shapes the owner's curl check saw (connection reset,
+// empty reply, connection refused) - Zephyr's HTTP server polls
+// 1 + listen + CONFIG_HTTP_SERVER_MAX_CLIENTS descriptors in one
+// zsock_poll() call, and zvfs_poll_internal() can only build
+// CONFIG_ZVFS_POLL_MAX k_poll_events for them. Once more descriptors were
+// active than that, poll() failed with ENOMEM, and http_server_run()
+// treats a poll() failure as fatal: close_all_sockets() drops every live
+// connection *and* the listening socket, then the server restarts
+// CONFIG_HTTP_SERVER_RESTART_DELAY later. One connection fits in the
+// stock three poll slots (eventfd + listen + one client), which is why
+// sequential requests always worked and the old inline page never showed
+// this. See firmware/app/prj.conf's own ZVFS_POLL_MAX comment.
+ZTEST(wifi_web_http, test_parallel_connections_each_get_their_asset) {
+    publishSmokeTestCatalog();
+
+    int sockets[kBrowserConnections];
+    AssetFetch fetches[kBrowserConnections]{};
+    size_t connected = 0;
+
+    // Connect every socket before sending anything: these have to be open
+    // simultaneously for this to be the test it claims to be.
+    for (size_t i = 0; i < kBrowserConnections; ++i) {
+        sockets[i] = tryConnectToServer();
+        if (sockets[i] >= 0) {
+            ++connected;
+        }
+        fetches[i].path = qcbridge::webassets::kAssets[i].path;
+    }
+
+    fetchAssetsInParallel(sockets, fetches, kBrowserConnections);
+
+    for (size_t i = 0; i < kBrowserConnections; ++i) {
+        if (sockets[i] >= 0) {
+            (void)zsock_close(sockets[i]);
+        }
+    }
+
+    zassert_equal(connected, kBrowserConnections, "only %zu of %zu connections were accepted",
+                  connected, kBrowserConnections);
+    assertAllFetchesSucceeded(fetches, kBrowserConnections, "parallel asset fetch");
+}
+
+// The whole page load, the way the browser actually does it: all nine of
+// the UI's assets over six connections that stay open across both waves
+// (keep-alive, exactly as the request headers above ask for). This is the
+// case the owner's Safari test failed on - "/" came back but
+// /src/main.js and its siblings didn't, so the module graph never
+// resolved and the UI never started.
+ZTEST(wifi_web_http, test_every_page_asset_loads_over_parallel_connections) {
+    publishSmokeTestCatalog();
+
+    constexpr size_t kAssetCount = ARRAY_SIZE(qcbridge::webassets::kAssets);
+    BUILD_ASSERT(kAssetCount > kBrowserConnections,
+                 "this test is about a page needing more than one wave of fetches; if the UI "
+                 "ever ships fewer assets than a browser opens connections, drop it");
+
+    int sockets[kBrowserConnections];
+    size_t connected = 0;
+    for (size_t i = 0; i < kBrowserConnections; ++i) {
+        sockets[i] = tryConnectToServer();
+        if (sockets[i] >= 0) {
+            ++connected;
+        }
+    }
+
+    AssetFetch fetches[kAssetCount]{};
+    for (size_t i = 0; i < kAssetCount; ++i) {
+        fetches[i].path = qcbridge::webassets::kAssets[i].path;
+    }
+
+    for (size_t done = 0; done < kAssetCount; done += kBrowserConnections) {
+        const size_t wave =
+            (kAssetCount - done) < kBrowserConnections ? kAssetCount - done : kBrowserConnections;
+        fetchAssetsInParallel(sockets, fetches + done, wave);
+    }
+
+    for (size_t i = 0; i < kBrowserConnections; ++i) {
+        if (sockets[i] >= 0) {
+            (void)zsock_close(sockets[i]);
+        }
+    }
+
+    zassert_equal(connected, kBrowserConnections, "only %zu of %zu connections were accepted",
+                  connected, kBrowserConnections);
+    assertAllFetchesSucceeded(fetches, kAssetCount, "full page load");
 }
