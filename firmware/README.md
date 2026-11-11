@@ -1655,11 +1655,14 @@ and it holds. Chrome's open live-update socket is therefore *not* part of the pr
 only its six idle HTTP connections are. An upgrade does occupy a slot transiently, until
 that handoff, which is what the `+1` below is for.
 
-Two settings, and both levers were measured rather than guessed:
+Two settings, and both levers were measured rather than guessed. **The `MAX_CLIENTS=13` in
+this table did not survive round three below** - it regressed the board and is now 8; the
+inactivity timeout is what carries the multi-browser case. `app/prj.conf` is always
+authoritative.
 
 | Setting | Was | Now | Why |
 | --- | --- | --- | --- |
-| `CONFIG_HTTP_SERVER_MAX_CLIENTS` | 6 | **13** | 6 (first browser) + 6 (second, or the same one reloading) + 1 transient upgrade |
+| `CONFIG_HTTP_SERVER_MAX_CLIENTS` | 6 | **13** (→ 8, round three) | 6 (first browser) + 6 (second, or the same one reloading) + 1 transient upgrade |
 | `CONFIG_HTTP_SERVER_CLIENT_INACTIVITY_TIMEOUT` | 10 | **5** | a parked slot recycles twice as fast - the backstop for a third client |
 | `CONFIG_ZVFS_POLL_MAX` | 10 | **16** | 1 + 1 + 13, same arithmetic as above |
 | `CONFIG_NET_MAX_CONTEXTS` | 12 | **20** | 1 listener + 13 accepted + DHCPv4, plus `TIME_WAIT` headroom |
@@ -1679,47 +1682,157 @@ Off-board coverage: `test_a_second_browsers_page_load_is_not_locked_out` parks s
 keep-alive connections *and* a WebSocket, then brings a second browser's six connections
 and six assets in while all of them are still open. At 6 slots the second browser's
 upgrade only gets in after a full 10 s inactivity timeout and the test fails; at 13 it
-connects in **0.69 s** with nothing waiting on a timer.
+connects in **0.69 s** with nothing waiting on a timer. (At the 8 slots round three settles
+on, it connects after one 5 s recycle instead - see that round's own note on the test's
+retuned bar.)
+
+#### Round three: the TCP window is a third of the whole buffer pool, per connection
+
+Round two made hardware **worse**: Chrome went from loading the page to hanging like Safari.
+The owner's waterfall on that build served `/` in 3.53 s and the next four files in 11-30 ms
+each, then stalled on the parallel wave - `vendor/lit.js` at 20.32 s, `qc-status.js` at
+20.00 s, `store-controller.js` at 21.20 s, and `qc-preset-list.js` **failed at 45.18 s with
+`net::ERR_CONNECTION_RESET` after "200 OK" and 0.1 kB transferred**. One module failing kills
+the whole import graph from `qc-app.js`, so the page never starts. Coordinator probes: single
+requests 200 in 0.08-0.11 s, but 9 in parallel gave one 200 and the rest 12 s timeouts, and a
+second round of the same probe gave 0 of 9.
+
+"200 OK, then a stall, then a reset mid-response" is not a slot problem - the connection was
+accepted and the response had started. And the fact that it got *worse* when
+`HTTP_SERVER_MAX_CLIENTS` went 6 → 13 says the binding resource scales with the number of
+connections **being served at once**, not with slots.
+
+It is the TCP window, and it is a one-line default in `subsys/net/ip/tcp.c`:
+
+```c
+static int tcp_tx_window =
+#if (CONFIG_NET_TCP_MAX_SEND_WINDOW_SIZE != 0)
+        CONFIG_NET_TCP_MAX_SEND_WINDOW_SIZE;
+#else
+        MIN((CONFIG_NET_BUF_TX_COUNT * CONFIG_NET_BUF_DATA_SIZE) / 3, UINT16_MAX);
+#endif
+```
+
+`CONFIG_NET_TCP_MAX_SEND_WINDOW_SIZE` defaults to 0, so the window is **one third of the
+entire TX buffer pool - and that value is used per connection** (`tcp_rx_window` is the same
+shape out of the RX pool). More than three concurrently-sending connections therefore
+oversubscribes the pool **by construction, at any pool size**: raising `NET_BUF_TX_COUNT`
+raises the per-connection window by exactly the same factor and changes nothing. The window
+has to be pinned.
+
+This board had `NET_BUF_TX_COUNT=36` - Zephyr's own `NET_PKT_LARGE_DEFAULTS` value, which is
+`default y if WIFI`, so it was never set by hand - and `NET_BUF_DATA_SIZE=128`. That is a
+**1536-byte window per connection against a 4608-byte pool**: 2× oversubscribed at 6 clients,
+**4.3× at 13**. TCP holds a segment's buffers until it is ACKed, so on a real Wi-Fi link
+(25-150 ms RTT, measured) they stay held for a whole round trip and the pool genuinely runs
+dry. The send then stalls; the response ends in a reset rather than an error the client can
+retry. And because Zephyr's HTTP server is a **single thread**, a stalled send blocks every
+other client too - which is why the whole wave serialises instead of just one request being
+slow.
+
+**Why `tests/wifi_web_http` passed this the whole way through, and the lesson from it.** Over
+loopback the RTT is microseconds: a buffer is allocated, sent, ACKed and freed before anything
+else needs it, so the pool is never actually oversubscribed and the suite passes at any
+window size. The suite's buffer counts were never the problem - the *absence of a round trip*
+was. That is the one class of bug this suite structurally cannot see, and it is worth
+remembering before trusting it about anything throughput- or timing-related: it is a protocol
+and resource-accounting harness, not a performance one.
+
+The budget, written out in `app/prj.conf` so it can be checked rather than tuned:
+
+| Setting | Was | Now | Why |
+| --- | --- | --- | --- |
+| `CONFIG_NET_TCP_MAX_SEND_WINDOW_SIZE` | 0 (→ 1536 derived) | **2048** | pinned, so it stops scaling with the pool |
+| `CONFIG_NET_TCP_MAX_RECV_WINDOW_SIZE` | 0 (→ 1536 derived) | **2048** | same |
+| `CONFIG_NET_BUF_TX_COUNT` | 36 (default) | **160** | 20 480 B = 1.25× the 8 × 2048 B worst case |
+| `CONFIG_NET_BUF_RX_COUNT` | 36 (default) | **96** | inbound is request headers and ACKs only |
+| `CONFIG_NET_PKT_TX_COUNT` | 16 | **24** | ~2 segments per connection in flight, plus ACKs |
+| `CONFIG_NET_PKT_RX_COUNT` | 16 | **24** | same |
+| `CONFIG_HTTP_SERVER_MAX_CLIENTS` | 13 | **8** | 6 (browser's cap) + 1 transient upgrade + 1 spare |
+| `CONFIG_ZVFS_POLL_MAX` | 16 | **10** | 1 + 1 + 8 |
+| `CONFIG_NET_MAX_CONTEXTS` | 20 | **14** | 1 listener + 8 accepted + DHCPv4 + `TIME_WAIT` |
+| `CONFIG_NET_MAX_CONN` | 24 | **18** | same |
+
+At a 2048-byte window and a 100 ms RTT that is ~20 KB/s per connection, so the largest asset
+(`vendor/lit.js`, 7 053 B gzipped) takes ~0.35 s and a whole six-file wave ~2 s even with the
+server serialising them.
+
+**`MAX_CLIENTS` comes back down to 8**, because 13 is what regressed the board. Parked idle
+connections cost a slot but no buffers; connections being *served* cost both, and the server
+accepts up to `MAX_CLIENTS`, so that number also caps how many sends can be in flight - it has
+to stay inside the window budget. Accepting more connections than the link can serve turns a
+queue into a stall. Two browsers at once is handled by recycling parked slots quickly (the 5 s
+inactivity timeout from round two) rather than by holding a slot open for each, so
+`test_a_second_browsers_page_load_is_not_locked_out` now holds the weaker but achievable bar
+of "served within one inactivity timeout" (it passes in 6.4 s) instead of "served
+immediately".
+
+#### Diagnostics build
+
+Two rounds of this were diagnosed from source plus a loopback suite and then found wrong on
+hardware, so `app/diagnostics.conf` exists to make the board report the numbers instead. It is
+not part of any normal build:
+
+```bash
+west build -b frdm_rw612 firmware/app -d build-diag --pristine \
+  -- -DEXTRA_CONF_FILE="wifi_credentials.conf;diagnostics.conf"
+```
+
+It turns on `NET_BUF_POOL_USAGE` (per-pool high-water marks and failed-allocation counts - a
+pool that ran dry becomes a number instead of a mysterious stall), `NET_STATISTICS_TCP`
+(retransmits and segment drops), the net shell (`net mem`, `net stats`, `net conn` on demand),
+`THREAD_ANALYZER` plus `STACK_SENTINEL` and `INIT_STACKS` (so a stack overflow is ruled in or
+out rather than guessed at - `zvfs_poll_internal()` puts a `k_poll_event[ZVFS_POLL_MAX]` array
+on the stack of whichever thread calls `poll()`, and the HTTP server thread's own stack is only
+`CONFIG_HTTP_SERVER_STACK_SIZE` = 3 072 B), and the HTTP server's own debug logging. Verified
+to build and link: 806 232 B RAM / 82.01% and 1 016 612 B flash on `frdm_rw612` STA.
+
+If a page load still stalls, `net mem` straight afterwards is the single most useful thing to
+capture - if the TX pool's high-water mark is at its limit or allocations failed, the window
+budget above is still too generous for the link.
 
 #### Cost
 
-Against `940271f` - this branch immediately before the parallel-connection work, rebased
-onto the same master (`80d2289`, so #94's dispatch queue is in both) - rebuilt the same way
-in the same local environment, with example credentials in a separate build tree:
+Against `940271f` - this branch immediately before the parallel-connection work, rebased onto
+the same master (`80d2289`, so #94's dispatch queue is in both) - rebuilt the same way in the
+same local environment, with example credentials in a separate build tree:
 
 | Config | RAM/dram0 before → after | Flash before → after |
 | --- | --- | --- |
-| `frdm_rw612`, STA | 734 712 B / 74.74% → 761 672 B / 77.48% (**+26 960 B**) | 736 748 B → 736 780 B (**+32 B**) |
-| `frdm_rw612`, AP | 742 016 B / 75.48% → 769 080 B / 78.23% (**+27 064 B**) | 763 392 B → 763 416 B (**+24 B**) |
-| ESP32-S3, with PSRAM | `dram0` 219 504 B / 55.00% → 246 600 B / 61.79% (**+27 096 B**) | `irom0`+`drom0` 1 007 028 B → 1 007 092 B (**+64 B**) |
-| ESP32-S3, no PSRAM | `dram0` 334 080 B (**unchanged**) | **unchanged** |
+| `frdm_rw612`, STA | 734 712 B / 74.74% → 778 472 B / 79.19% (**+43 760 B**) | 736 748 B → 736 740 B (**-8 B**) |
+| `frdm_rw612`, AP | 742 016 B / 75.48% → 785 832 B / 79.94% (**+43 816 B**) | 763 392 B → 763 392 B (**unchanged**) |
+| ESP32-S3, with PSRAM | `dram0` 219 504 B / 55.00% → 263 336 B / 65.98% (**+43 832 B**) | `irom0`+`drom0` 1 007 028 B → 1 007 060 B (**+32 B**) |
+| ESP32-S3, no PSRAM | `dram0` 334 080 B (**byte-identical**) | **byte-identical** |
 
 Every byte of the `frdm_rw612` STA delta is accounted for, from `nm` on the two
-`zephyr.elf`s:
+`zephyr.elf`s - and two thirds of it is the buffer pools, which is the point:
 
 | Symbol | Delta | Why |
 | --- | --- | --- |
-| `server_ctx` | +12 816 B | 9 more `struct http_client_ctx` @ 1 424 B - `MAX_CLIENTS` 4 → 13 |
-| `_k_mem_slab_buf_tcp_conns_slab` | +9 632 B | 14 more `struct tcp` @ 688 B - `NET_MAX_CONTEXTS` 6 → 20 |
-| `contexts` | +2 688 B | 14 more `struct net_context` @ 192 B - same knob |
-| `conns` | +1 152 B | 16 more `struct net_conn` @ 72 B - `NET_MAX_CONN` 8 → 24 |
-| `fdtable` | +672 B | 14 more fd slots @ 48 B - derived from `NET_MAX_CONTEXTS` |
-| **total** | **+26 960 B** | matches the measured RAM delta exactly |
+| `net_buf_data_tx_bufs` | +15 872 B | 124 more TX data fragments @ 128 B - `NET_BUF_TX_COUNT` 36 → 160 |
+| `net_buf_data_rx_bufs` | +7 680 B | 60 more RX data fragments @ 128 B - `NET_BUF_RX_COUNT` 36 → 96 |
+| `server_ctx` | +5 696 B | 4 more `struct http_client_ctx` @ 1 424 B - `MAX_CLIENTS` 4 → 8 |
+| `_k_mem_slab_buf_tcp_conns_slab` | +5 504 B | 8 more `struct tcp` @ 688 B - `NET_MAX_CONTEXTS` 6 → 14 |
+| `_net_buf_tx_bufs` | +3 472 B | the 124 new TX buffers' own `struct net_buf` headers @ 28 B |
+| `_net_buf_rx_bufs` | +1 680 B | the 60 new RX buffers' headers |
+| `contexts` | +1 536 B | 8 more `struct net_context` @ 192 B |
+| `_k_mem_slab_buf_{tx,rx}_pkts` | +1 216 B | 8 more `struct net_pkt` each @ 76 B - `NET_PKT_*_COUNT` 16 → 24 |
+| `conns` | +720 B | 10 more `struct net_conn` @ 72 B - `NET_MAX_CONN` 8 → 18 |
+| `fdtable` | +384 B | 8 more fd slots @ 48 B |
+| **total** | **+43 760 B** | matches the measured RAM delta exactly |
 
-`CONFIG_ZVFS_POLL_MAX` - the original root cause - and
-`CONFIG_HTTP_SERVER_CLIENT_INACTIVITY_TIMEOUT` both cost **no static RAM at all**: the
-first sizes a stack array inside whichever thread calls `poll()` (~20 B per entry on
-Cortex-M), the second is a `k_timeout_t`. That is why `ZVFS_POLL_MAX` carries margin. The
-no-PSRAM ESP32-S3 config doesn't move because it never enables networking in the first
-place (`prj_nopsram.conf`).
+`CONFIG_ZVFS_POLL_MAX`, the pinned window sizes and the inactivity timeout all cost **no
+static RAM**: the first sizes a stack array in whichever thread calls `poll()`, the other
+three are plain integers. The no-PSRAM ESP32-S3 config doesn't move because it never enables
+networking in the first place (`prj_nopsram.conf`).
 
-ADR 0010's RAM tables are unaffected in their conclusions: the `frdm_rw612` still has
-~216 KB of its 960 KB free, and the PSRAM ESP32-S3 ~149 KB of `dram0`. So the alternative
-of serving fewer files (ADR 0011 decision 2's bundler, which the embed step's contract
-makes a one-line CMake change) is **not needed here**, and would not have fixed either
-limit: one bundle plus the page is still two parallel requests, which the stock
-`ZVFS_POLL_MAX=3` breaks just as thoroughly as nine, and two parked keep-alive connections
-hold slots just as long as six.
+ADR 0010's RAM tables are unaffected in their conclusions: the `frdm_rw612` still has ~200 KB
+of its 960 KB free (~193 KB in AP mode) and the PSRAM ESP32-S3 ~133 KB of `dram0`. ADR 0011
+decision 2's bundler would not have fixed any of this either - one bundle plus the page is
+still two parallel requests, two parked keep-alive connections hold slots as long as six, and
+a single 7 KB bundle against a 1 536-byte window stalls exactly the same way. It *would* cut
+the number of concurrent connections a page load needs, which is worth remembering as a
+second-order lever if the window budget above still proves too generous for the link.
 
 ### Dev loop
 
