@@ -193,9 +193,14 @@ public:
     uint32_t maxBytesInFlight() const { return maxBytesInFlight_.load(std::memory_order_relaxed); }
 
     // Records waiting for the consumer right now. Exact when read from
-    // either of the two threads; a snapshot from anywhere else.
+    // either of the two threads; a snapshot from anywhere else. readSeq_
+    // is loaded first on purpose: both sequence numbers only ever grow and
+    // readSeq_ never passes writeSeq_, so reading the slower-moving one
+    // first keeps the subtraction from underflowing for a third-party
+    // observer. Reading them the other way round can.
     uint32_t recordsInFlight() const {
-        return writeSeq_.load(std::memory_order_acquire) - readSeq_.load(std::memory_order_acquire);
+        const uint32_t readSeq = readSeq_.load(std::memory_order_acquire);
+        return writeSeq_.load(std::memory_order_acquire) - readSeq;
     }
 
 private:

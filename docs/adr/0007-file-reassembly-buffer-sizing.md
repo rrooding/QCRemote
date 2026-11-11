@@ -95,6 +95,18 @@ evidence implies, without assuming an implausible blow-up in per-slot cost.
    kept mirrored by hand, same as before) are both 131072 bytes (128 KiB)** - sized for a
    worst-case, fully-named 256-preset user folder per the Context section above, not today's
    mostly-empty 10193-byte message.
+
+   **Amended by issue #94**: the dispatcher's 128 KiB is no longer a single mailbox slot but a
+   shared *arena* behind a 32-entry queue (`QcMessageQueue.hpp`), because one slot provably
+   could not hold a preset-change burst - Zephyr's `usbh` thread produces at `K_PRIO_COOP(9)`
+   (priority -7, cooperative) and the consumer is preemptible at 6, so the producer always wins
+   the race whenever anything delays the consumer. The **size** decided here is unchanged on
+   every target, and so is the worst case it was sized for: an arena-sized record still fits
+   (an empty arena rewinds to offset 0 before allocating). The queue depth costs ~640 bytes of
+   descriptors, not 32 more buffers - the whole reason it is a descriptor ring over one arena
+   rather than an array of mailboxes. See firmware/README.md's "Dispatch queue (issue #94)"
+   for the full mechanism; the single oversized-`File`-message case this ADR's sizing was
+   always a stopgap for remains issue #66's.
 3. **`kMaxInflatedSize` (`QcGzip.hpp`) is 32768 bytes (32 KiB)** - ~44% headroom above the
    22667-byte `RecallPreset` the owner's unit actually produced, without just doubling blindly.
    **`kMaxCompressedInputSize` is 8192 bytes** - kept at the same 4x ratio to
