@@ -1503,6 +1503,451 @@ Flash in **station** mode with the Quad Cortex Mini connected over USB, and open
 6. Leave it a few minutes with the page open: no `LOG_ERR` lines, USB/handshake normal,
    `Post-connect tally: command=33 count=<N>` stepping up about once a minute (`GlobalTempo`,
    expected and unchanged).
+## Lit web UI (issue #88)
+
+ADR 0011's own research prototype (issue #84, `web/poc/`) is now the board's real UI:
+`QcWifiWebTransport.hpp`'s inline `kIndexHtml` test page is gone, replaced by
+[`web/ui/`](../web/ui/README.md) - plain ES modules, Lit 3, no build step - served from
+flash as build-time, pre-gzipped static resources.
+
+1. **Asset pipeline.** `firmware/app/tools/embed_assets.py` gzips every file in `web/ui/`
+   deterministically (mtime 0, so an unchanged UI produces a byte-identical generated
+   header) into a `constexpr uint8_t[]` per asset, plus the
+   `http_resource_detail_static`/`HTTP_RESOURCE_DEFINE` pair that serves each one on
+   `qcWebService` with `Content-Encoding: gzip` and the right `Content-Type`.
+   `firmware/app/cmake/EmbedWebAssets.cmake` wires this into both `firmware/app`'s own
+   build and `tests/wifi_web_http` (which links the same header) as a CMake custom
+   command, depended on by the `app` target - so **editing a file under `web/ui/` needs no
+   firmware code change at all**, just a rebuild. Nothing is committed; the generated
+   header lives under the build directory.
+2. **`GET /api/presets.json` and `/ws` are unchanged** - still hand-written resources in
+   `QcWifiWebTransport.hpp`, independent of the embed step. Only `/` moved from the old
+   inline page onto the generated static resources (it's just one more entry in the same
+   table).
+3. **The client store speaks the board's real envelope**, not the richer one `web/poc/`
+   proposed: `web/ui/src/store.js` consumes exactly `snapshot`/`patch`/`tick` as
+   `QcLiveUpdateEnvelope.hpp` actually emits them (see "Live WebSocket updates" above) -
+   there's no "currently loaded preset" on this wire yet, so the UI shows the catalog plus
+   the last preset-change event's command/count, same as the inline page it replaces. A
+   second browser tab, refused a live WebSocket under the one-client policy, now falls
+   back to the same one-shot `GET /api/presets.json` the old inline page made, instead of
+   showing a blank list.
+4. **Vendored Lit** (`web/ui/vendor/lit.js`, `web/ui/tools/vendor-lit.mjs`) is this tree's
+   own pinned bundle, separate from `web/poc/vendor/lit.js` - firmware CI still needs no
+   Node; regenerating it is a manual, rarely-run step.
+
+### Parallel connections (PR #92's hardware blocker)
+
+The first build of this UI loaded nothing in Safari, and the owner's curl check from a Mac
+showed why: **sequential** requests for every asset returned 200 with the right gzip and
+`Content-Type`, but two or more **parallel** connections mostly failed - connection reset
+(curl 56), empty reply (52) or refused (7) - and in Safari's own waterfall the parallel
+requests (`vendor/lit.js`, `store-controller.js`, `qc-status.js`, `qc-preset-list.js`)
+simply hung pending forever, so the module graph never resolved. The old inline page hid
+this completely: it only ever made sequential requests on one keep-alive connection.
+
+Two separate limits, both now in `app/prj.conf` with the arithmetic written out there:
+
+1. **`CONFIG_ZVFS_POLL_MAX` was 3** (Zephyr's own default - the larger "6 if
+   `WIFI_NM_WPA_SUPPLICANT`" default doesn't apply to the NXP driver). Zephyr's HTTP
+   server watches all of its descriptors in one `zsock_poll()` call - 1 eventfd + the
+   listening socket + `CONFIG_HTTP_SERVER_MAX_CLIENTS` accepted sockets
+   (`subsys/net/lib/http/http_server_core.c`'s `HTTP_SERVER_SOCK_COUNT` and the
+   `zsock_poll()` in `http_server_run()`) - and every *active* descriptor needs one entry
+   in `zvfs_poll_internal()`'s `struct k_poll_event poll_events[CONFIG_ZVFS_POLL_MAX]`
+   (`lib/os/zvfs/zvfs_poll.c`), with `zsock_poll_prepare_ctx()` returning `-ENOMEM` the
+   moment it runs out (`subsys/net/lib/sockets/sockets_inet.c`). Three entries is eventfd
+   + listener + exactly **one** client. A second simultaneous connection therefore made
+   `poll()` fail, and `http_server_run()` treats that as fatal: `close_all_sockets()`
+   drops every live connection *and* the listening socket, then the thread re-inits after
+   `CONFIG_HTTP_SERVER_RESTART_DELAY` (1 s). Hence resets for connections already open,
+   and "connection refused" for anything that connects inside that 1 s window - and, for
+   a browser that keeps retrying, a livelock: every retry pair kills the server again.
+   `CONFIG_HTTP_SERVER_MAX_CLIENTS=4` was never the effective limit; **1** was.
+2. **`CONFIG_HTTP_SERVER_MAX_CLIENTS` was 4**, but a browser opens **six** connections per
+   host (Safari's and Chrome's own cap) and keeps them alive. With four client slots the
+   other two connections sit unaccepted in the TCP backlog, and since nothing closes a
+   keep-alive connection, they wait out
+   `CONFIG_HTTP_SERVER_CLIENT_INACTIVITY_TIMEOUT` (10 s then, 5 now - see round two below)
+   rather than being served. This
+   one is independently reproducible: with `ZVFS_POLL_MAX` fixed and `MAX_CLIENTS` left at
+   4, `tests/wifi_web_http`'s six-connection test still fails with exactly two of its six
+   assets never answered (`errno 11`, nothing received). ADR 0011's assumption that
+   over-limit requests would just wait briefly in the TCP backlog holds for one-shot
+   requests; it does not hold for a browser's keep-alive connections.
+
+`CONFIG_NET_MAX_CONTEXTS` (6) and `CONFIG_NET_MAX_CONN` (8) were also exactly consumed by
+a six-connection load - 1 listening socket + 6 accepted + 1 for the DHCPv4 client - with
+nothing left for a connection still in `TIME_WAIT` (`CONFIG_NET_TCP_TIME_WAIT_DELAY` is
+1500 ms, and a page reload closes and reopens all six at once). Either pool running empty
+sends an RST straight back at the next SYN (`subsys/net/ip/tcp.c`'s `tcp_conn_new()`
+failure path calls `net_tcp_reply_rst()`), which is the same curl 56 from a different
+cause, so both are raised too.
+
+Off-board coverage, in `tests/wifi_web_http`:
+`test_parallel_connections_each_get_their_asset` opens six connections *before* sending
+anything and requests one asset on each;
+`test_every_page_asset_loads_over_parallel_connections` fetches all nine of the UI's
+assets over those six keep-alive connections in two waves, the way the browser does.
+Against the pre-fix config the first reports `only 0 of 6 connections were accepted`, the
+second `only 3 of 6`, and the server stays down long enough that **every other
+socket test in the suite** then fails with `ECONNREFUSED` - 11 of 12 cases red. With the
+fix, 12 of 12 pass.
+
+Note that the suite's own `CONFIG_NET_MAX_CONTEXTS`/`NET_MAX_CONN`/`ZVFS_OPEN_MAX` are
+deliberately *larger* than the app's: both ends of the loopback connection live in the
+same image, so those pools have to hold six client sockets as well as the server's share.
+`CONFIG_ZVFS_POLL_MAX` and `CONFIG_HTTP_SERVER_MAX_CLIENTS` do mirror the app exactly -
+only the server polls and only the server accepts, so those are the app's real values
+under test. **This is why the bug was invisible off-board in the first place**: the suite
+had all five raised to the values Zephyr's own `tests/net/lib/http_server/core` uses, so it
+was exercising Zephyr's sample limits rather than this firmware's.
+
+The values quoted in this subsection are the ones round one landed on
+(`ZVFS_POLL_MAX=10`, `MAX_CLIENTS=6`, `NET_MAX_CONTEXTS=12`, `NET_MAX_CONN=16`); round two
+below raises four of them again and explains why. `firmware/app/prj.conf` is always
+authoritative.
+
+#### Round two: parked keep-alive connections
+
+The fix above got Chrome loading the page, and the owner's next hardware round showed the
+rest of the problem. **Chrome: fine.** **Safari: very slow, with `vendor/lit.js`,
+`store-controller.js`, `qc-status.js` and `qc-preset-list.js` still stuck pending** (two of
+them eventually completing, two never). The coordinator's parallel curl check, run while
+browser tabs were still open, came back *serialised in roughly one-second steps*: 0.115,
+0.115, 1.12, 1.16, 2.04, 2.05, 3.07, 3.09, 4.09 s - two connections served per second.
+
+That ladder is **client-side SYN retransmission**, not a timer on the board - no poll
+timeout, no `CONFIG_HTTP_SERVER_RESTART_DELAY`, no `k_sleep` of ours is involved. The chain:
+
+1. A browser that has *finished* loading does not close its connections. The server never
+   sends `Connection: close` (ADR 0011 noted this), so each of a browser's six connections
+   holds an HTTP client slot until `CONFIG_HTTP_SERVER_CLIENT_INACTIVITY_TIMEOUT` expires -
+   the timer is armed in `init_client_ctx()` and restarted on every data event
+   (`http_client_timer_restart()`), so an *idle* connection keeps its slot for the full
+   timeout after its last request.
+2. While every slot is taken, `handle_listen_pollin()` sets the listening socket's poll
+   events to 0 and the server stops accepting at all.
+3. Once the listening socket's own TCP backlog fills too, Zephyr stops even completing
+   handshakes: `tcp_backlog_is_full()` makes it **drop further SYNs outright** ("same
+   behavior as on Linux. Retransmitted SYN attempts may be successful later",
+   `subsys/net/ip/tcp.c`).
+4. So the client retransmits its SYN about once a second and gets in only as fast as slots
+   free up - exactly two per second in the measurement above, which is how many slots were
+   actually free behind the open browsers.
+
+Sizing `CONFIG_HTTP_SERVER_MAX_CLIENTS` to "what one page load needs" was the mistake in
+round one. The question is **how many connections are still parked when the next page load
+starts**: the owner had Chrome and Safari open at once (6 + 6), and a single browser
+reloading is the same shape. Chrome got its six in first and loaded fine; Safari queued
+behind them. That is the whole Chrome-vs-Safari difference - it is about arrival order and
+how many connections are already parked, not about either browser's HTTP implementation.
+(The coordinator's probe of six *silent* connections followed by a fast `main.js` fetch is
+consistent: connections that never send a request are accepted but their slots were
+evidently not all still held when that fetch went out.)
+
+One thing this fix depends on, confirmed in source and now asserted in the suite: **a
+WebSocket does not hold an HTTP client slot.**
+`handle_http1_to_websocket_upgrade()` calls `websocket_register()` and then
+`http_server_release_client()` (`subsys/net/lib/http/http_server_ws.c`), so the upgraded
+socket is handed to the application and the slot goes straight back. ADR 0011 claimed this
+and it holds. Chrome's open live-update socket is therefore *not* part of the pressure -
+only its six idle HTTP connections are. An upgrade does occupy a slot transiently, until
+that handoff, which is what the `+1` below is for.
+
+Two settings, and both levers were measured rather than guessed. **The `MAX_CLIENTS=13` in
+this table did not survive round three below** - it regressed the board and is now 8; the
+inactivity timeout is what carries the multi-browser case. `app/prj.conf` is always
+authoritative.
+
+| Setting | Was | Now | Why |
+| --- | --- | --- | --- |
+| `CONFIG_HTTP_SERVER_MAX_CLIENTS` | 6 | **13** (→ 8, round three) | 6 (first browser) + 6 (second, or the same one reloading) + 1 transient upgrade |
+| `CONFIG_HTTP_SERVER_CLIENT_INACTIVITY_TIMEOUT` | 10 | **5** | a parked slot recycles twice as fast - the backstop for a third client |
+| `CONFIG_ZVFS_POLL_MAX` | 10 | **16** | 1 + 1 + 13, same arithmetic as above |
+| `CONFIG_NET_MAX_CONTEXTS` | 12 | **20** | 1 listener + 13 accepted + DHCPv4, plus `TIME_WAIT` headroom |
+| `CONFIG_NET_MAX_CONN` | 16 | **24** | same, one 5-tuple handler per connection |
+
+**Why the timeout isn't cut further, which is the interesting result.** Shortening it alone
+(to 2 s, leaving `MAX_CLIENTS` at 6) *does* make the new test pass - but the second
+browser's WebSocket still waits a full timeout (2.46 s, versus 0.69 s with 13 slots), so
+the page is still visibly slow; and it **breaks
+`test_presets_json_on_same_keep_alive_connection` outright**, because the server now drops
+the connection in the gap between the page request and the script's own `fetch()` on it.
+That is a real keep-alive regression, not a test artifact. Hence slots as the primary fix,
+and 5 s (Zephyr's own `HTTP_SERVER_VERSION_3` default, comfortably longer than any gap
+inside one page load on a LAN) as the backstop rather than 2 s.
+
+Off-board coverage: `test_a_second_browsers_page_load_is_not_locked_out` parks six
+keep-alive connections *and* a WebSocket, then brings a second browser's six connections
+and six assets in while all of them are still open. At 6 slots the second browser's
+upgrade only gets in after a full 10 s inactivity timeout and the test fails; at 13 it
+connects in **0.69 s** with nothing waiting on a timer. (At the 8 slots round three settles
+on, it connects after one 5 s recycle instead - see that round's own note on the test's
+retuned bar.)
+
+#### Round three: the TCP window is a third of the whole buffer pool, per connection
+
+Round two made hardware **worse**: Chrome went from loading the page to hanging like Safari.
+The owner's waterfall on that build served `/` in 3.53 s and the next four files in 11-30 ms
+each, then stalled on the parallel wave - `vendor/lit.js` at 20.32 s, `qc-status.js` at
+20.00 s, `store-controller.js` at 21.20 s, and `qc-preset-list.js` **failed at 45.18 s with
+`net::ERR_CONNECTION_RESET` after "200 OK" and 0.1 kB transferred**. One module failing kills
+the whole import graph from `qc-app.js`, so the page never starts. Coordinator probes: single
+requests 200 in 0.08-0.11 s, but 9 in parallel gave one 200 and the rest 12 s timeouts, and a
+second round of the same probe gave 0 of 9.
+
+"200 OK, then a stall, then a reset mid-response" is not a slot problem - the connection was
+accepted and the response had started. And the fact that it got *worse* when
+`HTTP_SERVER_MAX_CLIENTS` went 6 → 13 says the binding resource scales with the number of
+connections **being served at once**, not with slots.
+
+It is the TCP window, and it is a one-line default in `subsys/net/ip/tcp.c`:
+
+```c
+static int tcp_tx_window =
+#if (CONFIG_NET_TCP_MAX_SEND_WINDOW_SIZE != 0)
+        CONFIG_NET_TCP_MAX_SEND_WINDOW_SIZE;
+#else
+        MIN((CONFIG_NET_BUF_TX_COUNT * CONFIG_NET_BUF_DATA_SIZE) / 3, UINT16_MAX);
+#endif
+```
+
+`CONFIG_NET_TCP_MAX_SEND_WINDOW_SIZE` defaults to 0, so the window is **one third of the
+entire TX buffer pool - and that value is used per connection** (`tcp_rx_window` is the same
+shape out of the RX pool). More than three concurrently-sending connections therefore
+oversubscribes the pool **by construction, at any pool size**: raising `NET_BUF_TX_COUNT`
+raises the per-connection window by exactly the same factor and changes nothing. The window
+has to be pinned.
+
+This board had `NET_BUF_TX_COUNT=36` - Zephyr's own `NET_PKT_LARGE_DEFAULTS` value, which is
+`default y if WIFI`, so it was never set by hand - and `NET_BUF_DATA_SIZE=128`. That is a
+**1536-byte window per connection against a 4608-byte pool**: 2× oversubscribed at 6 clients,
+**4.3× at 13**. TCP holds a segment's buffers until it is ACKed, so on a real Wi-Fi link
+(25-150 ms RTT, measured) they stay held for a whole round trip and the pool genuinely runs
+dry. The send then stalls; the response ends in a reset rather than an error the client can
+retry. And because Zephyr's HTTP server is a **single thread**, a stalled send blocks every
+other client too - which is why the whole wave serialises instead of just one request being
+slow.
+
+**Why `tests/wifi_web_http` passed this the whole way through, and the lesson from it.** Over
+loopback the RTT is microseconds: a buffer is allocated, sent, ACKed and freed before anything
+else needs it, so the pool is never actually oversubscribed and the suite passes at any
+window size. The suite's buffer counts were never the problem - the *absence of a round trip*
+was. That is the one class of bug this suite structurally cannot see, and it is worth
+remembering before trusting it about anything throughput- or timing-related: it is a protocol
+and resource-accounting harness, not a performance one.
+
+The budget, written out in `app/prj.conf` so it can be checked rather than tuned:
+
+| Setting | Was | Now | Why |
+| --- | --- | --- | --- |
+| `CONFIG_NET_TCP_MAX_SEND_WINDOW_SIZE` | 0 (→ 1536 derived) | **2048** | pinned, so it stops scaling with the pool |
+| `CONFIG_NET_TCP_MAX_RECV_WINDOW_SIZE` | 0 (→ 1536 derived) | **2048** | same |
+| `CONFIG_NET_BUF_TX_COUNT` | 36 (default) | **160** | 20 480 B = 1.25× the 8 × 2048 B worst case |
+| `CONFIG_NET_BUF_RX_COUNT` | 36 (default) | **96** | inbound is request headers and ACKs only |
+| `CONFIG_NET_PKT_TX_COUNT` | 16 | **24** | ~2 segments per connection in flight, plus ACKs |
+| `CONFIG_NET_PKT_RX_COUNT` | 16 | **24** | same |
+| `CONFIG_HTTP_SERVER_MAX_CLIENTS` | 13 | **8** | 6 (browser's cap) + 1 transient upgrade + 1 spare |
+| `CONFIG_ZVFS_POLL_MAX` | 16 | **10** | 1 + 1 + 8 |
+| `CONFIG_NET_MAX_CONTEXTS` | 20 | **14** | 1 listener + 8 accepted + DHCPv4 + `TIME_WAIT` |
+| `CONFIG_NET_MAX_CONN` | 24 | **18** | same |
+
+At a 2048-byte window and a 100 ms RTT that is ~20 KB/s per connection, so the largest asset
+(`vendor/lit.js`, 7 053 B gzipped) takes ~0.35 s and a whole six-file wave ~2 s even with the
+server serialising them.
+
+**`MAX_CLIENTS` comes back down to 8**, because 13 is what regressed the board. Parked idle
+connections cost a slot but no buffers; connections being *served* cost both, and the server
+accepts up to `MAX_CLIENTS`, so that number also caps how many sends can be in flight - it has
+to stay inside the window budget. Accepting more connections than the link can serve turns a
+queue into a stall. Two browsers at once is handled by recycling parked slots quickly (the 5 s
+inactivity timeout from round two) rather than by holding a slot open for each, so
+`test_a_second_browsers_page_load_is_not_locked_out` now holds the weaker but achievable bar
+of "served within one inactivity timeout" (it passes in 6.4 s) instead of "served
+immediately".
+
+#### Diagnostics build
+
+Two rounds of this were diagnosed from source plus a loopback suite and then found wrong on
+hardware, so `app/diagnostics.conf` exists to make the board report the numbers instead. It is
+not part of any normal build:
+
+```bash
+west build -b frdm_rw612 firmware/app -d build-diag --pristine \
+  -- -DEXTRA_CONF_FILE="wifi_credentials.conf;diagnostics.conf"
+```
+
+It turns on `NET_BUF_POOL_USAGE` (per-pool high-water marks and failed-allocation counts - a
+pool that ran dry becomes a number instead of a mysterious stall), `NET_STATISTICS_TCP`
+(retransmits and segment drops), the net shell (`net mem`, `net stats`, `net conn` on demand),
+`THREAD_ANALYZER` plus `STACK_SENTINEL` and `INIT_STACKS` (so a stack overflow is ruled in or
+out rather than guessed at - `zvfs_poll_internal()` puts a `k_poll_event[ZVFS_POLL_MAX]` array
+on the stack of whichever thread calls `poll()`, and the HTTP server thread's own stack is only
+`CONFIG_HTTP_SERVER_STACK_SIZE` = 3 072 B), and the HTTP server's own debug logging. Verified
+to build and link: 806 232 B RAM / 82.01% and 1 016 612 B flash on `frdm_rw612` STA.
+
+If a page load still stalls, `net mem` straight afterwards is the single most useful thing to
+capture - if the TX pool's high-water mark is at its limit or allocations failed, the window
+budget above is still too generous for the link.
+
+#### Cost
+
+Against `940271f` - this branch immediately before the parallel-connection work, rebased onto
+the same master (`80d2289`, so #94's dispatch queue is in both) - rebuilt the same way in the
+same local environment, with example credentials in a separate build tree:
+
+| Config | RAM/dram0 before → after | Flash before → after |
+| --- | --- | --- |
+| `frdm_rw612`, STA | 734 712 B / 74.74% → 778 472 B / 79.19% (**+43 760 B**) | 736 748 B → 736 740 B (**-8 B**) |
+| `frdm_rw612`, AP | 742 016 B / 75.48% → 785 832 B / 79.94% (**+43 816 B**) | 763 392 B → 763 392 B (**unchanged**) |
+| ESP32-S3, with PSRAM | `dram0` 219 504 B / 55.00% → 263 336 B / 65.98% (**+43 832 B**) | `irom0`+`drom0` 1 007 028 B → 1 007 060 B (**+32 B**) |
+| ESP32-S3, no PSRAM | `dram0` 334 080 B (**byte-identical**) | **byte-identical** |
+
+Every byte of the `frdm_rw612` STA delta is accounted for, from `nm` on the two
+`zephyr.elf`s - and two thirds of it is the buffer pools, which is the point:
+
+| Symbol | Delta | Why |
+| --- | --- | --- |
+| `net_buf_data_tx_bufs` | +15 872 B | 124 more TX data fragments @ 128 B - `NET_BUF_TX_COUNT` 36 → 160 |
+| `net_buf_data_rx_bufs` | +7 680 B | 60 more RX data fragments @ 128 B - `NET_BUF_RX_COUNT` 36 → 96 |
+| `server_ctx` | +5 696 B | 4 more `struct http_client_ctx` @ 1 424 B - `MAX_CLIENTS` 4 → 8 |
+| `_k_mem_slab_buf_tcp_conns_slab` | +5 504 B | 8 more `struct tcp` @ 688 B - `NET_MAX_CONTEXTS` 6 → 14 |
+| `_net_buf_tx_bufs` | +3 472 B | the 124 new TX buffers' own `struct net_buf` headers @ 28 B |
+| `_net_buf_rx_bufs` | +1 680 B | the 60 new RX buffers' headers |
+| `contexts` | +1 536 B | 8 more `struct net_context` @ 192 B |
+| `_k_mem_slab_buf_{tx,rx}_pkts` | +1 216 B | 8 more `struct net_pkt` each @ 76 B - `NET_PKT_*_COUNT` 16 → 24 |
+| `conns` | +720 B | 10 more `struct net_conn` @ 72 B - `NET_MAX_CONN` 8 → 18 |
+| `fdtable` | +384 B | 8 more fd slots @ 48 B |
+| **total** | **+43 760 B** | matches the measured RAM delta exactly |
+
+`CONFIG_ZVFS_POLL_MAX`, the pinned window sizes and the inactivity timeout all cost **no
+static RAM**: the first sizes a stack array in whichever thread calls `poll()`, the other
+three are plain integers. The no-PSRAM ESP32-S3 config doesn't move because it never enables
+networking in the first place (`prj_nopsram.conf`).
+
+ADR 0010's RAM tables are unaffected in their conclusions: the `frdm_rw612` still has ~200 KB
+of its 960 KB free (~193 KB in AP mode) and the PSRAM ESP32-S3 ~133 KB of `dram0`. ADR 0011
+decision 2's bundler would not have fixed any of this either - one bundle plus the page is
+still two parallel requests, two parked keep-alive connections hold slots as long as six, and
+a single 7 KB bundle against a 1 536-byte window stalls exactly the same way. It *would* cut
+the number of concurrent connections a page load needs, which is worth remembering as a
+second-order lever if the window budget above still proves too generous for the link.
+
+### Dev loop
+
+```sh
+node web/ui/tools/mock-server.mjs              # http://localhost:8080/
+node web/ui/tools/mock-server.mjs --max-ws-clients 1   # exercise the second-tab fallback
+```
+
+Edit a file under `web/ui/`, reload - no reflash. `?board=<ip>` points the page's
+WebSocket (and its HTTP fallback fetch) at a real board while still serving the UI from
+the Mac. See `web/ui/README.md`.
+
+### Size report
+
+```sh
+python3 firmware/app/tools/embed_assets.py --ui-dir web/ui --out /tmp/qc_web_assets.hpp
+```
+
+Measured 2026-11-10, gzip level 9, 9 assets: **17 096 B total** (vendored Lit 3.3.3 alone:
+7 053 B) - under ADR 0011's 20 221 B PoC-era estimate, mostly because this tree ships one
+fewer component (no Milestone 3 knob probe) and a 4-symbol Lit bundle instead of 8.
+
+### Verified
+
+`west twister -p qemu_cortex_m3 -p mps2/an385 -K -T firmware/app/tests` (on the
+rebase onto `80d2289`): all 24 configurations build, 248 of 250 cases pass, and the only
+failure is `firmware.live_updates` on `qemu_cortex_m3`, the same
+pre-existing RAM-limitation timeout issue #75's own build already has on that platform
+(not caused by this issue; that suite has its own `prj.conf`, untouched by the settings
+above, and `mps2/an385` and `native_sim` are what CI actually gates on).
+`wifi_web_http` itself: **13/13** cases pass on `mps2/an385` (it's skipped on
+`qemu_cortex_m3` for RAM overflow, as `preset_transport` and `dispatch_queue` are).
+
+New Ztest coverage in `tests/wifi_web_http`: the generated asset table is present and
+sane (every entry starts with the gzip magic, `/` and `/vendor/lit.js` both present), `/`
+is served with `Content-Encoding: gzip` and actually inflates (via
+`qcbridge::gzip::inflate()`, the same decoder the firmware uses for compressed device
+messages) to the real page, and `/vendor/lit.js` likewise. Plus the three
+connection-concurrency tests described under "Parallel connections" above.
+
+Clean builds with example credentials in a separate build tree (this worktree's real
+`wifi_credentials.conf` was never created, read or committed), compared against `fd08b49`
+(PR #90's tip, current master) rebuilt the same way in the same local environment:
+
+| Config | RAM/dram0 before → after | Flash/(irom0+drom0) before → after |
+| --- | --- | --- |
+| `frdm_rw612`, STA | 734048 B / 74.67% → 734048 B / 74.67% (**unchanged**) | 722304 B → 736096 B (**+13 792 B**) |
+| `frdm_rw612`, AP | 741352 B / 75.41% → 741352 B / 75.41% (**unchanged**) | 748948 B → 762740 B (**+13 792 B**) |
+| ESP32-S3, with PSRAM (`CONFIG_BUILD_ONLY_NO_BLOBS=y`, matching CI) | `dram0` 195464 B → 195688 B (**+224 B**) | `irom0`+`drom0` 538276 B → 551844 B (**+13 568 B**) |
+| ESP32-S3, no PSRAM | `dram0` 333424 B (unchanged) | `irom0`+`drom0` 131460 B (unchanged) |
+
+RAM barely moves anywhere (the no-PSRAM config not at all: Wi-Fi is off there, so
+`QcWifiWebTransport` - and the generated web asset header it `#include`s - is never
+compiled in at all). The ~13.6-13.8 KB flash increase on every Wi-Fi-enabled config is
+consistent across boards and close to the generated header's own 17 096 B of gzipped
+payload minus the inline `kIndexHtml` page it replaced - exactly ADR 0011's own claim that
+this decision "costs flash and no RAM" (static resources send straight from flash). The
+ESP32-S3 PSRAM baseline measured here (538 276 B) differs slightly from PR #90's own
+CI-measured 546 580 B - environment/toolchain drift between this local build and CI's
+pinned SDK, confirmed unrelated to this issue by rebuilding `fd08b49` itself locally first
+and diffing against that, not against PR #90's own numbers directly. The `frdm_rw612`
+numbers, by contrast, reproduce PR #90's CI figures exactly.
+
+### Smoke test (owner - can't run hardware or a browser myself)
+
+1. Flash in either mode. From a Mac on the same network, confirm **parallel** asset
+   requests all succeed - this is the check PR #92's blocker failed, and the one a
+   sequential check can't catch:
+
+   ```sh
+   BOARD=192.168.4.1   # or the station-mode IP
+   for p in / /manifest.webmanifest /src/main.js /src/store.js /src/store-controller.js \
+            /src/qc-app.js /src/qc-status.js /src/qc-preset-list.js /vendor/lit.js; do
+     curl -s -o /dev/null --compressed -w "%{http_code} %{url_effective}\n" "http://$BOARD$p" &
+   done; wait
+   ```
+
+   All nine lines must read `200`. In round one most came back `000` (curl exit 56/52/7);
+   in round two they came back `200` but **serialised in ~1 s steps**, so check the times
+   too - every line should land inside a few hundred milliseconds of the others, not in
+   pairs a second apart. Run this with **no browser tabs open on the board**, then again
+   with one browser tab open, since parked keep-alive connections were the round-two
+   cause.
+2. **Safari alone, no other browser open.** Quit Chrome (or close its board tabs) first,
+   then load the board's URL in Safari: the full preset catalog renders (folders, 48
+   presets) and the status line reads "Waiting for a preset change…" until the first one
+   arrives. In Web Inspector → Network, all nine files must reach **Completed** - none
+   left pending, and no file sitting for seconds. Reload once with the inspector open
+   (that closes and reopens a whole browser's worth of connections at once, which
+   exercises the `TIME_WAIT` headroom).
+3. **Safari with Chrome also open on the board** - this is the round-two case, and the one
+   that was broken. Load the board in Chrome first and leave the tab open (it holds six
+   keep-alive connections plus the live WebSocket), *then* load it in Safari. Safari must
+   still render the full catalog promptly with all nine files Completed. Then reload
+   Chrome's tab while Safari stays open, and confirm Chrome recovers the same way. If
+   either browser is slow or leaves files pending, grab the board's log for the window -
+   `Websocket client ... connected`/`closed` lines and their timestamps show whether
+   something is waiting out an inactivity timeout.
+4. Switch presets on the unit: within a couple of seconds the status line updates to
+   "Preset change (cmd N, #M)" without a reload - same timing bar as issue #75's own smoke
+   test (a *second* change a few seconds later must update just as fast, not wait up to a
+   minute).
+5. On an **iPhone** (Safari), load the same URL, then **Share → Add to Home Screen**.
+   Reopen from the home screen icon: confirm it opens `display: standalone` (no Safari
+   chrome), the status bar area isn't drawn over by the header, there's no
+   double-tap-to-zoom delay on the list, and no rubber-band bounce at the top/bottom of
+   the page.
+6. Open a **second browser tab/window** to the same URL while the first stays open:
+   confirm it shows the full catalog immediately (via its own `GET /api/presets.json`,
+   not a blank list) even though its WebSocket never connects (same retry-on-backoff
+   behaviour issue #75 already documented above). Close the first tab; the second's next
+   retry should connect and start showing live updates.
+7. Confirm the page still looks and behaves as before for anything issue #75's own smoke
+   test already covered (tick heartbeat with no console error, `GlobalTempo` never showing
+   up as a false preset change).
 
 ## Not yet done
 

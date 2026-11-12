@@ -85,8 +85,9 @@ inline void encodeTickEnvelope(uint32_t seq, etl::vector<char, N>& out) {
 }
 
 // The one inbound message this issue needs: {"v":1,"t":"resync"}, sent by
-// the page's own JS (see QcWifiWebTransport.hpp's kIndexHtml) after it
-// detects a seq gap. Deliberately a substring check, not a JSON parser -
+// the page's own JS (web/ui/src/store.js, issue #88 - originally
+// QcWifiWebTransport.hpp's inline kIndexHtml, removed by that issue) after
+// it detects a seq gap. Deliberately a substring check, not a JSON parser -
 // this firmware only ever needs to recognize its own client's one
 // outbound message shape, serialized exactly that way by a fixed call to
 // JSON.stringify(), not arbitrary client input.
