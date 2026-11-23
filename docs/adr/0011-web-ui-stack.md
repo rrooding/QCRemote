@@ -342,7 +342,9 @@ fixture's preset names are invented for the same reason.
 5. **Preset switching is confirmed, not optimistic.** The row shows a pending state until the
    board reports its own new state, with a timeout that surfaces the failure rather than
    silently reverting.
-6. **JSON on the wire**, in a versioned envelope `{"v":1,"t":"<type>","seq":N,...}`, with
+6. _Refined by [ADR 0012](0012-web-api-contract.md): there is no `v` field (a `build` id in
+   the snapshot instead), and the full contract lives in [`docs/api/`](../api/README.md)._
+   **JSON on the wire**, in a versioned envelope `{"v":1,"t":"<type>","seq":N,...}`, with
    unknown message types ignored by the client so the board can add messages without breaking
    a page served from older flash. Binary is reserved for a future high-rate numeric stream,
    as a purpose-built fixed-layout frame on a WebSocket binary opcode - not CBOR, MessagePack
