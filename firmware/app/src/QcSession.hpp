@@ -347,6 +347,29 @@ private:
         }
     }
 
+    // Issue #99: a new connection (first connect or a replug, maybe of a
+    // different unit) starts knowing no Current preset. Done here, before
+    // the handshake, rather than at the File READ where the Catalog is
+    // reset: the post-connect state READ's SetlistPosition reply arrives
+    // before that and must survive it. The old Catalog stops being one a
+    // new position can resolve against, so until the new listing is
+    // published the page shows no Current preset rather than this unit's
+    // slot named from the last unit's Catalog. Not unit-tested: QcSession
+    // has no seam without the USB host stack; tests/web_api_session covers
+    // what the page does with the empty Current preset.
+    void forgetPreviousUnit() {
+        {
+            ScopedKMutex lock(fileStreamMutex_);
+            haveSetlistPosition_ = false;
+            setlistFolderKey_.clear();
+            setlistSlot_ = 0;
+            catalogPublished_ = false;
+        }
+        for (auto* transport : transports_) {
+            transport->publishCurrentPreset(QcCurrentPreset{});
+        }
+    }
+
     // Call with fileStreamMutex_ held, once the listing is complete.
     QcCurrentPreset currentPresetLocked() const {
         if (!haveSetlistPosition_) {
@@ -357,14 +380,17 @@ private:
     }
 
     // Heartbeat thread only - see deviceConnected() for why the Link isn't
-    // published where it changes.
+    // published where it changes. Runs after this tick's KeepAlive is sent,
+    // and stays off the time-sensitive budget anyway: no log and no lock
+    // here, and publishLink() is lock-free by contract
+    // (QcPresetTransport.hpp) - QcWifiWebTransport logs the change from its
+    // own worker thread.
     void publishLinkIfChanged() {
         const bool up = linkUp_.load(std::memory_order_relaxed);
         if (up == publishedLinkUp_) {
             return;
         }
         publishedLinkUp_ = up;
-        LOG_INF("Link %s", up ? "up" : "down");
         for (auto* transport : transports_) {
             transport->publishLink(QcLinkState{.qcConnected = up});
         }
@@ -378,6 +404,8 @@ private:
     }
 
     void runHandshake() {
+        forgetPreviousUnit();
+
         // Starts the heartbeat first, before any handshake message - see
         // this class's header comment for why.
         startHeartbeat();

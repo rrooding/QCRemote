@@ -30,9 +30,9 @@ struct QcLinkState {
 // QcSession or QcPresetCatalog directly - QcSession hands it only the
 // snapshot/event types below.
 //
-// QcSession calls these synchronously from its own heartbeat/dispatcher
-// threads and they must never block or do real work inline - same contract
-// as QcPresetPrinter::requestPrint(): an implementation that needs to do
+// QcSession calls these synchronously from its own heartbeat/dispatcher/
+// handshake threads and they must never block or do real work inline - same
+// contract as QcPresetPrinter::requestPrint(): an implementation that needs to do
 // anything beyond a fast copy/enqueue (serializing JSON, writing to a
 // socket) must hand off to a thread of its own. Multiple transports can be
 // registered at once (QcSession::addTransport()) so Wi-Fi and a future BLE
@@ -52,10 +52,15 @@ public:
     // Called whenever the Quad Cortex reports a preset position (a
     // SetlistPosition message), and again with each new Catalog, since the
     // same position can name a different Catalog entry after a re-read.
-    // May repeat an unchanged value.
+    // Also called with an empty one as each new connection starts, before
+    // that unit has reported anything. May repeat an unchanged value.
     virtual void publishCurrentPreset(const QcCurrentPreset& current) = 0;
 
-    // Called when the Quad Cortex is claimed on USB or goes away.
+    // Called when the Quad Cortex is claimed on USB or goes away, from
+    // QcSession's KeepAlive heartbeat thread on every tick that sees the
+    // change. Stricter than the calls above: no lock and no logging at all
+    // (CODING_STANDARDS.md, "Time-sensitive code") - an atomic store and a
+    // semaphore give, say.
     virtual void publishLink(const QcLinkState& link) = 0;
 };
 

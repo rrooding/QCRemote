@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <optional>
@@ -181,12 +182,11 @@ public:
         k_sem_give(&wakeSem_);
     }
 
+    // Lock-free, unlike the two above: QcSession calls this on its KeepAlive
+    // heartbeat thread (QcPresetTransport.hpp), where dataMutex_ - held by
+    // the worker while it encodes a snapshot - must not be waited for.
     void publishLink(const QcLinkState& link) override {
-        {
-            ScopedKMutex lock(dataMutex_);
-            link_ = link;
-            linkDirty_ = true;
-        }
+        pendingLink_.store(link.qcConnected ? PendingLink::Up : PendingLink::Down, std::memory_order_release);
         k_sem_give(&wakeSem_);
     }
 
@@ -298,10 +298,13 @@ private:
                 currentDirty_ = false;
                 current = current_;
             }
-            if (linkDirty_) {
-                linkDirty_ = false;
-                link = link_;
-            }
+        }
+        const PendingLink pendingLink = pendingLink_.exchange(PendingLink::None, std::memory_order_acquire);
+        if (pendingLink != PendingLink::None) {
+            link = QcLinkState{.qcConnected = pendingLink == PendingLink::Up};
+            // Logged here, not where QcSession publishes it: that's the
+            // KeepAlive heartbeat thread.
+            LOG_INF("Link %s", link->qcConnected ? "up" : "down");
         }
         send(snapshot);
         if (current) {
@@ -760,7 +763,7 @@ private:
     k_sem wakeSem_{};
 
     // Guards what QcSession and the HTTP server thread hand over: the
-    // latest Catalog, Current preset and Link, and newly upgraded sockets.
+    // latest Catalog and Current preset, and newly upgraded sockets.
     // Member storage, not stack - CODING_STANDARDS.md's "big objects never
     // go on a thread's stack" rule and ADR 0008's own reasoning.
     k_mutex dataMutex_{};
@@ -768,9 +771,12 @@ private:
     bool catalogDirty_ = false;
     QcCurrentPreset current_;
     bool currentDirty_ = false;
-    QcLinkState link_;
-    bool linkDirty_ = false;
     etl::vector<int, kMaxWsContexts> newSockets_;
+
+    // The Link, handed over without dataMutex_ (see publishLink()): the
+    // latest value not yet forwarded, value and "changed" in one atomic.
+    enum class PendingLink : uint8_t { None, Down, Up };
+    std::atomic<PendingLink> pendingLink_{PendingLink::None};
 
     // qc_wifi_web's own: the protocol state and its frame buffers, the live
     // page's socket, and the buffer one inbound frame is read into

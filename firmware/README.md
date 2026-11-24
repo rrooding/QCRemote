@@ -1978,7 +1978,9 @@ browser no longer retries forever (see "One page at a time" below).
   hardware** - a position that doesn't resolve logs
   `Current preset (folder "...", slot N) isn't in the Catalog`.
 - **The Link** is `qcConnected`: up when the Quad Cortex is claimed, down on removal, published
-  from the heartbeat thread (`Link up`/`Link down` in the log).
+  from the heartbeat thread without a lock (an atomic hand-off), and logged as `Link up`/
+  `Link down` by the web worker. A new connection also starts with no Current preset, so a
+  replug never shows the previous unit's.
 - **One page at a time.** A new WebSocket replaces the old one, which is closed with code 4001.
   `CONFIG_WEBSOCKET_MAX_CONTEXTS` is 2, so the new page can upgrade while the old one is still
   open; the two contexts share one receive buffer, which is safe because only the worker
