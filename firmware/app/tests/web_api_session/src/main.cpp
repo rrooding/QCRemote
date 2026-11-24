@@ -80,6 +80,20 @@ void assertNoFrame(const std::optional<std::string_view>& frame) {
 
 }  // namespace
 
+// The session starts from a hand-written copy of this, so the two must not
+// drift apart.
+ZTEST(web_api_session, test_the_empty_catalog_is_what_the_encoder_makes_of_an_empty_incomplete_one) {
+    static QcCatalogSnapshot empty;
+    empty.incomplete = true;
+    static etl::vector<char, QcWebApiSession::kCatalogJsonCapacity> json;
+    json.clear();
+
+    encodeCatalogJson(empty, json);
+
+    zassert_equal(std::string_view(json.data(), json.size()), QcWebApiSession::kEmptyCatalogJson,
+                  "encoder: %.*s", static_cast<int>(json.size()), json.data());
+}
+
 ZTEST(web_api_session, test_a_page_connecting_before_the_listing_gets_the_empty_snapshot) {
     QcWebApiSession& session = freshSession();
 
@@ -146,6 +160,25 @@ ZTEST(web_api_session, test_a_tick_goes_out_only_after_the_interval_with_nothing
     assertFrame(session.timePassed(9000), R"({"t":"tick","seq":2})");
     assertNoFrame(session.timePassed(13999));
     assertFrame(session.timePassed(14000), R"({"t":"tick","seq":3})");
+}
+
+// docs/api/README.md, "Liveness": at least one message every 5 s. The
+// transport sleeps no longer than this, so the tick goes out when due
+// rather than up to one poll interval late.
+ZTEST(web_api_session, test_the_time_until_the_next_tick_counts_from_the_last_message_sent) {
+    QcWebApiSession& session = freshSession();
+    zassert_false(session.msUntilTickDue(0).has_value(), "no page, no tick to wait for");
+
+    (void)session.connectionOpened(1000);
+    zassert_equal(session.msUntilTickDue(1000), 5000);
+    zassert_equal(session.msUntilTickDue(4800), 1200);
+    (void)session.linkChanged(QcLinkState{.qcConnected = true}, 4800);
+    zassert_equal(session.msUntilTickDue(4800), 5000);
+    zassert_equal(session.msUntilTickDue(9800), 0);
+    zassert_equal(session.msUntilTickDue(12000), 0, "an overdue tick is due now, not negative");
+
+    session.connectionClosed();
+    zassert_false(session.msUntilTickDue(12000).has_value());
 }
 
 ZTEST(web_api_session, test_an_unchanged_current_preset_or_link_sends_nothing) {

@@ -38,15 +38,18 @@ public:
     static constexpr size_t kEnvelopeOverhead = 256;
     using Frame = etl::vector<char, kCatalogJsonCapacity + kEnvelopeOverhead>;
 
+    // The Catalog before the first listing: what encodeCatalogJson() makes
+    // of an empty, incomplete snapshot (tests/web_api_session checks that),
+    // written out because a QcCatalogSnapshot is too big to build on the
+    // stack just for this.
+    static constexpr std::string_view kEmptyCatalogJson =
+        R"({"generation":0,"presetCount":0,"incomplete":true,"folders":[]})";
+
     // `build` must outlive this object (in the firmware it's a generated
     // constant, see cmake/EmbedWebAssets.cmake).
     QcWebApiSession(std::string_view build, int64_t tickIntervalMs)
         : build_(build), tickIntervalMs_(tickIntervalMs) {
-        // What encodeCatalogJson() makes of an empty, incomplete snapshot -
-        // written out because a QcCatalogSnapshot is too big to build on
-        // the stack just for this.
-        detail::appendLiteral(R"({"generation":0,"presetCount":0,"incomplete":true,"folders":[]})",
-                              catalogJson_);
+        detail::appendLiteral(kEmptyCatalogJson, catalogJson_);
     }
 
     // A page's WebSocket opened: it gets a snapshot right away.
@@ -115,6 +118,18 @@ public:
         }
         encodeTickMessage(nextSeq_++, frame_);
         return sent(nowMs);
+    }
+
+    // How long until timePassed() would send a tick (0 when one is due
+    // already), or nothing without a page. A transport that waits no longer
+    // than this between calls keeps the contract's "a message at least
+    // every tick interval" exact instead of late by its own poll period.
+    std::optional<int64_t> msUntilTickDue(int64_t nowMs) const {
+        if (!open_) {
+            return std::nullopt;
+        }
+        const int64_t remaining = lastSentMs_ + tickIntervalMs_ - nowMs;
+        return remaining > 0 ? remaining : 0;
     }
 
 private:
