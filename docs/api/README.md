@@ -147,7 +147,9 @@ There is no protocol version number. The page and the firmware are built into th
 so they can only disagree when a page that was loaded *before* a firmware update reconnects
 to the new firmware. The page's reconnect logic makes this likely, not rare.
 
-- `snapshot.build` is the firmware's build id, the git commit it was built from.
+- `snapshot.build` is the firmware's build id, the git commit it was built from, with
+  `-dirty` appended when it was built from uncommitted changes (`unknown` outside a git
+  checkout).
 - The page has the same id baked in by the asset embed step at build time.
 - When they differ, the page calls `location.reload()` and doesn't apply the snapshot.
   To guard against a reload loop (an asset cache that ignores `no-cache`), it reloads at most

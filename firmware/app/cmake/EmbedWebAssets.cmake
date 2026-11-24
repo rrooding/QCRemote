@@ -30,8 +30,8 @@ function(qc_embed_web_assets target)
 
   # Issue #99: runs on every build, not only when a file under web/ui
   # changes, because the build id it stamps into the page and the firmware
-  # (qc_build_id_generated.hpp, web/ui/src/build.js) is the git commit, and
-  # a new commit touches nothing here. The script only rewrites a header
+  # (qc_build_id_generated.hpp, web/ui/src/build.js) is the git commit
+  # (plus -dirty), and a new commit or an edit elsewhere touches nothing here. The script only rewrites a header
   # whose content changed, and BYPRODUCTS lets Ninja see that (restat), so
   # an unchanged build recompiles nothing.
   add_custom_target(${target}_qc_web_assets

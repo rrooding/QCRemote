@@ -69,14 +69,21 @@ BUILD_ID_PATTERN = re.compile(r"^[0-9A-Za-z._+-]{1,40}$")
 
 
 def git_build_id(repo: Path) -> str:
-    """The short commit hash of HEAD, or "unknown" outside a usable git
-    checkout (a source tarball, or a container that can't see .git).
+    """The short commit hash of HEAD, with "-dirty" appended when tracked
+    files differ from it (so a build of uncommitted changes never shares an
+    id with the commit's own build, and the page still reloads onto it), or
+    "unknown" outside a usable git checkout (a source tarball, or a
+    container that can't see .git). Tags are excluded so the id is always
+    the hash, never a tag name of unbounded length.
 
     safe.directory: a CI container often runs as a different user than the
     one owning the bind-mounted checkout, and git then refuses to read it."""
     try:
         result = subprocess.run(
-            ["git", "-c", "safe.directory=*", "-C", str(repo), "rev-parse", "--short=7", "HEAD"],
+            [
+                "git", "-c", "safe.directory=*", "-C", str(repo),
+                "describe", "--always", "--dirty", "--abbrev=7", "--exclude=*",
+            ],
             capture_output=True,
             text=True,
             check=True,

@@ -83,7 +83,7 @@
     },
 
     "build": {
-      "description": "Identifies the firmware image (and therefore the page) the Board is running: the git commit it was built from. The page has its own build id baked in at build time and reloads itself when they differ.",
+      "description": "Identifies the firmware image (and therefore the page) the Board is running: the git commit it was built from, with -dirty appended for uncommitted changes. The page has its own build id baked in at build time and reloads itself when they differ.",
       "type": "string",
       "minLength": 1,
       "maxLength": 40,
