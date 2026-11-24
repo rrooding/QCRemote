@@ -157,6 +157,28 @@ test('a rejected switchPreset gets an error with its id', async () => {
   page.ws.close();
 });
 
+// Read from the source rather than provoked one by one: qcDisconnected, for
+// one, needs a fixture whose link is down, and a code added later should be
+// caught without a test written for it.
+test('every error code the mock can send is in the schema', () => {
+  const schema = JSON.parse(
+    readFileSync(join(examplesDir, '..', 'schema', 'server-message.schema.json'), 'utf8')
+  );
+  const allowed = schema.$defs.error.properties.code.enum;
+  const source = readFileSync(join(here, '..', 'tools', 'mock-server.mjs'), 'utf8');
+  const fromSource = [...source.matchAll(/sendError\(\s*'([^']*)'/g)].map((m) => m[1]);
+  const defaultFixture = JSON.parse(readFileSync(join(here, '..', 'fixtures', 'session.json'), 'utf8'));
+  const fromFixtures = [defaultFixture, fixture]
+    .flatMap((f) => f.script ?? [])
+    .filter((event) => event.error)
+    .map((event) => event.error.code);
+
+  assert.ok(fromSource.length >= 4, `found only ${fromSource} in mock-server.mjs`);
+  for (const code of [...fromSource, ...fromFixtures]) {
+    assert.ok(allowed.includes(code), `${code} is not one of ${allowed.join(', ')}`);
+  }
+});
+
 test('a newer page replaces the older one with close code 4001', async () => {
   const older = connect();
   await older.until((c) => c.messages.length >= 1);
