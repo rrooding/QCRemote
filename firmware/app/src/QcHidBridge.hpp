@@ -77,6 +77,7 @@ protected:
     void onRemoved() override {
         LOG_INF("Quad Cortex Mini disconnected");
         partialReport_.clear();
+        session_.deviceRemoved();
     }
 
     void onReportIn(std::span<const uint8_t> transfer) override {

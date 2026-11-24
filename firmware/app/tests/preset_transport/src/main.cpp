@@ -43,8 +43,8 @@ QcCatalogSnapshot& freshSnapshot() {
 // issue #71's seam proof: a transport that only needs plain fields - no
 // Zephyr/Wi-Fi/HTTP dependency at all - standing in for a real
 // QcWifiWebTransport (or a future BLE one) to show QcSession's own
-// addTransport()/publishCatalog()/publishPresetChange() call pattern works
-// against nothing but this interface.
+// addTransport()/publishCatalog()/publishCurrentPreset()/publishLink() call
+// pattern works against nothing but this interface.
 class FakeTransport : public QcPresetTransport {
 public:
     void publishCatalog(const QcCatalogSnapshot& snapshot) override {
@@ -54,24 +54,29 @@ public:
         lastIncomplete = snapshot.incomplete;
     }
 
-    void publishPresetChange(const QcPresetChangeEvent& event) override {
-        ++presetChangeCount;
-        lastChangeCommand = event.command;
-        lastChangeCount = event.count;
+    void publishCurrentPreset(const QcCurrentPreset& current) override {
+        ++currentPublishCount;
+        lastCurrent = current;
+    }
+
+    void publishLink(const QcLinkState& link) override {
+        ++linkPublishCount;
+        lastLink = link;
     }
 
     size_t catalogPublishCount = 0;
-    size_t presetChangeCount = 0;
+    size_t currentPublishCount = 0;
+    size_t linkPublishCount = 0;
     size_t lastPresetCount = 0;
     uint32_t lastGeneration = 0;
     bool lastIncomplete = false;
-    uint16_t lastChangeCommand = 0;
-    uint32_t lastChangeCount = 0;
+    QcCurrentPreset lastCurrent;
+    QcLinkState lastLink;
 };
 
 }  // namespace
 
-ZTEST(preset_transport, test_fake_transport_receives_catalog_and_change_events) {
+ZTEST(preset_transport, test_fake_transport_receives_catalog_current_preset_and_link) {
     QcPresetCatalog& catalog = freshCatalog();
     addPreset(catalog, "my-presets", "My Presets", "Practice 1", 0);
     addPreset(catalog, "my-presets", "My Presets", "Dark Jazz", 1);
@@ -93,7 +98,8 @@ ZTEST(preset_transport, test_fake_transport_receives_catalog_and_change_events) 
         transport->publishCatalog(snapshot);
     }
     for (auto* transport : transports) {
-        transport->publishPresetChange(QcPresetChangeEvent{.command = 9, .count = 3});
+        transport->publishCurrentPreset(findCurrentPreset(catalog, "my-presets", 1));
+        transport->publishLink(QcLinkState{.qcConnected = true});
     }
 
     zassert_equal(wifi.catalogPublishCount, 1);
@@ -101,10 +107,13 @@ ZTEST(preset_transport, test_fake_transport_receives_catalog_and_change_events) 
     zassert_equal(wifi.lastPresetCount, 2);
     zassert_equal(wifi.lastGeneration, snapshot.generation);
     zassert_false(wifi.lastIncomplete);
-    zassert_equal(wifi.presetChangeCount, 1);
-    zassert_equal(wifi.lastChangeCommand, 9);
-    zassert_equal(wifi.lastChangeCount, 3);
-    zassert_equal(ble.presetChangeCount, 1);
+    zassert_equal(wifi.currentPublishCount, 1);
+    zassert_true(wifi.lastCurrent.has_value());
+    zassert_equal(wifi.lastCurrent->name, "Dark Jazz");
+    zassert_equal(wifi.linkPublishCount, 1);
+    zassert_true(wifi.lastLink.qcConnected);
+    zassert_equal(ble.currentPublishCount, 1);
+    zassert_equal(ble.linkPublishCount, 1);
 }
 
 ZTEST(preset_transport, test_copy_catalog_snapshot_basic) {

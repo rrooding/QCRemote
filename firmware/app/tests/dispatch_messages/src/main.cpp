@@ -333,6 +333,57 @@ ZTEST(dispatch_messages, test_message_tally_stop_blocks_further_records_until_re
     zassert_equal(tally.otherCount(), 0u, "otherCount must reset on restart too");
 }
 
+// Issue #75's tally-forwarding fix, moved here from tests/live_updates when
+// that suite became tests/web_api_session (issue #99).
+ZTEST(dispatch_messages, test_preset_change_commands_are_classified_per_QcMessageTally_own_list)
+{
+    // RecallPreset, Scene, Grid, RecentsFavorites, PresetDirty,
+    // SetlistPosition - QcMessageTally.hpp's own documented list.
+    zassert_true(isPresetChangeCommand(kCommandRecallPreset));
+    zassert_true(isPresetChangeCommand(kCommandGrid));
+    zassert_true(isPresetChangeCommand(kCommandRecentsFavorites));
+    zassert_true(isPresetChangeCommand(13));  // Scene
+    zassert_true(isPresetChangeCommand(34));  // PresetDirty
+    zassert_true(isPresetChangeCommand(2));   // SetlistPosition
+
+    // GlobalTempo (33) is the continuously-streaming command the 5068403
+    // smoke test's "command=33" lines are about - must stay throttled.
+    zassert_false(isPresetChangeCommand(33));
+    zassert_false(isPresetChangeCommand(17));  // MasterVolume
+}
+
+ZTEST(dispatch_messages, test_a_brand_new_command_always_forwards)
+{
+    zassert_true(shouldForwardTallyEntry(/*isNew=*/true, /*bumped=*/false, /*intervalDue=*/false, 33));
+}
+
+ZTEST(dispatch_messages, test_a_repeat_preset_change_forwards_even_when_the_window_is_not_due)
+{
+    // The issue #75 fix: a real preset switch (RecallPreset) must not wait
+    // for the shared intervalDue window GlobalTempo's own ~4/s ticking
+    // keeps resetting - the 5068403 smoke test's "command=33 count=2" ->
+    // "count=170" a minute apart.
+    zassert_true(shouldForwardTallyEntry(/*isNew=*/false, /*bumped=*/true, /*intervalDue=*/false,
+                                         kCommandRecallPreset));
+}
+
+ZTEST(dispatch_messages, test_a_repeat_continuous_command_stays_throttled)
+{
+    // GlobalTempo bumping without the window being due must NOT forward -
+    // otherwise this fix would turn its own ~4/s ticking back into a
+    // reprint on every heartbeat, the exact thing intervalDue exists to
+    // prevent.
+    zassert_false(shouldForwardTallyEntry(/*isNew=*/false, /*bumped=*/true, /*intervalDue=*/false, 33));
+    zassert_true(shouldForwardTallyEntry(/*isNew=*/false, /*bumped=*/true, /*intervalDue=*/true, 33));
+}
+
+ZTEST(dispatch_messages, test_an_unbumped_entry_never_forwards)
+{
+    zassert_false(
+        shouldForwardTallyEntry(/*isNew=*/false, /*bumped=*/false, /*intervalDue=*/true, kCommandRecallPreset));
+    zassert_false(shouldForwardTallyEntry(/*isNew=*/false, /*bumped=*/false, /*intervalDue=*/true, 33));
+}
+
 // --- QcStateReads.hpp -------------------------------------------------------
 
 ZTEST(dispatch_messages, test_post_connect_state_read_commands_match_qc_mcp_handshake_order)

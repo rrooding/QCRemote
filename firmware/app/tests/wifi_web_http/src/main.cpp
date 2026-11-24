@@ -1,14 +1,18 @@
 // Issue #71: drives QcWifiWebTransport.hpp's real HTTP/WebSocket resources
 // over a real TCP socket on Zephyr's loopback interface, doing what a
-// browser actually does: GET / and then GET /api/presets.json (both on one
-// keep-alive connection and on a fresh one), plus a WebSocket upgrade.
+// browser actually does: GET / and the page's own assets (on one keep-alive
+// connection, and over several in parallel), plus a WebSocket upgrade.
 // Issue #88 / ADR 0011 added coverage for the embed step's generated
-// static resources (the real web UI, pre-gzipped) alongside these.
+// resources (the real web UI, pre-gzipped) alongside these.
 //
-// This exists because the 5068403 smoke test's "the page shows only the
-// title and Loading..." could not be reproduced or ruled out anywhere -
-// the page's own request sequence had never been exercised off-board, so
-// every explanation was a reading of Zephyr's server rather than a result.
+// Issue #99 made this suite thin on purpose: what goes over the WebSocket
+// is decided by QcWebApiSession.hpp, tested on its own (tests/
+// web_api_session). This suite checks only what that can't - the HTTP side
+// (no more /api/presets.json, Cache-Control: no-cache on every asset, the
+// build id stamped into the page), and the transport's own handling of the
+// socket: frames reach the page, frames from the page reach the session,
+// and a second page replaces the first with close code 4001.
+//
 // Nothing here needs Wi-Fi, a Wi-Fi driver, or a board: the transport's
 // startServer() brings up only the HTTP/WebSocket half.
 //
@@ -21,17 +25,11 @@
 // Issue #75: this test app has no Kconfig of its own (unlike the real
 // firmware/app build, see ../../Kconfig), so QcWifiWebTransport.hpp's own
 // CONFIG_QC_WIFI_WEB_TICK_INTERVAL_MS reference needs a value the same way
-// the two above do. Shorter than the real 5000ms default, so
-// test_tick_is_sent_when_nothing_else_is doesn't have to wait that long -
-// but deliberately kept *above* receiveAll()'s own kRecvTimeoutSeconds
-// (2000ms): every other test in this suite reads a WebSocket response
-// with receiveAll(), which decides a response is complete once the socket
-// goes quiet for kRecvTimeoutSeconds - and once a client is connected,
-// this transport never *stops* being busy again on its own (that's the
-// heartbeat's whole point). Keeping the tick slower than that read timeout
-// is what lets those other tests still see a clean "quiet" after the one
-// message they're reading, instead of hanging until this suite's own
-// overall timeout.
+// the two above do. Kept *above* receiveAll()'s own kRecvTimeoutSeconds
+// (2000ms): every WebSocket test reads with receiveAll(), which decides a
+// response is complete once the socket goes quiet for kRecvTimeoutSeconds -
+// and once a page is connected, the Board never stays quiet for longer than
+// the tick interval (that's the tick's whole point).
 #define CONFIG_QC_WIFI_WEB_TICK_INTERVAL_MS 2500
 
 #include <cstdint>
@@ -64,12 +62,22 @@ constexpr const char* kServerAddress = "127.0.0.1";
 constexpr uint16_t kServerPort = 8080;
 constexpr int kRecvTimeoutSeconds = 2;
 
-// Real request headers, as Safari/Chrome send them for a top-level
-// navigation and for a fetch() from the page's own script - deliberately
-// not a minimal hand-written request, since the point is to exercise the
-// server with what the browser in the smoke test actually sent (header
-// count and sizes included: CONFIG_HTTP_SERVER_CLIENT_BUFFER_SIZE is 256,
-// so these span several reads).
+// The header set Safari sends for a fetch from the page's own script -
+// deliberately not a minimal hand-written request, since the point is to
+// exercise the server with what a browser actually sends (header count and
+// sizes included: CONFIG_HTTP_SERVER_CLIENT_BUFFER_SIZE is 256, so these
+// span several reads).
+#define QC_BROWSER_HEADERS                                                                         \
+    "Host: 192.168.1.233\r\n"                                                                      \
+    "Accept: */*\r\n"                                                                              \
+    "Referer: http://192.168.1.233/\r\n"                                                           \
+    "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "            \
+    "(KHTML, like Gecko) Version/18.0 Safari/605.1.15\r\n"                                         \
+    "Accept-Language: en-GB,en;q=0.9\r\n"                                                          \
+    "Accept-Encoding: gzip, deflate\r\n"                                                           \
+    "Connection: keep-alive\r\n"                                                                   \
+    "\r\n"
+
 constexpr const char kNavigationRequest[] =
     "GET / HTTP/1.1\r\n"
     "Host: 192.168.1.233\r\n"
@@ -82,33 +90,10 @@ constexpr const char kNavigationRequest[] =
     "Connection: keep-alive\r\n"
     "\r\n";
 
-constexpr const char kFetchRequest[] =
-    "GET /api/presets.json HTTP/1.1\r\n"
-    "Host: 192.168.1.233\r\n"
-    "Accept: */*\r\n"
-    "Referer: http://192.168.1.233/\r\n"
-    "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-    "(KHTML, like Gecko) Version/18.0 Safari/605.1.15\r\n"
-    "Accept-Language: en-GB,en;q=0.9\r\n"
-    "Accept-Encoding: gzip, deflate\r\n"
-    "Connection: keep-alive\r\n"
-    "\r\n";
-
-// Issue #88 / ADR 0011: same shape as kFetchRequest, for one of the real
-// web UI's own vendored assets - confirms the embed step's generated
-// resources (firmware/app/tools/embed_assets.py) are reachable by path,
-// not just present in the generated header's own table.
-constexpr const char kVendorLitRequest[] =
-    "GET /vendor/lit.js HTTP/1.1\r\n"
-    "Host: 192.168.1.233\r\n"
-    "Accept: */*\r\n"
-    "Referer: http://192.168.1.233/\r\n"
-    "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-    "(KHTML, like Gecko) Version/18.0 Safari/605.1.15\r\n"
-    "Accept-Language: en-GB,en;q=0.9\r\n"
-    "Accept-Encoding: gzip, deflate\r\n"
-    "Connection: keep-alive\r\n"
-    "\r\n";
+constexpr const char kVendorLitRequest[] = "GET /vendor/lit.js HTTP/1.1\r\n" QC_BROWSER_HEADERS;
+constexpr const char kBuildJsRequest[] = "GET /src/build.js HTTP/1.1\r\n" QC_BROWSER_HEADERS;
+// Issue #99 / ADR 0012 decision 8: the WebSocket is the only API.
+constexpr const char kOldCatalogRequest[] = "GET /api/presets.json HTTP/1.1\r\n" QC_BROWSER_HEADERS;
 
 // Sec-WebSocket-Key is any 16 random bytes, base64-encoded; the value
 // below is the one RFC 6455 section 1.3 uses in its own example.
@@ -197,11 +182,10 @@ void sendRequest(int sock, const char* request) {
 }
 
 // Reads until the socket goes quiet (recv times out) or the buffer is
-// full, and returns what arrived as a NUL-terminated string. The
-// responses under test are a few KB at most, and reading to quiet rather
-// than parsing Content-Length/chunk lengths is what lets a *malformed*
-// response be asserted against too - a response that never arrives, or
-// arrives without a status line, is exactly the failure being chased.
+// full, and returns what arrived as a NUL-terminated string. Reading to
+// quiet rather than parsing lengths is what lets a *malformed* response be
+// asserted against too - a response that never arrives, or arrives
+// without a status line, is exactly the failure being chased.
 std::string_view receiveAll(int sock) {
     size_t offset = 0;
     while (offset + 1 < sizeof(g_responseBuffer)) {
@@ -220,47 +204,78 @@ bool contains(std::string_view haystack, std::string_view needle) {
     return haystack.find(needle) != std::string_view::npos;
 }
 
-// Issue #88 / ADR 0011: a static resource's response has no chunked
-// framing (unlike the dynamic /api/presets.json one tested above) - just
-// status line, headers, then the body back to back - so the body is
-// everything after the blank line that ends the headers (RFC 9112
-// section 2.1). receiveAll() already captured any embedded NUL bytes the
-// gzip body contains correctly (it bounds by byte count, not strlen), and
-// this just slices off the HTTP framing in front of them.
+// Issue #99: assets are dynamic resources now (so they can carry
+// Cache-Control), which Zephyr always sends with Transfer-Encoding:
+// chunked, as one chunk: "<hex length>\r\n<body>\r\n0\r\n\r\n" after the
+// headers (RFC 9112 section 7.1). This slices that one chunk's body out.
+constexpr std::string_view kLastChunk = "\r\n0\r\n\r\n";
+
 std::string_view bodyOf(std::string_view httpResponse) {
     constexpr std::string_view kHeaderEnd = "\r\n\r\n";
-    const size_t pos = httpResponse.find(kHeaderEnd);
-    zassert_true(pos != std::string_view::npos, "no end-of-headers marker in response");
-    return httpResponse.substr(pos + kHeaderEnd.size());
+    const size_t headerEnd = httpResponse.find(kHeaderEnd);
+    zassert_true(headerEnd != std::string_view::npos, "no end-of-headers marker in response");
+    const std::string_view chunked = httpResponse.substr(headerEnd + kHeaderEnd.size());
+    const size_t sizeLineEnd = chunked.find("\r\n");
+    zassert_true(sizeLineEnd != std::string_view::npos, "no chunk size line");
+    const size_t length = strtoul(chunked.data(), nullptr, 16);
+    const std::string_view rest = chunked.substr(sizeLineEnd + 2);
+    zassert_true(rest.size() == length + kLastChunk.size() && rest.ends_with(kLastChunk),
+                 "expected one %zu-byte chunk and the last chunk, got %zu bytes", length, rest.size());
+    return rest.substr(0, length);
 }
 
 // Scratch space for qcbridge::gzip::inflate() in the tests below - static
 // for the same reason g_responseBuffer is: too big for a test function's
 // own stack. Sized against the largest asset's *raw* (uncompressed) size -
-// the vendored Lit bundle is ~18 KB minified - not its gzipped size (the
-// whole UI gzips to under 20 KB total, see web/ui/README.md); matches
-// QcGzip.hpp's own kMaxInflatedSize headroom.
+// the vendored Lit bundle is ~18 KB minified.
 uint8_t g_inflateBuffer[32768];
 
-// Issue #75: a minimal RFC 6455 client->server frame encoder - just enough
-// to send the one message this firmware recognizes (resync). Client
-// frames must be masked (section 5.3); the mask key can be anything, the
-// server is required to undo it the same way regardless of value.
+std::string_view inflatedBodyOf(std::string_view httpResponse) {
+    const std::string_view gzipped = bodyOf(httpResponse);
+    const auto bytes =
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(gzipped.data()), gzipped.size());
+    zassert_true(qcbridge::gzip::hasMagic(bytes), "body doesn't start with the gzip magic");
+    const auto inflated = qcbridge::gzip::inflate(bytes, std::span<uint8_t>(g_inflateBuffer));
+    zassert_true(inflated.has_value(), "inflate failed: %s",
+                 inflated.has_value() ? "" : qcbridge::gzip::toString(inflated.error()));
+    return std::string_view(reinterpret_cast<const char*>(inflated->data()), inflated->size());
+}
+
+// A minimal RFC 6455 client->server text frame. Client frames must be
+// masked (section 5.3); the mask key can be anything.
+uint8_t g_frameBuffer[2 + 2 + 4 + 512];
+
 void sendWebSocketTextFrame(int sock, std::string_view payload) {
-    zassert_true(payload.size() < 126, "test payload too long for this helper's framing");
-    uint8_t frame[2 + 4 + 125];
+    zassert_true(payload.size() <= 512, "test payload too long for this helper");
     size_t pos = 0;
-    frame[pos++] = 0x81;  // FIN=1, opcode=0x1 (text)
-    frame[pos++] = 0x80 | static_cast<uint8_t>(payload.size());  // MASK=1, payload length
+    g_frameBuffer[pos++] = 0x81;  // FIN=1, opcode=0x1 (text)
+    if (payload.size() < 126) {
+        g_frameBuffer[pos++] = 0x80 | static_cast<uint8_t>(payload.size());
+    } else {
+        g_frameBuffer[pos++] = 0x80 | 126;  // MASK=1, 16-bit length follows
+        g_frameBuffer[pos++] = static_cast<uint8_t>(payload.size() >> 8);
+        g_frameBuffer[pos++] = static_cast<uint8_t>(payload.size() & 0xff);
+    }
     const uint8_t maskKey[4] = {0x12, 0x34, 0x56, 0x78};
     for (const uint8_t byte : maskKey) {
-        frame[pos++] = byte;
+        g_frameBuffer[pos++] = byte;
     }
     for (size_t i = 0; i < payload.size(); ++i) {
-        frame[pos++] = static_cast<uint8_t>(payload[i]) ^ maskKey[i % 4];
+        g_frameBuffer[pos++] = static_cast<uint8_t>(payload[i]) ^ maskKey[i % 4];
     }
-    const ssize_t sent = zsock_send(sock, frame, pos, 0);
+    const ssize_t sent = zsock_send(sock, g_frameBuffer, pos, 0);
     zassert_equal(sent, static_cast<ssize_t>(pos), "send() of websocket frame failed (%d)", errno);
+}
+
+// Opens /ws and returns the socket, having read the upgrade response and
+// the snapshot that follows it (left in g_responseBuffer).
+int openPage(std::string_view& received) {
+    const int sock = connectToServer();
+    sendRequest(sock, kWebsocketRequest);
+    received = receiveAll(sock);
+    zassert_true(contains(received, "HTTP/1.1 101 Switching Protocols"), "websocket upgrade refused: %s",
+                 received.empty() ? "<nothing received>" : received.data());
+    return sock;
 }
 
 // Issue #88 (PR #92's hardware blocker): a browser does not fetch the
@@ -268,15 +283,13 @@ void sendWebSocketTextFrame(int sock, std::string_view payload) {
 // TCP connections per host and fetch over all of them at once. The board
 // served every asset correctly when curl asked for them sequentially, and
 // reset/refused almost all of them as soon as two or more connections were
-// open at the same time, so the page never got its module graph. The two
-// tests at the end of this file are that request pattern, which nothing
-// here exercised before: the suite's other tests all use one connection at
-// a time.
+// open at the same time, so the page never got its module graph. The
+// tests at the end of this file are that request pattern.
 //
 // Six, because that is the real per-host cap both browsers use (and the
 // number the owner's curl check reproduces the failure with); the UI ships
-// nine assets, so a browser fetches them in two waves over these six
-// connections, which is what test_every_page_asset_loads_over_parallel_
+// more assets than that, so a browser fetches them in two waves over these
+// six connections, which is what test_every_page_asset_loads_over_parallel_
 // connections below does.
 constexpr size_t kBrowserConnections = 6;
 
@@ -312,10 +325,10 @@ int tryConnectToServer(int recvTimeoutSeconds = kRecvTimeoutSeconds) {
     return sock;
 }
 
-// One asset request, with the same header set kFetchRequest/
-// kVendorLitRequest use, for an arbitrary path from the generated asset
-// table. Reused for every request below, which is safe because send()
-// has copied it by the time this returns.
+// One asset request, with the same header set kVendorLitRequest uses, for
+// an arbitrary path from the generated asset table. Reused for every
+// request below, which is safe because send() has copied it by the time
+// this returns.
 char g_requestBuffer[512];
 
 // Sends a literal, already-formed request (the WebSocket upgrade), without
@@ -326,19 +339,8 @@ bool sendAssetRequestRaw(int sock, const char* request) {
 }
 
 bool sendAssetRequest(int sock, const char* path) {
-    const int length = snprintf(
-        g_requestBuffer, sizeof(g_requestBuffer),
-        "GET %s HTTP/1.1\r\n"
-        "Host: 192.168.1.233\r\n"
-        "Accept: */*\r\n"
-        "Referer: http://192.168.1.233/\r\n"
-        "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-        "(KHTML, like Gecko) Version/18.0 Safari/605.1.15\r\n"
-        "Accept-Language: en-GB,en;q=0.9\r\n"
-        "Accept-Encoding: gzip, deflate\r\n"
-        "Connection: keep-alive\r\n"
-        "\r\n",
-        path);
+    const int length =
+        snprintf(g_requestBuffer, sizeof(g_requestBuffer), "GET %s HTTP/1.1\r\n" QC_BROWSER_HEADERS, path);
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(g_requestBuffer)) {
         return false;
     }
@@ -362,12 +364,12 @@ struct AssetFetch {
     size_t bodyLength;
 };
 
-// Drain space for the bodies read by readStaticResponse() - one shared
+// Drain space for the bodies read by readAssetResponse() - one shared
 // buffer, since responses are read one socket at a time.
 char g_drainBuffer[512];
 
-// Reads one complete static-resource response: the headers, then exactly
-// Content-Length body bytes.
+// Reads one complete asset response: the headers, the chunk size line, then
+// exactly that many body bytes plus the last chunk.
 //
 // Deliberately not receiveAll(): that one reads until the socket goes
 // quiet, which on these keep-alive connections (the server never closes
@@ -375,16 +377,14 @@ char g_drainBuffer[512];
 // kRecvTimeoutSeconds per connection and, worse, cannot tell a response
 // that arrived in full from one that was cut short. Reading to the
 // declared length makes "this connection's asset never finished" an
-// immediate, attributable result. Every static resource sends a
-// Content-Length - see
-// test_index_page_is_served_gzipped_with_content_length.
-bool readStaticResponse(int sock, AssetFetch& out) {
+// immediate, attributable result.
+bool readAssetResponse(int sock, AssetFetch& out) {
     char header[384];
     size_t headerLength = 0;
-    size_t headerEnd = 0;
-    bool haveHeaders = false;
+    size_t headerEnd = std::string_view::npos;
+    size_t sizeLineEnd = std::string_view::npos;
 
-    while (!haveHeaders && headerLength < sizeof(header)) {
+    while (sizeLineEnd == std::string_view::npos && headerLength < sizeof(header)) {
         const ssize_t received =
             zsock_recv(sock, header + headerLength, sizeof(header) - headerLength, 0);
         if (received <= 0) {
@@ -392,10 +392,18 @@ bool readStaticResponse(int sock, AssetFetch& out) {
             break;
         }
         headerLength += static_cast<size_t>(received);
-        const size_t pos = std::string_view(header, headerLength).find("\r\n\r\n");
-        if (pos != std::string_view::npos) {
-            haveHeaders = true;
-            headerEnd = pos + 4;
+        const std::string_view view(header, headerLength);
+        if (headerEnd == std::string_view::npos) {
+            const size_t pos = view.find("\r\n\r\n");
+            if (pos != std::string_view::npos) {
+                headerEnd = pos + 4;
+            }
+        }
+        if (headerEnd != std::string_view::npos) {
+            const size_t pos = view.find("\r\n", headerEnd);
+            if (pos != std::string_view::npos) {
+                sizeLineEnd = pos + 2;
+            }
         }
     }
 
@@ -410,38 +418,29 @@ bool readStaticResponse(int sock, AssetFetch& out) {
         }
     }
 
-    if (!haveHeaders) {
+    if (sizeLineEnd == std::string_view::npos) {
         return false;
     }
 
-    constexpr std::string_view kContentLength = "Content-Length: ";
-    const size_t pos = std::string_view(header, headerEnd).find(kContentLength);
-    if (pos == std::string_view::npos) {
-        return false;
-    }
-    // strtol stops at the "\r" that ends the header line.
-    const long declared = strtol(header + pos + kContentLength.size(), nullptr, 10);
-    if (declared < 0) {
-        return false;
-    }
-    out.expectedBodyLength = static_cast<size_t>(declared);
-    out.bodyLength = headerLength - headerEnd;
-
-    while (out.bodyLength < out.expectedBodyLength) {
-        size_t want = out.expectedBodyLength - out.bodyLength;
+    out.expectedBodyLength = strtoul(header + headerEnd, nullptr, 16);
+    const size_t total = sizeLineEnd + out.expectedBodyLength + kLastChunk.size();
+    size_t received = headerLength;
+    while (received < total) {
+        size_t want = total - received;
         if (want > sizeof(g_drainBuffer)) {
             want = sizeof(g_drainBuffer);
         }
-        const ssize_t received = zsock_recv(sock, g_drainBuffer, want, 0);
-        if (received <= 0) {
-            out.error = (received < 0) ? errno : 0;
+        const ssize_t got = zsock_recv(sock, g_drainBuffer, want, 0);
+        if (got <= 0) {
+            out.error = (got < 0) ? errno : 0;
+            out.bodyLength = received - sizeLineEnd;
             return false;
         }
-        out.bodyLength += static_cast<size_t>(received);
+        received += static_cast<size_t>(got);
     }
-
-    out.complete = true;
-    return true;
+    out.bodyLength = out.expectedBodyLength;
+    out.complete = received == total;
+    return out.complete;
 }
 
 // Sends one asset request per already-open connection, then reads them
@@ -462,7 +461,7 @@ void fetchAssetsInParallel(const int* sockets, AssetFetch* fetches, size_t count
         if (sockets[i] < 0 || fetches[i].error != 0) {
             continue;
         }
-        (void)readStaticResponse(sockets[i], fetches[i]);
+        (void)readAssetResponse(sockets[i], fetches[i]);
     }
 }
 
@@ -501,65 +500,63 @@ void* setup(void) {
 ZTEST_SUITE(wifi_web_http, NULL, setup, NULL, NULL, NULL);
 
 // The page itself: a browser's navigation request has to come back as a
-// complete HTTP/1.1 response with a Content-Length, or the browser never
-// considers the document finished and never runs its script at all.
+// complete HTTP/1.1 response, or the browser never considers the document
+// finished and never runs its script at all.
 //
-// Issue #88 / ADR 0011: "/" is now one of the embed step's generated
-// static resources (firmware/app/tools/embed_assets.py over web/ui/),
-// served pre-gzipped - the body below is a gzip stream, not plaintext, so
-// this inflates it (qcbridge::gzip::inflate(), the same decoder the
-// firmware uses for compressed device messages) to confirm the round
-// trip actually produced the real page, not just well-formed headers.
-ZTEST(wifi_web_http, test_index_page_is_served_gzipped_with_content_length) {
-    publishSmokeTestCatalog();
+// Issue #88 / ADR 0011: "/" is one of the embed step's generated resources
+// (firmware/app/tools/embed_assets.py over web/ui/), served pre-gzipped -
+// the body is a gzip stream, so this inflates it (qcbridge::gzip::inflate(),
+// the same decoder the firmware uses for compressed device messages) to
+// confirm the round trip actually produced the real page.
+//
+// Issue #99 / docs/api: with Cache-Control: no-cache, so a reload after a
+// firmware update revalidates instead of running cached old JavaScript.
+ZTEST(wifi_web_http, test_index_page_is_served_gzipped_and_not_cached) {
     const int sock = connectToServer();
     sendRequest(sock, kNavigationRequest);
     const std::string_view response = receiveAll(sock);
 
-    zassert_true(contains(response, "HTTP/1.1 200 OK"), "no 200 status line in: %.64s",
+    zassert_true(contains(response, "HTTP/1.1 200 OK\r\n"), "no 200 status line in: %.64s",
                  response.data());
-    zassert_true(contains(response, "Content-Type: text/html"), "wrong content type");
-    zassert_true(contains(response, "Content-Length: "), "no Content-Length");
-    zassert_true(contains(response, "Content-Encoding: gzip"), "page isn't served pre-gzipped");
+    zassert_true(contains(response, "Content-Type: text/html\r\n"), "wrong content type");
+    zassert_true(contains(response, "Content-Encoding: gzip\r\n"), "page isn't served pre-gzipped");
+    zassert_true(contains(response, "Cache-Control: no-cache\r\n"), "page may be cached");
 
-    const std::string_view gzipped = bodyOf(response);
-    zassert_true(qcbridge::gzip::hasMagic(
-                     std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(gzipped.data()),
-                                              gzipped.size())),
-                 "body doesn't start with the gzip magic");
-
-    const auto inflated = qcbridge::gzip::inflate(
-        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(gzipped.data()), gzipped.size()),
-        std::span<uint8_t>(g_inflateBuffer));
-    zassert_true(inflated.has_value(), "inflate failed: %s",
-                 inflated.has_value() ? "" : qcbridge::gzip::toString(inflated.error()));
-    const std::string_view page(reinterpret_cast<const char*>(inflated->data()), inflated->size());
+    const std::string_view page = inflatedBodyOf(response);
     zassert_true(contains(page, "QC Remote"), "page title missing from inflated body");
     zassert_true(contains(page, "src/main.js"), "page isn't loading the UI's module entry");
     (void)zsock_close(sock);
 }
 
 // Issue #88 / ADR 0011: one of the UI's own served files, not the shell
-// page - confirms the embed step's generated resources cover more than
-// just "/", and that the vendored Lit bundle (web/ui/vendor/lit.js) is
-// reachable at the path the page's own ES module imports use.
-ZTEST(wifi_web_http, test_vendor_lit_js_is_served_gzipped) {
+// page - and the biggest one, so the whole body arriving in one piece is
+// worth checking.
+ZTEST(wifi_web_http, test_vendor_lit_js_is_served_gzipped_and_not_cached) {
     const int sock = connectToServer();
     sendRequest(sock, kVendorLitRequest);
     const std::string_view response = receiveAll(sock);
 
-    zassert_true(contains(response, "HTTP/1.1 200 OK"), "no 200 status line in: %.64s",
+    zassert_true(contains(response, "HTTP/1.1 200 OK\r\n"), "no 200 status line in: %.64s",
                  response.data());
-    zassert_true(contains(response, "Content-Type: text/javascript"), "wrong content type");
-    zassert_true(contains(response, "Content-Encoding: gzip"), "lit.js isn't served pre-gzipped");
+    zassert_true(contains(response, "Content-Type: text/javascript\r\n"), "wrong content type");
+    zassert_true(contains(response, "Content-Encoding: gzip\r\n"), "lit.js isn't served pre-gzipped");
+    zassert_true(contains(response, "Cache-Control: no-cache\r\n"), "lit.js may be cached");
+    zassert_true(contains(inflatedBodyOf(response), "lit.dev"), "doesn't look like the vendored Lit bundle");
+    (void)zsock_close(sock);
+}
 
-    const std::string_view gzipped = bodyOf(response);
-    const auto inflated = qcbridge::gzip::inflate(
-        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(gzipped.data()), gzipped.size()),
-        std::span<uint8_t>(g_inflateBuffer));
-    zassert_true(inflated.has_value(), "inflate failed");
-    const std::string_view bundle(reinterpret_cast<const char*>(inflated->data()), inflated->size());
-    zassert_true(contains(bundle, "lit.dev"), "doesn't look like the vendored Lit bundle");
+// Issue #99 / ADR 0012: the page's copy of the build id is the firmware's,
+// stamped into web/ui/src/build.js by the same embed step.
+ZTEST(wifi_web_http, test_the_page_gets_the_firmwares_build_id) {
+    const int sock = connectToServer();
+    sendRequest(sock, kBuildJsRequest);
+    const std::string_view buildJs = inflatedBodyOf(receiveAll(sock));
+
+    static char expected[64];
+    (void)snprintf(expected, sizeof(expected), "export const BUILD = \"%.*s\";",
+                   static_cast<int>(kBuildId.size()), kBuildId.data());
+    zassert_true(contains(buildJs, expected), "build.js doesn't carry %s: %.*s", expected,
+                 static_cast<int>(buildJs.size()), buildJs.data());
     (void)zsock_close(sock);
 }
 
@@ -571,7 +568,6 @@ ZTEST(wifi_web_http, test_generated_web_asset_table_is_sane) {
     size_t foundIndex = 0;
     size_t foundVendorLit = 0;
     for (const auto& asset : qcbridge::webassets::kAssets) {
-        zassert_true(asset.gzippedLength > 0, "%s has a zero-length payload", asset.path);
         zassert_true(asset.gzippedLength >= 3, "%s too short to hold a gzip header", asset.path);
         const auto bytes = std::span<const uint8_t>(asset.gzipped, asset.gzippedLength);
         zassert_true(qcbridge::gzip::hasMagic(bytes), "%s isn't a gzip stream", asset.path);
@@ -587,184 +583,147 @@ ZTEST(wifi_web_http, test_generated_web_asset_table_is_sane) {
     zassert_equal(foundVendorLit, 1u, "no vendored Lit bundle in the generated asset table");
 }
 
-// The regression the 5068403 smoke test hit: with the page open, the
-// browser's own fetch('/api/presets.json') is usually reused on the same
-// keep-alive connection the page came over.
-ZTEST(wifi_web_http, test_presets_json_on_same_keep_alive_connection) {
-    publishSmokeTestCatalog();
+// The browser reuses the connection the page came over for the page's own
+// files (keep-alive); a server that drops it in between is the regression
+// prj.conf's CONFIG_HTTP_SERVER_CLIENT_INACTIVITY_TIMEOUT comment is about.
+ZTEST(wifi_web_http, test_two_assets_on_one_keep_alive_connection) {
     const int sock = connectToServer();
 
     sendRequest(sock, kNavigationRequest);
-    const std::string_view page = receiveAll(sock);
-    zassert_true(contains(page, "HTTP/1.1 200 OK"), "page request failed");
+    zassert_true(contains(receiveAll(sock), "HTTP/1.1 200 OK\r\n"), "page request failed");
 
-    sendRequest(sock, kFetchRequest);
-    const std::string_view json = receiveAll(sock);
-    // A dynamic resource's status line is built from
-    // RESPONSE_TEMPLATE_DYNAMIC_PART1, not the static resource's hardcoded
-    // one, and it comes out as a bare "HTTP/1.1 200" - no space, no reason
-    // phrase - unless CONFIG_HTTP_SERVER_COMPLETE_STATUS_PHRASES is on.
-    // RFC 9112 section 4 requires the space, so this asserts the whole
-    // well-formed line rather than just the status code.
-    zassert_true(contains(json, "HTTP/1.1 200 OK\r\n"),
-                 "malformed or missing status line for the JSON fetch");
-    zassert_true(contains(json, "Transfer-Encoding: chunked"), "no transfer encoding");
-    zassert_true(contains(json, "Content-Type: application/json"), "wrong content type");
-    zassert_true(contains(json, "\"presetCount\":49"), "catalog not in the response");
-    zassert_true(contains(json, "My Presets"), "first folder missing");
-    zassert_true(contains(json, "Practice"), "second folder missing");
-    zassert_true(contains(json, "Downloads"), "third folder missing");
-    zassert_true(contains(json, "\"incomplete\":false"), "listing reported as incomplete");
+    sendRequest(sock, kVendorLitRequest);
+    const std::string_view response = receiveAll(sock);
+    zassert_true(contains(response, "HTTP/1.1 200 OK\r\n"), "second request on the same connection failed");
+    zassert_true(contains(inflatedBodyOf(response), "lit.dev"), "second asset is wrong");
     (void)zsock_close(sock);
 }
 
-// The other shape a browser uses: a separate connection for the fetch.
-ZTEST(wifi_web_http, test_presets_json_on_a_fresh_connection) {
-    publishSmokeTestCatalog();
-    const int pageSock = connectToServer();
-    sendRequest(pageSock, kNavigationRequest);
-    (void)receiveAll(pageSock);
-
-    const int fetchSock = connectToServer();
-    sendRequest(fetchSock, kFetchRequest);
-    const std::string_view json = receiveAll(fetchSock);
-    zassert_true(contains(json, "HTTP/1.1 200 OK\r\n"),
-                 "malformed or missing status line for the JSON fetch");
-    zassert_true(contains(json, "\"presetCount\":49"), "catalog not in the response");
-    (void)zsock_close(fetchSock);
-    (void)zsock_close(pageSock);
-}
-
-// Before this round, catalogJson_ was re-encoded only by the worker
-// thread's broadcast(), so a GET that beat that thread served the startup
-// placeholder ({"presetCount":0,...,"incomplete":true}) instead of the
-// listing that had already been published. Publishing and fetching back to
-// back is the case that used to be racy.
-ZTEST(wifi_web_http, test_presets_json_reflects_the_latest_publish_immediately) {
+// Issue #99 / ADR 0012 decision 8: the WebSocket is the only API, and the
+// catalog endpoint (and its 16 KB buffer) is gone.
+ZTEST(wifi_web_http, test_the_old_catalog_endpoint_is_gone) {
     publishSmokeTestCatalog();
     const int sock = connectToServer();
-    sendRequest(sock, kFetchRequest);
-    const std::string_view json = receiveAll(sock);
-    zassert_true(contains(json, "HTTP/1.1 200 OK\r\n"),
-                 "malformed or missing status line for the JSON fetch");
-    zassert_true(contains(json, "\"presetCount\":49"), "GET served a stale catalog");
-    (void)zsock_close(sock);
-}
-
-// A WebSocket upgrade has to be accepted, and - the other half of the
-// smoke test's "nothing arrives over the WebSocket" - the client has to
-// receive the catalog the firmware already holds without waiting for the
-// next publish.
-ZTEST(wifi_web_http, test_websocket_upgrade_pushes_the_current_catalog) {
-    publishSmokeTestCatalog();
-    // Drain the publish's own broadcast so what this test reads can only
-    // be the push triggered by the upgrade itself.
-    k_msleep(200);
-
-    const int sock = connectToServer();
-    sendRequest(sock, kWebsocketRequest);
+    sendRequest(sock, kOldCatalogRequest);
     const std::string_view response = receiveAll(sock);
 
-    zassert_true(contains(response, "HTTP/1.1 101 Switching Protocols"),
-                 "websocket upgrade refused: %s",
-                 response.empty() ? "<nothing received>" : response.data());
+    zassert_true(contains(response, "HTTP/1.1 404"), "expected a 404, got: %.64s", response.data());
+    zassert_false(contains(response, "presetCount"), "the catalog is still served over HTTP");
+    (void)zsock_close(sock);
+}
+
+// The other half of the 5068403 smoke test's "nothing arrives over the
+// WebSocket": a page that connects after the Catalog was published gets
+// it right away, in a docs/api snapshot carrying this firmware's build id.
+ZTEST(wifi_web_http, test_a_new_page_gets_a_snapshot_right_away) {
+    publishSmokeTestCatalog();
+    k_msleep(200);
+
+    std::string_view received;
+    const int sock = openPage(received);
+
     // RFC 6455's own example key hashes to this accept value.
-    zassert_true(contains(response, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+    zassert_true(contains(received, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
                  "wrong Sec-WebSocket-Accept");
-    zassert_true(contains(response, "\"presetCount\":49"),
-                 "no catalog pushed to the new websocket client");
-    // Issue #75 / ADR 0011: the push is wrapped in the versioned envelope,
-    // as a "snapshot" (never a "patch" - a newly-connected client has no
-    // prior state to patch), with its own seq starting fresh at 0.
-    zassert_true(contains(response, R"("v":1,"t":"snapshot","seq":0,"catalog":)"),
-                 "catalog push isn't wrapped in a v1 snapshot envelope: %s", response.data());
+    static char expectedStart[96];
+    (void)snprintf(expectedStart, sizeof(expectedStart), R"({"t":"snapshot","seq":0,"build":"%.*s","catalog":)",
+                   static_cast<int>(kBuildId.size()), kBuildId.data());
+    zassert_true(contains(received, expectedStart), "no snapshot: %s", received.data());
+    zassert_true(contains(received, "\"presetCount\":49"), "snapshot without the published Catalog");
     (void)zsock_close(sock);
-    // Issue #75: CONFIG_WEBSOCKET_MAX_CONTEXTS=1 means the next test's own
-    // connect only succeeds once the worker thread's own poll cycle
-    // (kPollIntervalMs, 1000ms) has noticed this socket closed and freed
-    // the one slot - give it that cycle before moving on.
-    k_msleep(1100);
 }
 
-// Issue #75: a preset-change event with no catalog change must reach the
-// client as a lean "patch" (just the envelope plus lastChange), not a
-// second full catalog resend - and its seq must continue from the
-// snapshot's.
-ZTEST(wifi_web_http, test_preset_change_is_pushed_as_a_patch_not_a_full_catalog) {
+// What QcSession publishes reaches the open page.
+ZTEST(wifi_web_http, test_a_published_current_preset_reaches_the_page_as_a_patch) {
+    transport().publishCurrentPreset(std::nullopt);
     publishSmokeTestCatalog();
     k_msleep(200);
 
-    const int sock = connectToServer();
-    sendRequest(sock, kWebsocketRequest);
-    const std::string_view snapshot = receiveAll(sock);
-    zassert_true(contains(snapshot, R"("t":"snapshot","seq":0,)"), "no initial snapshot: %s",
-                 snapshot.data());
+    std::string_view received;
+    const int sock = openPage(received);
+    zassert_true(contains(received, R"("current":{"index":null,"name":null,"scene":null})"),
+                 "snapshot with a stale Current preset: %s", received.data());
 
-    transport().publishPresetChange(QcPresetChangeEvent{.command = 15, .count = 3});
-    k_msleep(200);
-    const std::string_view patch = receiveAll(sock);
-
-    zassert_true(contains(patch, R"({"v":1,"t":"patch","seq":1,"lastChange":{"command":15,)"
-                                 R"("count":3}})"),
-                 "preset change wasn't pushed as the expected patch envelope: %s", patch.data());
-    zassert_false(contains(patch, "folders"), "a patch must not resend the full catalog: %s",
-                  patch.data());
+    QcCatalogSnapshot::PresetEntry verse;
+    verse.index = 3;
+    verse.name = "Verse 1";
+    transport().publishCurrentPreset(verse);
+    received = receiveAll(sock);
+    zassert_true(contains(received, R"({"t":"patch","seq":1,"current":{"index":3,"name":"Verse 1","scene":null}})"),
+                 "no current patch: %s", received.data());
     (void)zsock_close(sock);
-    k_msleep(1100);  // See test_websocket_upgrade_pushes_the_current_catalog's own comment.
 }
 
-// Issue #75 / ADR 0011: without a tick, an idle rig and a half-open socket
-// look the same. CONFIG_QC_WIFI_WEB_TICK_INTERVAL_MS is overridden (this
-// file's own #define above) so the test doesn't have to wait out the real
-// (5s) production cadence - see that #define's own comment for why it's
-// still kept above kRecvTimeoutSeconds rather than as short as possible.
-ZTEST(wifi_web_http, test_tick_is_sent_when_nothing_else_is) {
+// Frames from the page reach the session: a resync is answered with a
+// fresh snapshot.
+ZTEST(wifi_web_http, test_a_resync_from_the_page_gets_a_fresh_snapshot) {
     publishSmokeTestCatalog();
     k_msleep(200);
 
-    const int sock = connectToServer();
-    sendRequest(sock, kWebsocketRequest);
-    const std::string_view snapshot = receiveAll(sock);
-    zassert_true(contains(snapshot, R"("t":"snapshot","seq":0,)"), "no initial snapshot: %s",
-                 snapshot.data());
+    std::string_view received;
+    const int sock = openPage(received);
 
-    // Comfortably past kTickIntervalMs (2500ms, this file's own #define
-    // above) plus the worker's own poll granularity (kPollIntervalMs,
-    // 1000ms) - sleeping *before* calling receiveAll() rather than
-    // relying on it to wait the tick out, since a tick this slow would
-    // otherwise exceed receiveAll()'s own per-call quiet timeout
-    // (kRecvTimeoutSeconds, 2s) before ever arriving.
-    k_msleep(3800);
-    const std::string_view tick = receiveAll(sock);
-    zassert_true(contains(tick, R"({"v":1,"t":"tick","seq":1})"), "no tick heartbeat arrived: %s",
-                 tick.data());
+    sendWebSocketTextFrame(sock, R"({"t":"resync"})");
+    received = receiveAll(sock);
+    zassert_true(contains(received, R"({"t":"snapshot","seq":0,)"), "resync didn't produce a snapshot: %s",
+                 received.data());
     (void)zsock_close(sock);
-    k_msleep(1100);  // See test_websocket_upgrade_pushes_the_current_catalog's own comment.
 }
 
-// Issue #75: the client's own resync request (sent after it notices a seq
-// gap) must get a fresh "snapshot" back, not be silently ignored.
-ZTEST(wifi_web_http, test_resync_request_triggers_a_fresh_snapshot) {
+// docs/api: a page -> Board frame is at most 256 bytes. The transport reads
+// a longer one to its end (so the next frame still parses) and the session
+// refuses it.
+ZTEST(wifi_web_http, test_a_frame_over_256_bytes_is_refused_and_the_next_one_still_works) {
     publishSmokeTestCatalog();
     k_msleep(200);
 
-    const int sock = connectToServer();
-    sendRequest(sock, kWebsocketRequest);
-    const std::string_view snapshot = receiveAll(sock);
-    zassert_true(contains(snapshot, R"("t":"snapshot","seq":0,)"), "no initial snapshot: %s",
-                 snapshot.data());
+    std::string_view received;
+    const int sock = openPage(received);
 
-    sendWebSocketTextFrame(sock, R"({"v":1,"t":"resync"})");
-    // Resync detection happens on the worker's own poll cadence
-    // (kPollIntervalMs, 1000ms) - give it comfortable margin.
-    k_msleep(1500);
-    const std::string_view resynced = receiveAll(sock);
-    zassert_true(contains(resynced, R"("t":"snapshot")"), "resync didn't produce a fresh snapshot: %s",
-                 resynced.data());
-    zassert_true(contains(resynced, "\"presetCount\":49"), "fresh snapshot missing the catalog: %s",
-                 resynced.data());
+    static char oversized[300];
+    memset(oversized, ' ', sizeof(oversized));
+    const std::string_view resync = R"({"t":"resync"})";
+    memcpy(oversized, resync.data(), resync.size());
+    sendWebSocketTextFrame(sock, std::string_view(oversized, sizeof(oversized)));
+    received = receiveAll(sock);
+    zassert_true(contains(received, R"({"t":"error","seq":1,"code":"badRequest","message":"frame too large"})"),
+                 "oversized frame not refused: %s", received.data());
+
+    sendWebSocketTextFrame(sock, resync);
+    received = receiveAll(sock);
+    zassert_true(contains(received, R"({"t":"snapshot","seq":0,)"), "the frame after it was lost: %s",
+                 received.data());
     (void)zsock_close(sock);
-    k_msleep(1100);  // See test_websocket_upgrade_pushes_the_current_catalog's own comment.
+}
+
+// Issue #99 / docs/api's "One page at a time": the newest page wins, and
+// the one it replaced is closed with 4001 so it stops reconnecting.
+ZTEST(wifi_web_http, test_a_second_page_replaces_the_first_with_close_code_4001) {
+    publishSmokeTestCatalog();
+    k_msleep(200);
+
+    std::string_view received;
+    const int first = openPage(received);
+    zassert_true(contains(received, R"({"t":"snapshot","seq":0,)"), "first page got no snapshot");
+
+    const int second = openPage(received);
+    zassert_true(contains(received, R"({"t":"snapshot","seq":0,)"), "second page got no snapshot: %s",
+                 received.data());
+
+    // An unmasked close frame (FIN + opcode 8), a 2-byte payload, 4001.
+    constexpr char kClose4001[] = {static_cast<char>(0x88), 0x02, 0x0f, static_cast<char>(0xa1)};
+    received = receiveAll(first);
+    zassert_true(contains(received, std::string_view(kClose4001, sizeof(kClose4001))),
+                 "first page wasn't closed with 4001 (%zu bytes received)", received.size());
+
+    // The second page is the live one now.
+    sendWebSocketTextFrame(second, R"({"t":"resync"})");
+    received = receiveAll(second);
+    zassert_true(contains(received, R"({"t":"snapshot","seq":0,)"), "second page isn't live: %s",
+                 received.data());
+
+    (void)zsock_close(first);
+    (void)zsock_close(second);
 }
 
 // PR #92's hardware blocker, reproduced off-board: six connections open at
@@ -782,8 +741,6 @@ ZTEST(wifi_web_http, test_resync_request_triggers_a_fresh_snapshot) {
 // sequential requests always worked and the old inline page never showed
 // this. See firmware/app/prj.conf's own ZVFS_POLL_MAX comment.
 ZTEST(wifi_web_http, test_parallel_connections_each_get_their_asset) {
-    publishSmokeTestCatalog();
-
     int sockets[kBrowserConnections];
     AssetFetch fetches[kBrowserConnections]{};
     size_t connected = 0;
@@ -811,15 +768,13 @@ ZTEST(wifi_web_http, test_parallel_connections_each_get_their_asset) {
     assertAllFetchesSucceeded(fetches, kBrowserConnections, "parallel asset fetch");
 }
 
-// The whole page load, the way the browser actually does it: all nine of
-// the UI's assets over six connections that stay open across both waves
+// The whole page load, the way the browser actually does it: all of the
+// UI's assets over six connections that stay open across both waves
 // (keep-alive, exactly as the request headers above ask for). This is the
 // case the owner's Safari test failed on - "/" came back but
 // /src/main.js and its siblings didn't, so the module graph never
 // resolved and the UI never started.
 ZTEST(wifi_web_http, test_every_page_asset_loads_over_parallel_connections) {
-    publishSmokeTestCatalog();
-
     constexpr size_t kAssetCount = ARRAY_SIZE(qcbridge::webassets::kAssets);
     BUILD_ASSERT(kAssetCount > kBrowserConnections,
                  "this test is about a page needing more than one wave of fetches; if the UI "
@@ -956,6 +911,4 @@ ZTEST(wifi_web_http, test_a_second_browsers_page_load_is_not_locked_out) {
                   "second browser: only %zu of %zu connections were accepted", secondCount,
                   kBrowserConnections);
     assertAllFetchesSucceeded(secondFetches, kBrowserConnections, "second browser's page load");
-
-    k_msleep(1100);  // See test_websocket_upgrade_pushes_the_current_catalog's own comment.
 }
