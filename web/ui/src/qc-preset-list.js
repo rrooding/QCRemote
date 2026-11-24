@@ -4,9 +4,8 @@ import { StoreController } from './store-controller.js';
 // The Quad Cortex's own folder/preset structure, drawn with our own CSS
 // (ADR 0011 decision 8 - no Neural DSP artwork, icons or fonts).
 //
-// Read-only: the board has no "currently loaded preset" on this wire (see
-// store.js's own header comment) and tapping a row to switch presets is
-// issue #78's job, not this one's - rendering rows as fake buttons with no
+// The Current preset's row is marked (aria-current). Read-only otherwise:
+// tapping a row to switch presets is issue #78's job, not this one's - rendering rows as fake buttons with no
 // handler would be a lie to a screen reader, so these are plain list items.
 //
 // `repeat()` rather than a plain `.map()`: keyed by the board's own preset
@@ -70,6 +69,14 @@ export class QcPresetList extends LitElement {
       font-size: 1rem;
     }
 
+    li[aria-current='true'] {
+      background: var(--qc-accent-dim);
+    }
+
+    li[aria-current='true'] .slot {
+      color: var(--qc-accent);
+    }
+
     .empty {
       padding: 2rem 1rem;
       color: var(--qc-text-dim);
@@ -80,7 +87,7 @@ export class QcPresetList extends LitElement {
   #store = new StoreController(this, window.qcStore);
 
   render() {
-    const { catalog } = this.#store.state;
+    const { catalog, current } = this.#store.state;
     if (catalog.folders.length === 0) {
       return html`<p class="empty">
         No presets yet${catalog.incomplete ? ' - waiting for the board to finish listing' : ''}.
@@ -97,7 +104,7 @@ export class QcPresetList extends LitElement {
             folder.presets,
             (preset) => preset.index,
             (preset) => html`
-              <li>
+              <li aria-current=${preset.index === current.index ? 'true' : 'false'}>
                 <span class="slot">${preset.index}</span>
                 <span class="name">${preset.name}</span>
               </li>
