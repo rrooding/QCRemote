@@ -18,7 +18,7 @@ beyond that directory.
 
 Issue #99: it also stamps the build id (the git commit, ADR 0012) into both
 the page and the firmware, from one value: web/ui/src/build.js is checked in
-as `export const BUILD = "dev";` and served with the real id in its place, and
+as `export const BUILD = 'dev';` and served with the real id in its place, and
 --build-id-out gets the same id as a C++ constant (`qcbridge::kBuildId`).
 Both outputs are rewritten only when their content changes, so CMake can run
 this on every build (to pick up a new commit) without recompiling anything.
@@ -59,9 +59,10 @@ ASSETS: list[tuple[str, str]] = [
 
 
 # web/ui/src/build.js, as checked in. The page imports BUILD from it; only
-# the quoted value is replaced.
+# the quoted value is replaced, keeping whichever quote the file uses (the
+# web UI's own style is single quotes; double is accepted too).
 BUILD_JS = "/src/build.js"
-BUILD_JS_PATTERN = re.compile(r'^(export const BUILD = ")[^"]*(";)$', re.MULTILINE)
+BUILD_JS_PATTERN = re.compile(r"""^(export const BUILD = (['"]))[^'"]*(\2;)$""", re.MULTILINE)
 
 # docs/api/schema/server-message.schema.json's "build".
 BUILD_ID_PATTERN = re.compile(r"^[0-9A-Za-z._+-]{1,40}$")
@@ -87,9 +88,9 @@ def git_build_id(repo: Path) -> str:
 
 def stamp_build_js(raw: bytes, build_id: str) -> bytes:
     text = raw.decode("utf-8")
-    stamped, count = BUILD_JS_PATTERN.subn(lambda m: f"{m.group(1)}{build_id}{m.group(2)}", text)
+    stamped, count = BUILD_JS_PATTERN.subn(lambda m: f"{m.group(1)}{build_id}{m.group(3)}", text)
     if count != 1:
-        raise SystemExit(f'{BUILD_JS} must contain exactly one line: export const BUILD = "...";')
+        raise SystemExit(f"{BUILD_JS} must contain exactly one line: export const BUILD = '...';")
     return stamped.encode("utf-8")
 
 

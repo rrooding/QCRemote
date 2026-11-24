@@ -1987,7 +1987,7 @@ browser no longer retries forever (see "One page at a time" below).
   dynamic resources now, so they can carry `Cache-Control: no-cache`, which makes them
   chunked instead of `Content-Length` framed.
 - **Build id.** `tools/embed_assets.py` runs on every build and stamps the short git commit
-  into both the page (`web/ui/src/build.js`, checked in as `export const BUILD = "dev";`) and
+  into both the page (`web/ui/src/build.js`, checked in as `export const BUILD = 'dev';`) and
   the firmware (`kBuildId` in the generated `qc_build_id_generated.hpp`). Outside a usable git
   checkout (for example a container that can't see the worktree's `.git`) both get `unknown`.
 

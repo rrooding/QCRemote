@@ -55,7 +55,7 @@ the mock on a free port and checks what it sends against the same examples.
 
 ## Build id
 
-`src/build.js` is checked in as `export const BUILD = "dev";`. The firmware's asset embed
+`src/build.js` is checked in as `export const BUILD = 'dev';`. The firmware's asset embed
 step rewrites that value to the firmware's build id when it embeds the page, so the page
 and the Board's `snapshot.build` match. When they don't, the page reloads once per Board
 build per tab (`sessionStorage`) without applying the snapshot.

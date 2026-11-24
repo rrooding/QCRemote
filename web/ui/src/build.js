@@ -1,1 +1,1 @@
-export const BUILD = "dev";
+export const BUILD = 'dev';

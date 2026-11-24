@@ -553,7 +553,7 @@ ZTEST(wifi_web_http, test_the_page_gets_the_firmwares_build_id) {
     const std::string_view buildJs = inflatedBodyOf(receiveAll(sock));
 
     static char expected[64];
-    (void)snprintf(expected, sizeof(expected), "export const BUILD = \"%.*s\";",
+    (void)snprintf(expected, sizeof(expected), "export const BUILD = '%.*s';",
                    static_cast<int>(kBuildId.size()), kBuildId.data());
     zassert_true(contains(buildJs, expected), "build.js doesn't carry %s: %.*s", expected,
                  static_cast<int>(buildJs.size()), buildJs.data());
