@@ -1,13 +1,10 @@
-// Development mock of the board: serves web/ui over HTTP and speaks the
-// REAL subset of ADR 0011's WebSocket protocol issue #75 shipped
-// (QcLiveUpdateEnvelope.hpp / firmware/README.md's "Live WebSocket updates"
-// section) on /ws, replaying a recorded-shape session so the UI can be
-// iterated on without reflashing. This is a from-scratch rewrite of
-// web/poc/tools/mock-server.mjs for the real protocol - that script speaks
-// a richer, fictional one (a `current` preset, `link.qcConnected`) the
-// board never actually sends; see web/ui/src/store.js's own header comment.
+// Development mock of the Board: serves web/ui over HTTP and speaks the
+// contract in docs/api/ (README, schemas, examples; ADR 0012) on /ws,
+// replaying a scripted session so the UI can be iterated on without
+// reflashing. test/mock-server.test.js checks what it sends against
+// docs/api/examples/.
 //
-//   node web/ui/tools/mock-server.mjs [--port 8080] [--fixture <file>] [--max-ws-clients N]
+//   node web/ui/tools/mock-server.mjs [--port 8080] [--fixture <file>] [--drop-every N]
 //
 // Deliberately dependency-free: Node's standard library only, no npm
 // install, no package.json in the repo.
@@ -24,6 +21,8 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize, extname } from 'node:path';
 
+import { BUILD } from '../src/build.js';
+
 const here = dirname(fileURLToPath(import.meta.url));
 const docRoot = join(here, '..');
 
@@ -34,12 +33,8 @@ const argValue = (name, fallback) => {
 };
 const port = Number(argValue('--port', '8080'));
 const fixturePath = argValue('--fixture', join(docRoot, 'fixtures', 'session.json'));
-// Mirrors CONFIG_WEBSOCKET_MAX_CONTEXTS=1 (the real board's one-client
-// policy, issue #75 / ADR 0011) so the "second tab" case can be exercised
-// against the mock before ever touching hardware: 0 means unlimited.
-const maxWsClients = Number(argValue('--max-ws-clients', '0'));
-// --drop-every N: silently skip every Nth patch while still burning its
-// sequence number, so the client sees a gap. There is no other way to
+// --drop-every N: silently skip every Nth message after the snapshot while
+// still burning its seq, so the page sees a gap. There is no other way to
 // exercise the resync path on a link that works, and "the UI quietly shows
 // stale state after a dropped message" is otherwise a bug that only shows
 // up on a bad Wi-Fi day.
@@ -55,25 +50,18 @@ const kContentTypes = {
   '.webmanifest': 'application/manifest+json; charset=utf-8',
 };
 
+// docs/api/README.md, "Liveness": at least one message every 5 s.
 const kTickIntervalMs = 5000;
+// How long the mock's pretend Quad Cortex takes to report a preset load.
+const kSwitchDelayMs = 300;
+// docs/api/README.md, "One page at a time".
+const kReplacedCloseCode = 4001;
 
 // --- HTTP --------------------------------------------------------------
 
+// The WebSocket is the only API (ADR 0012 decision 8): no JSON over HTTP.
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
-  // The real board's GET /api/presets.json (QcWifiWebTransport.hpp) - the
-  // bare catalog, no envelope - is what a second browser falls back to
-  // when its WebSocket is refused (see maxWsClients above and
-  // store.js's own #fetchInitialCatalog()).
-  if (url.pathname === '/api/presets.json') {
-    res.writeHead(200, {
-      'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'no-store',
-    });
-    res.end(JSON.stringify(fixture.initial.catalog));
-    return;
-  }
-
   let path = normalize(decodeURIComponent(url.pathname));
   if (path === '/' || path === '\\') path = '/index.html';
   // normalize() collapses `..`, but a leading `..` survives it - reject
@@ -86,9 +74,9 @@ const server = createServer(async (req, res) => {
     const body = await readFile(join(docRoot, path));
     res.writeHead(200, {
       'content-type': kContentTypes[extname(path)] ?? 'application/octet-stream',
-      // No caching in the mock: the whole point is that an edit shows up on
-      // reload. The board's own caching story is ADR 0011's asset pipeline.
-      'cache-control': 'no-store',
+      // Same as the Board (docs/api/README.md, "HTTP"): revalidate every
+      // asset, so an edit shows up on reload.
+      'cache-control': 'no-cache',
     });
     res.end(body);
   } catch {
@@ -99,7 +87,8 @@ const server = createServer(async (req, res) => {
 // --- WebSocket (RFC 6455, the subset a browser needs) -------------------
 
 const kWsMagic = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
-let liveClients = 0;
+// The Board serves one live WebSocket at a time, and the newest wins.
+let liveSession = null;
 
 server.on('upgrade', (req, socket) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -123,22 +112,14 @@ server.on('upgrade', (req, socket) => {
   );
   socket.setNoDelay(true);
 
-  // Matches what Zephyr does under CONFIG_WEBSOCKET_MAX_CONTEXTS=1: the
-  // HTTP-level upgrade completes (the 101 above already went out) and the
-  // connection is torn down right after - the browser's own onopen fires
-  // briefly, then onclose, and its reconnect loop takes it from there.
-  if (maxWsClients > 0 && liveClients >= maxWsClients) {
-    console.log(`[ws] refused: already at --max-ws-clients ${maxWsClients}`);
-    socket.destroy();
-    return;
-  }
-  liveClients += 1;
-  startSession(socket, () => {
-    liveClients -= 1;
+  liveSession?.replace();
+  const session = startSession(socket, () => {
+    if (liveSession === session) liveSession = null;
   });
+  liveSession = session;
 });
 
-/** Encodes one unfragmented server frame. opcode 0x1 = text, 0xA = pong. */
+/** Encodes one unfragmented server frame. opcode 0x1 = text, 0x8 = close, 0xA = pong. */
 function encodeFrame(payload, opcode = 0x1) {
   const data = Buffer.isBuffer(payload) ? payload : Buffer.from(payload, 'utf8');
   let header;
@@ -156,6 +137,13 @@ function encodeFrame(payload, opcode = 0x1) {
     header.writeBigUInt64BE(BigInt(data.length), 2);
   }
   return Buffer.concat([header, data]);
+}
+
+/** A close frame carrying a status code. */
+function encodeClose(code) {
+  const payload = Buffer.alloc(2);
+  payload.writeUInt16BE(code, 0);
+  return encodeFrame(payload, 0x8);
 }
 
 /**
@@ -200,48 +188,67 @@ function decodeFrames(buffer) {
   return { frames, rest: buffer.subarray(offset) };
 }
 
-// --- The session: one connected browser ---------------------------------
+// --- The Board's state ----------------------------------------------------
+
+// Shared by every connection, like the real Board's: a switch made from
+// one page is what the next page's snapshot shows.
+const board = structuredClone(fixture.initial);
+const findPreset = (index) =>
+  board.catalog.folders.flatMap((f) => f.presets).find((p) => p.index === index);
 
 let sessionCount = 0;
 
+// --- The session: one connected page --------------------------------------
+
 function startSession(socket, onClosed) {
   const id = ++sessionCount;
-  // Each connection gets its own copy of the fixture state and its own
-  // seq, matching the real board's per-connection seq counter
-  // (QcWifiWebTransport::requestFreshSnapshot()) - two open tabs would
-  // otherwise appear to share one sequence.
-  const state = { catalog: structuredClone(fixture.initial.catalog) };
   let seq = 0;
+  let sentSinceSnapshot = 0;
   let buffer = Buffer.alloc(0);
   let alive = true;
+  let tickTimer = null;
   const timers = [];
 
   const log = (...parts) => console.log(`[ws ${id}]`, ...parts);
 
-  const send = (message) => {
+  // Liveness: a tick only when nothing else went out for the interval.
+  const armTick = () => {
+    clearTimeout(tickTimer);
+    tickTimer = setTimeout(() => send({ t: 'tick' }), kTickIntervalMs);
+  };
+
+  // Every Board -> page message gets the next seq, in the examples' key
+  // order: t, seq, then the message's own fields.
+  const send = ({ t, ...fields }) => {
     if (!alive) return;
-    socket.write(encodeFrame(JSON.stringify(message)));
+    seq += 1;
+    armTick();
+    sentSinceSnapshot += 1;
+    if (dropEvery > 0 && sentSinceSnapshot % dropEvery === 0) {
+      log(`dropped ${t} seq=${seq} (--drop-every ${dropEvery})`);
+      return;
+    }
+    socket.write(encodeFrame(JSON.stringify({ t, seq, ...fields })));
   };
 
   const sendSnapshot = () => {
-    seq += 1;
-    send({ v: 1, t: 'snapshot', seq, catalog: state.catalog });
+    if (!alive) return;
+    seq = 0;
+    sentSinceSnapshot = 0;
+    armTick();
+    const { catalog, current, link } = board;
+    socket.write(
+      encodeFrame(JSON.stringify({ t: 'snapshot', seq, build: BUILD, catalog, current, link }))
+    );
   };
 
-  let patchCount = 0;
-  const sendPatch = (lastChange) => {
-    seq += 1;
-    patchCount += 1;
-    if (dropEvery > 0 && patchCount % dropEvery === 0) {
-      log(`dropped patch seq=${seq} (--drop-every ${dropEvery})`);
-      return;
-    }
-    send({ v: 1, t: 'patch', seq, lastChange });
-  };
+  const sendError = (code, message, commandId) =>
+    send(commandId === undefined ? { t: 'error', code, message } : { t: 'error', id: commandId, code, message });
 
   const close = () => {
     if (!alive) return;
     alive = false;
+    clearTimeout(tickTimer);
     for (const t of timers) clearTimeout(t);
     socket.destroy();
     onClosed();
@@ -251,32 +258,81 @@ function startSession(socket, onClosed) {
   log('connected');
   sendSnapshot();
 
-  // Liveness, same cadence the store expects (store.js kTickIntervalMs).
-  const tick = setInterval(() => {
-    if (!alive) {
-      clearInterval(tick);
-      return;
-    }
-    seq += 1;
-    send({ v: 1, t: 'tick', seq });
-  }, kTickIntervalMs);
-  timers.push(tick);
-
-  // Scripted events: what the board would have pushed on its own, e.g. a
-  // footswitch preset change at the unit.
+  // Scripted events: what the Board would have pushed on its own, e.g. a
+  // footswitch preset change at the unit. `once` events only happen on the
+  // first connection, so a take-over after a scripted replace sticks.
   for (const event of fixture.script ?? []) {
+    if (event.once && id !== 1) continue;
     timers.push(
       setTimeout(() => {
-        log(`script: ${event.note ?? event.t}`);
-        if (event.lastChange) sendPatch(event.lastChange);
-        if (event.catalog) {
-          state.catalog = { ...state.catalog, ...event.catalog };
-          seq += 1;
-          send({ v: 1, t: 'snapshot', seq, catalog: state.catalog });
+        log(`script: ${event.note ?? Object.keys(event).join(',')}`);
+        if (event.patch) {
+          Object.assign(board, event.patch);
+          send({ t: 'patch', ...event.patch });
         }
+        if (event.catalog) {
+          // The Catalog never changes by patch: a new one is a new snapshot.
+          board.catalog = event.catalog;
+          sendSnapshot();
+        }
+        if (event.error) sendError(event.error.code, event.error.message, event.error.id);
+        if (event.replace) replace();
       }, event.atMs ?? 0)
     );
   }
+
+  // Another page connected: close this one with 4001, as the Board does.
+  function replace() {
+    if (!alive) return;
+    log('replaced (4001)');
+    socket.write(encodeClose(kReplacedCloseCode));
+    close();
+  }
+
+  const switchPreset = (command) => {
+    if (!board.link.qcConnected) return sendError('qcDisconnected', 'link down', command.id);
+    if (command.generation !== board.catalog.generation) {
+      return sendError(
+        'staleCatalog',
+        `generation ${command.generation} != ${board.catalog.generation}`,
+        command.id
+      );
+    }
+    const preset = findPreset(command.index);
+    if (!preset) return sendError('badIndex', `no preset ${command.index}`, command.id);
+    timers.push(
+      setTimeout(() => {
+        board.current = { index: preset.index, name: preset.name, scene: null };
+        // Always sent once the switch completes, even if nothing changed.
+        send({ t: 'patch', current: board.current });
+      }, kSwitchDelayMs)
+    );
+  };
+
+  const receive = (text) => {
+    let command;
+    try {
+      command = JSON.parse(text);
+    } catch {
+      return sendError('badRequest', 'unparseable');
+    }
+    if (command.t === 'resync') {
+      log('resync requested');
+      return sendSnapshot();
+    }
+    if (command.t === 'switchPreset') {
+      if (
+        typeof command.id !== 'string' ||
+        !Number.isInteger(command.index) ||
+        !Number.isInteger(command.generation)
+      ) {
+        return sendError('badRequest', 'malformed switchPreset', command.id);
+      }
+      log(`switchPreset ${command.index} (id ${command.id})`);
+      return switchPreset(command);
+    }
+    sendError('badRequest', `unknown t ${command.t}`, command.id);
+  };
 
   socket.on('data', (chunk) => {
     buffer = Buffer.concat([buffer, chunk]);
@@ -291,30 +347,19 @@ function startSession(socket, onClosed) {
         socket.write(encodeFrame(frame.payload, 0xa));
         continue;
       }
-      if (frame.opcode !== 0x1) continue;
-      // Deliberately a substring check, not a JSON parser - same as the
-      // real firmware's isResyncMessage() (QcLiveUpdateEnvelope.hpp): this
-      // mock only ever needs to recognize the one inbound message this
-      // protocol subset has.
-      const text = frame.payload.toString('utf8');
-      if (text.includes('"t":"resync"')) {
-        log('resync requested');
-        sendSnapshot();
-      } else {
-        log(`ignored message: ${text}`);
-      }
+      if (frame.opcode === 0x1) receive(frame.payload.toString('utf8'));
     }
   });
 
   socket.on('error', close);
   socket.on('close', close);
+
+  return { replace };
 }
 
 server.listen(port, () => {
-  console.log(`mock board on http://localhost:${port}/  (ws://localhost:${port}/ws)`);
-  console.log(`serving ${docRoot}`);
+  const actualPort = server.address().port;
+  console.log(`mock board on http://localhost:${actualPort}/  (ws://localhost:${actualPort}/ws)`);
+  console.log(`serving ${docRoot}, build ${BUILD}`);
   console.log(`fixture ${fixturePath}`);
-  if (maxWsClients > 0) {
-    console.log(`--max-ws-clients ${maxWsClients}: a further concurrent tab's WebSocket is refused`);
-  }
 });
