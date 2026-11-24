@@ -5,12 +5,10 @@ live in `QcWifiWebTransport.hpp`. Lit 3, no build step, plain ES modules - see
 [ADR 0011](../../docs/adr/0011-web-ui-stack.md) for why.
 
 This tree is **separate from [`web/poc/`](../poc/README.md)**, which stays as a frozen
-research artifact: the PoC's protocol (a `current` preset, `link.qcConnected`) was never
-what the board ships. [Issue #75](https://github.com/rrooding/QCRemote/issues/75)'s real
-envelope (`QcLiveUpdateEnvelope.hpp`, `firmware/README.md`'s "Live WebSocket updates"
-section) is leaner - no preset identity on the wire yet, just a catalog and a
-command/count tally - and this tree is built against that, not the PoC's assumption. See
-`src/store.js`'s own header comment for the exact shapes.
+research artifact. It speaks the Board's WebSocket contract in [`docs/api/`](../../docs/api/README.md)
+([ADR 0012](../../docs/adr/0012-web-api-contract.md)): a snapshot, section-replacing patches,
+ticks and errors, `resync` after a `seq` gap, a build id instead of a protocol version, and
+close code 4001 when another page takes over. `src/store.js` is where the page applies it.
 
 ## Run it
 
@@ -19,23 +17,48 @@ node web/ui/tools/mock-server.mjs          # http://localhost:8080/
 ```
 
 Node 18 or newer, no `npm install`, no dependencies. Open the page: the mock replays
-`fixtures/session.json` - a 3-folder / 48-preset catalog, then two preset-change events a
-few seconds apart (the issue #75 fix: a *repeat* change must update just as fast as the
-first one, not wait up to a minute) and a scene-change tally bump.
+`fixtures/session.json` - a 3-folder / 48-preset Catalog, two preset changes at the unit, the
+Link dropping and coming back, an error, a Catalog change (a new snapshot), and after 40 s one
+replace with close code 4001, so the "Opened on another device" banner and its take-over button
+can be tried. Tapping is not wired yet (#78), but the mock already answers `switchPreset`
+with a `current` patch or a `qcDisconnected` / `staleCatalog` / `badIndex` error.
+
+The mock serves one live page at a time like the Board: opening a second tab closes the first
+with 4001. It sends the page's own build id (`src/build.js`), so the page never reloads
+against it.
 
 Useful flags:
 
 | Flag | What it does |
 | --- | --- |
-| `--port N` | Listen somewhere else (default 8080). |
+| `--port N` | Listen somewhere else (default 8080; 0 picks a free port). |
 | `--fixture <file>` | Replay a different session. |
-| `--drop-every N` | Silently skip every Nth patch while still burning its sequence number, to exercise the gap → resync path. |
-| `--max-ws-clients N` | Refuse any concurrent WebSocket upgrade past N, mirroring the real board's `CONFIG_WEBSOCKET_MAX_CONTEXTS=1` one-client policy. Set to `1` and open a second tab to check its fallback-to-HTTP behaviour without touching hardware. |
+| `--drop-every N` | Silently skip every Nth message after a snapshot while still burning its `seq`, to exercise the gap → `resync` path. |
 
-To point the page at a **real board** instead of the mock while still serving the UI from
+To point the page at a **real Board** instead of the mock while still serving the UI from
 the Mac, load `http://localhost:8080/?board=192.168.1.42` - the page then opens its
-WebSocket (and its one-shot `GET /api/presets.json`) against that address. That is the
-iteration loop ADR 0011 recommends: edit a file, reload, no reflash.
+WebSocket against that address. That is the iteration loop ADR 0011 recommends: edit a file,
+reload, no reflash. The page served from the Mac has build id `dev`, so against a Board it
+reloads once and then shows that it doesn't match the Board's firmware; that's expected.
+
+## Test it
+
+```sh
+node --test web/ui/test/
+```
+
+Node's built-in test runner, no `npm install`; Node 22 or newer, for its built-in WebSocket
+client. `test/store.test.js` drives the `Store`
+through its public interface with a fake WebSocket, `location` and `sessionStorage`, feeding
+it the Board → page messages in `docs/api/examples/server/`. `test/mock-server.test.js` runs
+the mock on a free port and checks what it sends against the same examples.
+
+## Build id
+
+`src/build.js` is checked in as `export const BUILD = "dev";`. The firmware's asset embed
+step rewrites that value to the firmware's build id when it embeds the page, so the page
+and the Board's `snapshot.build` match. When they don't, the page reloads once per Board
+build per tab (`sessionStorage`) without applying the snapshot.
 
 ## Measure it
 
@@ -55,16 +78,18 @@ with `Content-Encoding: gzip`.
 ```
 index.html                 page shell: viewport, meta, design tokens, module entry
 manifest.webmanifest       standalone/home-screen metadata (works over plain HTTP)
-src/store.js               the state model: snapshot/patch, seq gaps, reconnect, HTTP fallback
+src/store.js               the state model: the docs/api contract, reconnect, take-over
+src/build.js               the page's build id ("dev"; rewritten by the firmware embed step)
 src/store-controller.js    Lit ReactiveController that ties the store to component updates
 src/qc-app.js              shell: header with link state, scroll container
-src/qc-status.js           catalog summary + the last preset-change event (command/count)
-src/qc-preset-list.js      folders and presets, keyed, read-only
+src/qc-status.js           the Current preset, the Link and a Catalog summary
+src/qc-preset-list.js      folders and presets, keyed, the Current preset marked, read-only
 vendor/lit.js               pinned Lit 3.3.3 bundle (see tools/vendor-lit.mjs) - this
                            tree's own copy, not shared with web/poc/vendor/lit.js
 tools/mock-server.mjs      dev-only mock board: static files + RFC 6455 WebSocket + replay
 tools/vendor-lit.mjs       regenerates vendor/lit.js on a Lit upgrade (needs npm, rarely run)
-fixtures/session.json      a 3-folder / 48-preset catalog plus a few preset-change events
+fixtures/session.json      the mock's scripted session (Catalog, patches, an error, a 4001)
+test/                      node --test suites for the store and the mock
 ```
 
 `firmware/app/tools/embed_assets.py` (not duplicated here) is the asset pipeline itself -
@@ -73,8 +98,9 @@ reaches the board.
 
 ## What's deliberately not here
 
-- **Preset switching, scenes, the grid, parameters, footswitches.** Issue #78 and
-  Milestone 3. The board has nothing to switch to or report back yet on this wire.
+- **Tapping to switch presets, its 4 s timeout and the `staleCatalog`/`busy` wording in
+  context.** Issue #78. The store already has `switchPreset()`, pending state and error
+  mapping. Scenes, the grid, parameters and footswitches are Milestone 3.
 - **Any Neural DSP artwork, icon, typeface or colour.** Everything drawn is ours - the
   system font stack and a palette written from scratch (ADR 0011 decision 8). The preset
   names in the fixture are invented.
