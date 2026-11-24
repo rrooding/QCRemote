@@ -1,0 +1,30 @@
+name: api-contract
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "docs/api/**"
+      - ".github/workflows/api-contract.yml"
+  pull_request:
+    paths:
+      - "docs/api/**"
+      - ".github/workflows/api-contract.yml"
+
+# Issue #101: keeps the web UI <-> Board API contract (docs/api) and its
+# examples honest. check_examples.py declares its own dependencies inline
+# (PEP 723), so `uv run` is the whole setup. Deliberately separate from the
+# firmware workflow: no Zephyr image, no firmware build, just a few seconds
+# of Python.
+jobs:
+  check-examples:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out QCRemote
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.4.0
+
+      - name: Check the API examples against the schemas
+        run: uv run docs/api/check_examples.py

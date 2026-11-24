@@ -17,6 +17,16 @@ The schemas and examples are documentation and test fixtures only. Nothing here 
 into the firmware: the Board's encoder stays hand-written, and its unit tests compare its
 output against the example files.
 
+## CI
+
+The [`api-contract`](../../.github/workflows/api-contract.yml) workflow runs
+`uv run docs/api/check_examples.py` on every pull request, and on every push to `master`,
+that touches `docs/api/**` or the workflow file. A change that breaks an example, or the schema
+it is checked against, fails the job. The checker verifies that every example validates
+(and every `examples/invalid/` one is rejected), that examples are compact, and that page → Board
+frames are at most 256 bytes. The job installs only `uv` and none of the firmware toolchain, so
+it is independent of the `firmware` workflow. Run the same command locally before pushing.
+
 This document covers the rules a schema can't express. When it and a schema disagree, fix
 whichever is wrong in the same change.
 

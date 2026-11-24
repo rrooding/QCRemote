@@ -1,78 +1,106 @@
-// The whole client state model for the real UI: one store, fed by a
-// reconnecting WebSocket, that components subscribe to (same shape as
-// web/poc/src/store-controller.js's ReactiveController glue - reused as-is).
+// The whole client state model for the page: one store, fed by a
+// reconnecting WebSocket, that components subscribe to.
 //
-// This consumes exactly the subset of ADR 0011's envelope issue #75 ships
-// on the board today (QcLiveUpdateEnvelope.hpp, firmware/README.md's
-// "Live WebSocket updates (issue #75)" section) - NOT web/poc's research
-// protocol, which assumed a `current` preset and a `link.qcConnected`
-// field the board does not actually send:
+// It speaks the contract in docs/api/ (README, schemas, examples) and
+// ADR 0012 - that is the source of truth for every message shape, rule and
+// number below; this comment only says how the page applies them.
 //
-//   server -> client  {"v":1,"t":"snapshot","seq":N,"catalog":{...}}
-//                     {"v":1,"t":"patch","seq":N,"lastChange":{"command":N,"count":M}}
-//                     {"v":1,"t":"tick","seq":N}                          (liveness only)
-//   client -> server  {"v":1,"t":"resync"}        (after a seq gap - send a snapshot)
+//   Board -> page  snapshot  {t,seq:0,build,catalog,current,link}  complete state
+//                  patch     {t,seq,current?,link?}                 replaces sections
+//                  tick      {t,seq}                                liveness only
+//                  error     {t,seq,id?,code,message}               a rejected command
+//   page -> Board  resync    {t}                                    after a seq gap
 //
-// The board has no notion of "the currently loaded preset" on this wire:
-// RecallPreset and friends carry no preset identity, just a command id and
-// a running count (QcPresetChangeEvent) - a transport-agnostic tally, not
-// decoded preset content (see QcPresetTransport.hpp). So the most "live"
-// state this UI can show is the catalog plus the last preset-change
-// event's command/count - the same information the inline test page this
-// replaces showed as its status line. Preset identity by index/name, and
-// preset switching (#78), are later issues once the board emits them.
-//
-// `seq` is per-connection and monotonic. A gap means we missed a message,
-// so the client asks for a fresh snapshot instead of silently rendering
-// stale state.
+// There is no protocol version: a snapshot whose `build` differs from the
+// page's own BUILD (src/build.js, rewritten by the firmware's embed step)
+// means this tab is running old JavaScript against new firmware, so it
+// reloads instead of guessing.
 
-export const PROTOCOL_VERSION = 1;
-
-// Liveness. The board only speaks when something changes, so silence is
-// ambiguous: it could be an idle rig or a TCP connection that died without
-// a FIN (a Wi-Fi drop looks exactly like that). The board sends a `tick`
-// at a known cadence (CONFIG_QC_WIFI_WEB_TICK_INTERVAL_MS, 5000ms by
-// default) and a missed window here is treated as a dead link, which is
-// what makes a reconnect happen at all on a half-open socket.
+// Liveness: the Board sends something at least every 5 s, and 12.5 s of
+// silence (2.5 intervals) is a dead Connection. Both numbers are the
+// contract's (docs/api/README.md, "Liveness") - change them there first.
 const kTickIntervalMs = 5000;
 const kLivenessTimeoutMs = kTickIntervalMs * 2.5;
 
 // Reconnect backoff: fast enough that walking back into Wi-Fi range feels
-// instant, capped so a board that is simply off doesn't get hammered.
-// Jitter keeps two open tabs from retrying in lockstep. This is also what
-// a second browser's WebSocket does forever under the board's one-client
-// policy (CONFIG_WEBSOCKET_MAX_CONTEXTS=1) - its upgrade completes at the
-// HTTP level then the connection is torn down immediately, so this loop
-// just keeps trying until the first browser disconnects.
+// instant, capped so a Board that is simply off doesn't get hammered.
+// Jitter keeps two open tabs from retrying in lockstep.
 const kBackoffMs = [250, 500, 1000, 2000, 5000, 10000];
 
+// The Board closes an older page's socket with this code when a newer
+// page connects (docs/api/README.md, "One page at a time").
+const kReplacedCloseCode = 4001;
+const kReplacedText = 'Opened on another device';
+
+// sessionStorage key holding the Board build this tab last reloaded for.
+const kReloadedForBuildKey = 'qcRemote.reloadedForBuild';
+const kPageOutdatedText = "This page doesn't match the Board's firmware. Reload it to update.";
+
+// The page's own wording for each error `code` (docs/api/README.md,
+// "Errors"). The Board's `message` is English detail for the console and
+// logs, and is never shown.
+const kErrorText = Object.freeze({
+  qcDisconnected: "The Quad Cortex isn't connected to the Board.",
+  badIndex: "That preset isn't on the Quad Cortex any more.",
+  staleCatalog: 'The preset list just changed. Pick the preset again.',
+  busy: 'Still switching to the last preset.',
+  badRequest: "The Board didn't understand the page's request.",
+});
+const kUnknownErrorText = 'The Board refused that.';
+
 const emptyState = Object.freeze({
-  /** 'offline' | 'connecting' | 'online' - this WebSocket's own state. */
-  link: 'offline',
-  /** Last error text worth showing, or null. */
+  /**
+   * This page's Connection to the Board: 'offline' | 'connecting' |
+   * 'online' | 'replaced' (another page took over; see takeOver()).
+   */
+  connection: 'offline',
+  /** Last problem worth showing, in the page's own words, or null. */
   error: null,
-  /** { generation, presetCount, incomplete, folders: [{ name, presets }] } */
-  catalog: { generation: 0, presetCount: 0, incomplete: true, folders: [] },
-  /** { command, count } from the last patch, or null before the first one. */
-  lastChange: null,
+  /** { generation, presetCount, incomplete, folders: [{ name, presets: [{ index, name }] }] } */
+  catalog: Object.freeze({ generation: 0, presetCount: 0, incomplete: true, folders: [] }),
+  /** The Current preset: { index, name, scene }, each null when unknown. */
+  current: Object.freeze({ index: null, name: null, scene: null }),
+  /** The Link to the Quad Cortex: { qcConnected }. */
+  link: Object.freeze({ qcConnected: false }),
+  /**
+   * The switch the page asked for and the Board hasn't confirmed or
+   * rejected yet: { id, index }, or null. Confirmed, not optimistic
+   * (ADR 0011 decision 5): the selection only moves with `current`.
+   */
+  pending: null,
 });
 
 export class Store {
   #state = emptyState;
   #listeners = new Set();
-  #socket = null;
   #url;
-  #httpOrigin;
+  #build;
+  #WebSocket;
+  #location;
+  #sessionStorage;
+  #socket = null;
   #attempt = 0;
   #seq = null;
-  #gotSnapshot = false;
   #livenessTimer = null;
   #reconnectTimer = null;
   #closed = false;
+  #commandCount = 0;
+  #listening = false;
 
-  constructor(url, httpOrigin) {
+  /**
+   * @param {object} options
+   * @param {string} options.url             the Board's WebSocket URL
+   * @param {string} options.build           this page's build id (src/build.js)
+   * @param {typeof WebSocket} options.WebSocket
+   * @param {{ reload(): void }} options.location
+   * @param {Storage} options.sessionStorage
+   */
+  constructor({ url, build, WebSocket, location, sessionStorage }) {
     this.#url = url;
-    this.#httpOrigin = httpOrigin;
+    this.#build = build;
+    this.#WebSocket = WebSocket;
+    this.#location = location;
+    this.#sessionStorage = sessionStorage;
   }
 
   get state() {
@@ -87,15 +115,40 @@ export class Store {
 
   connect() {
     this.#closed = false;
-    this.#fetchInitialCatalog();
     this.#open();
     // Coming back from a locked phone or a backgrounded tab is the single
-    // most common way this connection dies on iOS. Both events are cheap
-    // and land well before the liveness timeout would.
-    addEventListener('online', () => this.#retryNow());
-    addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') this.#retryNow();
-    });
+    // most common way this Connection dies on iOS. Both events are cheap
+    // and land well before the liveness timeout would. (Absent outside a
+    // browser, e.g. under node --test.)
+    if (!this.#listening && typeof globalThis.addEventListener === 'function') {
+      this.#listening = true;
+      globalThis.addEventListener('online', () => this.#retryNow());
+      globalThis.addEventListener('visibilitychange', () => {
+        if (globalThis.document?.visibilityState === 'visible') this.#retryNow();
+      });
+    }
+  }
+
+  /**
+   * Connect again after another page replaced this one (close code 4001).
+   * The Board then closes that other page's socket with 4001 in turn.
+   */
+  takeOver() {
+    if (this.#state.connection !== 'replaced') return;
+    this.#attempt = 0;
+    this.#open();
+  }
+
+  /**
+   * Ask the Board to load the Preset with this Catalog-wide index. Marks it
+   * pending; the Board's `current` patch or an `error` with the same id
+   * settles it. (The 4 s give-up and refusing a tap while pending are #78.)
+   */
+  switchPreset(index) {
+    this.#commandCount += 1;
+    const id = `c${this.#commandCount}`;
+    this.#send({ t: 'switchPreset', id, index, generation: this.#state.catalog.generation });
+    this.#setState({ pending: { id, index }, error: null });
   }
 
   close() {
@@ -106,128 +159,68 @@ export class Store {
 
   // --- internals -----------------------------------------------------------
 
-  // A second open browser never gets a live WebSocket at all under the
-  // board's one-client policy: Zephyr completes the upgrade at the HTTP
-  // level and then tears the connection down immediately
-  // (firmware/README.md's "What a second browser sees under the one-client
-  // policy"), so #open()'s reconnect loop below just retries on backoff
-  // forever. Without this fetch that second tab would show an empty list
-  // the whole time - this is the same one-shot GET the old inline page
-  // made on load (QcWifiWebTransport.hpp's kIndexHtml, before this issue),
-  // now made by the store instead of relying on a page reload.
-  async #fetchInitialCatalog() {
-    try {
-      const response = await fetch(`${this.#httpOrigin}/api/presets.json`);
-      if (!response.ok) return;
-      const catalog = await response.json();
-      // A WebSocket snapshot is always current; don't let a slower HTTP
-      // response clobber it once one has arrived.
-      if (!this.#gotSnapshot) this.#patchState({ catalog });
-    } catch {
-      // No link yet - a WebSocket snapshot will supersede this once the
-      // connection comes up, and #open()'s own reconnect loop is already
-      // handling that side.
-    }
-  }
-
   #open() {
-    this.#patchState({ link: 'connecting' });
-    let socket;
-    try {
-      socket = new WebSocket(this.#url);
-    } catch (err) {
-      // Constructing a WebSocket throws synchronously for a malformed URL,
-      // which is a bug on our side, not a dropped link - don't retry it.
-      this.#patchState({ link: 'offline', error: String(err) });
-      return;
-    }
+    this.#setState({ connection: 'connecting' });
+    const socket = new this.#WebSocket(this.#url);
     this.#socket = socket;
 
     socket.onopen = () => {
       this.#attempt = 0;
+      // The page sends nothing on connect: the Board sends a snapshot as
+      // soon as the socket opens, and until it arrives nothing else applies.
       this.#seq = null;
-      this.#patchState({ link: 'online', error: null });
+      this.#setState({ connection: 'online', error: null });
       this.#armLiveness();
     };
 
     socket.onmessage = (event) => {
+      if (socket !== this.#socket) return;
       this.#armLiveness();
       let message;
       try {
         message = JSON.parse(event.data);
       } catch {
-        // A frame we can't parse is a protocol bug, not a reason to drop
-        // the connection - every other message still works.
+        // A frame we can't parse is a Board bug, not a reason to drop the
+        // Connection - every other message still works.
         return;
       }
       this.#handle(message);
     };
 
-    socket.onclose = () => {
+    socket.onclose = (event) => {
+      // A socket this store already replaced (liveness timeout, take-over)
+      // can still report its close late; only the current one counts.
+      if (socket !== this.#socket) return;
       clearTimeout(this.#livenessTimer);
-      this.#patchState({ link: 'offline' });
+      // Either way, a switch in flight on a dead socket is never answered,
+      // so `pending` clears.
+      if (event?.code === kReplacedCloseCode) {
+        // A newer page took the Board's one live socket. Reconnecting on
+        // our own would just replace it back, so the two would fight;
+        // only the user's take-over connects again.
+        this.#setState({ connection: 'replaced', error: kReplacedText, pending: null });
+        return;
+      }
+      this.#setState({ connection: 'offline', pending: null });
       this.#scheduleReconnect();
     };
 
-    // onerror is always followed by onclose, so the reconnect is handled
-    // there; this only exists so the browser console isn't the only
-    // record.
-    socket.onerror = () => this.#patchState({ error: 'WebSocket error' });
-  }
-
-  #handle(message) {
-    if (message.v !== PROTOCOL_VERSION) {
-      this.#patchState({
-        error: `Board speaks protocol v${message.v}, this page speaks v${PROTOCOL_VERSION}`,
-      });
-      return;
-    }
-
-    // Gap detection. A snapshot resets the sequence; anything else must be
-    // exactly one past what we last saw, or we have missed a change and
-    // our state is a guess.
-    if (message.t === 'snapshot') {
-      this.#seq = message.seq ?? 0;
-    } else if (typeof message.seq === 'number') {
-      if (this.#seq !== null && message.seq !== this.#seq + 1) {
-        this.#seq = null;
-        this.#send({ v: PROTOCOL_VERSION, t: 'resync' });
-        return;
-      }
-      this.#seq = message.seq;
-    }
-
-    switch (message.t) {
-      case 'snapshot':
-        this.#gotSnapshot = true;
-        this.#patchState({
-          catalog: message.catalog ?? emptyState.catalog,
-          // A fresh snapshot already reports the full current state; a
-          // lastChange from before it would describe a now-superseded
-          // moment.
-          lastChange: null,
-        });
-        break;
-      case 'patch':
-        if (message.lastChange) this.#patchState({ lastChange: message.lastChange });
-        break;
-      case 'tick':
-        break;
-      default:
-        // Forward compatibility: a v1 client must ignore message types it
-        // doesn't know rather than treat them as an error, so the board
-        // can add message types (the full schema is #15) without breaking
-        // an older page served from older flash.
-        break;
-    }
+    // onerror is always followed by onclose, which handles the reconnect.
+    socket.onerror = () => {};
   }
 
   #armLiveness() {
     clearTimeout(this.#livenessTimer);
     this.#livenessTimer = setTimeout(() => {
-      // Nothing for 2.5 tick intervals: assume a half-open socket. close()
-      // fires onclose, which schedules the reconnect.
-      this.#socket?.close();
+      // A half-open socket after a Wi-Fi drop looks exactly like an idle
+      // Board, except that the Board promises a message every tick
+      // interval. Treat the socket as dead and reconnect now rather than
+      // wait for TCP to notice.
+      const socket = this.#socket;
+      this.#socket = null;
+      socket?.close();
+      this.#setState({ connection: 'offline', pending: null });
+      this.#scheduleReconnect();
     }, kLivenessTimeoutMs);
   }
 
@@ -241,27 +234,111 @@ export class Store {
   }
 
   #retryNow() {
-    if (this.#closed || this.#state.link === 'online') return;
+    const { connection } = this.#state;
+    if (this.#closed || connection === 'online' || connection === 'replaced') return;
     this.#attempt = 0;
     clearTimeout(this.#reconnectTimer);
     this.#open();
   }
 
+  #handle(message) {
+    // `seq` counts every Board -> page message on this connection, ticks
+    // and errors included. A snapshot is always 0 and resets the count;
+    // anything else must be exactly one past the last. `#seq === null`
+    // means "waiting for a snapshot": right after connecting, and after a
+    // gap. In that state every other message is discarded, because patches
+    // already on their way apply to a state this page no longer has.
+    if (message.t !== 'snapshot') {
+      if (this.#seq === null) return;
+      if (message.seq !== this.#seq + 1) {
+        this.#seq = null;
+        this.#send({ t: 'resync' });
+        return;
+      }
+      this.#seq = message.seq;
+    }
+
+    switch (message.t) {
+      case 'snapshot':
+        if (message.build !== this.#build && this.#reloadForBuild(message.build)) return;
+        this.#seq = message.seq;
+        this.#setState({
+          catalog: message.catalog,
+          current: message.current,
+          link: message.link,
+        });
+        break;
+      case 'patch': {
+        // Each section present replaces that section whole - no merging
+        // inside it. Only `current` and `link` can change by patch: the
+        // Catalog only ever arrives in a snapshot, so a `catalog` here is
+        // ignored like any other unknown field.
+        const sections = {};
+        if (message.current) sections.current = message.current;
+        if (message.link) sections.link = message.link;
+        // The Board always sends a `current` patch when a switch completes,
+        // even if the Current preset didn't change.
+        if (message.current && message.current.index === this.#state.pending?.index) {
+          sections.pending = null;
+        }
+        this.#setState(sections);
+        break;
+      }
+      case 'error': {
+        const update = { error: kErrorText[message.code] ?? kUnknownErrorText };
+        if (message.id !== undefined && message.id === this.#state.pending?.id) {
+          update.pending = null;
+        }
+        this.#setState(update);
+        break;
+      }
+      default:
+        // Both sides ignore message types they don't know: that is the
+        // contract's extension point.
+        break;
+    }
+  }
+
+  // This tab is running JavaScript from another build than the Board's
+  // firmware - typically a page loaded before a reflash that has since
+  // reconnected on its own. Reload to fetch the Board's own page, but at
+  // most once per Board build per tab: if the reload brings back the same
+  // old page (a cache that ignores no-cache), reloading again would loop
+  // forever. Returns whether it reloaded; if not, the caller applies the
+  // snapshot and the page says it may be out of date.
+  #reloadForBuild(boardBuild) {
+    let alreadyReloaded = false;
+    try {
+      alreadyReloaded = this.#sessionStorage.getItem(kReloadedForBuildKey) === boardBuild;
+      if (!alreadyReloaded) this.#sessionStorage.setItem(kReloadedForBuildKey, boardBuild);
+    } catch {
+      // Storage blocked (a private window, say). Without a record there is
+      // no loop guard, so don't reload at all.
+      alreadyReloaded = true;
+    }
+    if (alreadyReloaded) {
+      this.#setState({ error: kPageOutdatedText });
+      return false;
+    }
+    this.#location.reload();
+    return true;
+  }
+
   #send(message) {
-    if (this.#socket?.readyState === WebSocket.OPEN) {
+    if (this.#socket?.readyState === this.#WebSocket.OPEN) {
       this.#socket.send(JSON.stringify(message));
     }
   }
 
-  #patchState(partial) {
+  #setState(partial) {
     this.#state = { ...this.#state, ...partial };
     for (const listener of this.#listeners) listener(this.#state);
   }
 }
 
-// Where the WebSocket lives. Served from the board, that's the same
+// Where the WebSocket lives. Served from the Board, that's the same
 // origin. Served from a Mac during development it is either the mock
-// server on this same origin or, with ?board=<ip>, a real board - which is
+// server on this same origin or, with ?board=<ip>, a real Board - which is
 // what makes iterating on the UI without reflashing possible (ADR 0011
 // question 7).
 export function websocketUrl(location) {
@@ -269,13 +346,4 @@ export function websocketUrl(location) {
   if (board) return `ws://${board}/ws`;
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${scheme}//${location.host}/ws`;
-}
-
-// Same seam as websocketUrl(), for the plain HTTP GET #fetchInitialCatalog()
-// makes: '' (same origin as the page) normally, or the real board's origin
-// under ?board=<ip> so that fetch still reaches the board while the page
-// itself is served from the Mac.
-export function httpOrigin(location) {
-  const board = new URLSearchParams(location.search).get('board');
-  return board ? `http://${board}` : '';
 }
