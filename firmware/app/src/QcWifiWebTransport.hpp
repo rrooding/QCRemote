@@ -341,8 +341,13 @@ private:
             return;
         }
         if (messageType & WEBSOCKET_FLAG_PING) {
-            (void)websocket_send_msg(liveSocket_, frameBuffer_, static_cast<size_t>(received),
-                                     WEBSOCKET_OPCODE_PONG, /*mask=*/false, /*final=*/true, kSendTimeoutMs);
+            const int ponged = websocket_send_msg(liveSocket_, frameBuffer_, static_cast<size_t>(received),
+                                                  WEBSOCKET_OPCODE_PONG, /*mask=*/false, /*final=*/true,
+                                                  kSendTimeoutMs);
+            if (ponged < 0) {
+                LOG_INF("Websocket client %d gone answering a ping (err=%d), dropping", liveSocket_, ponged);
+                dropPage();
+            }
             return;
         }
         if (!(messageType & (WEBSOCKET_FLAG_TEXT | WEBSOCKET_FLAG_BINARY))) {
@@ -401,15 +406,28 @@ private:
     void closeReplacedPage() {
         const uint8_t closeCode[] = {static_cast<uint8_t>(kReplacedCloseCode >> 8),
                                      static_cast<uint8_t>(kReplacedCloseCode & 0xff)};
-        (void)websocket_send_msg(liveSocket_, closeCode, sizeof(closeCode), WEBSOCKET_OPCODE_CLOSE,
-                                 /*mask=*/false, /*final=*/true, kSendTimeoutMs);
-        LOG_INF("Websocket client %d replaced by a newer page, closed with %u", liveSocket_,
-                kReplacedCloseCode);
+        const int sent = websocket_send_msg(liveSocket_, closeCode, sizeof(closeCode), WEBSOCKET_OPCODE_CLOSE,
+                                            /*mask=*/false, /*final=*/true, kSendTimeoutMs);
+        if (sent < 0) {
+            // Dropped all the same: that page is gone either way, it just
+            // won't see 4001 and will reconnect instead of stopping.
+            LOG_WRN("Websocket client %d replaced by a newer page, but sending close %u failed (err=%d)",
+                    liveSocket_, kReplacedCloseCode, sent);
+        } else {
+            LOG_INF("Websocket client %d replaced by a newer page, closed with %u", liveSocket_,
+                    kReplacedCloseCode);
+        }
         dropPage();
     }
 
     void dropPage() {
-        (void)websocket_unregister(liveSocket_);
+        const int ret = websocket_unregister(liveSocket_);
+        if (ret < 0) {
+            // Nothing to retry: the socket is forgotten regardless. A
+            // context Zephyr didn't release (-ENOENT/-EALREADY: it already
+            // had) would show up as the next page being refused.
+            LOG_WRN("websocket_unregister(%d) failed: %d", liveSocket_, ret);
+        }
         liveSocket_ = -1;
         session_.connectionClosed();
     }
