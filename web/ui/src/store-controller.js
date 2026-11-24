@@ -21,8 +21,10 @@ export class StoreController {
     return this.#store.state;
   }
 
-  get store() {
-    return this.#store;
+  // After another page took over (connection 'replaced'): make this page
+  // the live one again.
+  takeOver() {
+    this.#store.takeOver();
   }
 
   hostConnected() {

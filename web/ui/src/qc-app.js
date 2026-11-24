@@ -134,7 +134,7 @@ export class QcApp extends LitElement {
         ? html`<p class="error" role="status">
             <span>${error}</span>
             ${connection === 'replaced'
-              ? html`<button @click=${() => this.#store.store.takeOver()}>Use here</button>`
+              ? html`<button @click=${() => this.#store.takeOver()}>Use here</button>`
               : null}
           </p>`
         : html`<span></span>`}
