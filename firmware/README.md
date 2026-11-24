@@ -1952,6 +1952,80 @@ numbers, by contrast, reproduce PR #90's CI figures exactly.
    test already covered (tick heartbeat with no console error, `GlobalTempo` never showing
    up as a false preset change).
 
+## The docs/api contract on the WebSocket (issue #99)
+
+The Board now speaks [`docs/api/`](../docs/api/README.md) ([ADR 0012](../docs/adr/0012-web-api-contract.md))
+on `/ws`. This replaces issue #75's envelope (`QcLiveUpdateEnvelope.hpp`, `"v":1`, `lastChange`)
+and parts of the sections above: there is no `GET /api/presets.json` any more, and a second
+browser no longer retries forever (see "One page at a time" below).
+
+- **`QcWebApiSession.hpp`** holds the contract, with no sockets in it: events in (the Catalog
+  was published, the Current preset or the Link changed, a frame arrived, time passed), frames
+  out. It owns `seq`, snapshot vs. patch, ticks, the build id, inbound parsing and errors.
+  `QcWebApiMessages.hpp` has the hand-written encoders, `QcWebApiRequest.hpp` the inbound
+  extractor (no JSON library, at most 256 bytes). A well-formed `switchPreset` is answered with
+  `badRequest` "not implemented" until #78 executes it.
+- **`QcWifiWebTransport.hpp`** only moves bytes: it hands the session what `QcSession`
+  publishes, reads the page's frames on its worker thread, serves HTTP, and keeps one page.
+- **The transport seam** (`QcPresetTransport.hpp`) carries the Current preset and the Link
+  instead of the tally event. The tally still logs (`Post-connect tally: ...`).
+- **The Current preset** comes from `SetlistPosition` (pushed on every preset change, and
+  answered to the post-connect state READ). `QcSession` keeps the last folder key and slot,
+  and resolves them against the finished Catalog (`findCurrentPreset()`), again whenever a new
+  listing is published. Presets are now indexed across the whole Catalog, in listing order.
+  Downloads and plugin folders use `key_in_downloads`/`key_in_plugin_folder`, user folders
+  `folder_key`. **Whether those match the File listing's folder keys has not been checked on
+  hardware** - a position that doesn't resolve logs
+  `Current preset (folder "...", slot N) isn't in the Catalog`.
+- **The Link** is `qcConnected`: up when the Quad Cortex is claimed, down on removal, published
+  from the heartbeat thread (`Link up`/`Link down` in the log).
+- **One page at a time.** A new WebSocket replaces the old one, which is closed with code 4001.
+  `CONFIG_WEBSOCKET_MAX_CONTEXTS` is 2, so the new page can upgrade while the old one is still
+  open; the two contexts share one receive buffer, which is safe because only the worker
+  thread reads a socket, and only the live one.
+- **HTTP.** `/api/presets.json` and its 16 KB `responseJson_` buffer are gone. Assets are
+  dynamic resources now, so they can carry `Cache-Control: no-cache`, which makes them
+  chunked instead of `Content-Length` framed.
+- **Build id.** `tools/embed_assets.py` runs on every build and stamps the short git commit
+  into both the page (`web/ui/src/build.js`, checked in as `export const BUILD = "dev";`) and
+  the firmware (`kBuildId` in the generated `qc_build_id_generated.hpp`). Outside a usable git
+  checkout (for example a container that can't see the worktree's `.git`) both get `unknown`.
+
+### Verified
+
+`west twister -p native_sim -T firmware/app/tests`, in `ghcr.io/rrooding/qcremote-firmware:v4.5.0-1`:
+12 of 12 configurations, 150 of 150 cases pass. `tests/web_api_session` (new, replaces `tests/live_updates`) compares
+every frame with `docs/api/examples` byte for byte, replays the examples' own `seq` sequence
+through a resync, and feeds the parser the client examples and 30 malformed frames.
+`tests/wifi_web_http` is thinner: no `/api/presets.json`, `Cache-Control: no-cache` on assets,
+the build id in `build.js`, frames both ways, a 300-byte frame refused without breaking the
+next one, and a second page closing the first with 4001.
+
+`frdm_rw612` (default config, same image), against `7fae5bf`:
+
+| | Before | After |
+| --- | --- | --- |
+| RAM | 778 472 B | 762 632 B (**−15 840 B**) |
+| FLASH | 736 332 B | 743 140 B (**+6 808 B**) |
+
+The RAM is `responseJson_` (16 KB) less the second WebSocket context. The flash includes the
+session, parser and dynamic asset resources, plus about 750 B of the page's own growth from #100.
+
+Not verified: anything on hardware (see the smoke test below).
+
+### Smoke test
+
+1. Flash, Quad Cortex connected, open the page. The log shows `Link up`, the File stream
+   summary, then `Sent snapshot to websocket client <fd> (<N> bytes)`. The page shows the
+   Catalog and the Current preset.
+2. Change preset on the Quad Cortex. The page's Current preset follows within a couple of
+   seconds. If it doesn't, look for `Current preset (folder "...", slot N) isn't in the
+   Catalog` - that's the folder-key question above.
+3. Open the page in a second browser. The first one shows "Opened on another device" and stops
+   reconnecting; the log shows `Websocket client <fd> replaced by a newer page, closed with 4001`.
+4. `curl -i http://<board>/api/presets.json` is a 404; `curl -i http://<board>/` shows
+   `Cache-Control: no-cache`.
+
 ## Not yet done
 
 - ETL is wired in via CMake `FetchContent` (see `app/CMakeLists.txt`) but not yet used by
