@@ -298,70 +298,50 @@ no reason.
 The board serves a web UI over Wi-Fi/HTTP instead of a native app
 ([ADR 0010](docs/adr/0010-wifi-web-transport.md)). The stack for that UI, and the reasoning
 behind it, is [ADR 0011](docs/adr/0011-web-ui-stack.md) — this section states the conventions
-that follow from it rather than repeating the research; read the ADR for the "why".
+that follow from it rather than repeating the research; read the ADR for the "why". The real
+UI lives in [`web/ui/`](web/ui/README.md). [`web/poc/`](web/poc/README.md) is a frozen
+research artifact from that ADR — don't add to it.
 
 - **Lit 3, plain ES modules, no build step.** Templates are authored with Lit's `html`/`css`
-  tagged literals and served as-is; the one real requirement (bare module specifiers) is met
-  by committing a single pinned, vendored Lit bundle rather than adding a bundler. The
-  firmware build stays Python-only — no Node dependency for `west build`.
+  tagged literals and served as-is. Don't introduce bundling, minification, TypeScript or JSX
+  under `web/ui/` — ADR 0011 decision 2 names the specific triggers for revisiting that, and
+  none of them have fired.
+- **Lit is vendored, not fetched.** `web/ui/vendor/lit.js` is a single pinned bundle, which
+  is what meets the one real requirement (bare module specifiers) without a bundler. It is
+  regenerated only on a Lit upgrade by `web/ui/tools/vendor-lit.mjs` (needs `npm`/`esbuild`,
+  run by hand, never by CI or by `west build`). **Firmware CI must never gain a Node
+  dependency** — the asset pipeline that actually ships the UI
+  (`firmware/app/tools/embed_assets.py`) is Python standard library only. The page's own
+  tests (`node --test web/ui/test/`) run in the separate `api-contract` workflow.
+- **Assets are pre-gzipped at build time into a generated C++ header**, served from flash
+  with `Content-Encoding: gzip` and `Cache-Control: no-cache` — costing flash, not RAM, per
+  ADR 0011's own measurements.
 - **DOM + CSS** for lists, buttons and panels (preset list, scenes, footswitches). **SVG** for
   the grid/signal chain, knobs and meters — elements with real identity that need hit testing
   and styling. **Canvas** for nothing yet; it's reserved for a genuinely continuous, high-rate
   display (an output meter) if one ever needs it, not a default choice.
-- **Assets are pre-gzipped at build time into a generated C++ header**, served as static HTTP
-  resources with `Content-Encoding: gzip` — costing flash, not RAM, per ADR 0011's own
-  measurements.
-- **JSON over WebSocket**, in a versioned envelope (`{"v":1,"t":"<type>","seq":N,...}`) with
-  unknown message types ignored by the client, so the board can add messages without breaking
-  a page served from older flash. The full message schema is tracked in
-  [#15](https://github.com/rrooding/QCRemote/issues/15).
-- **Our own drawing, always.** No Neural DSP artwork, icons, typeface or color values are
-  copied from the device or its companion app — only the Quad Cortex's layout and interaction
-  model (a folder list, a current-preset header, a row of scene buttons) is reproduced.
-- **No JS/CSS formatting or lint tooling is enforced yet.** If the UI outgrows a handful of
-  files, that's a question for [#30](https://github.com/rrooding/QCRemote/issues/30)
-  (which already notes it as an open option, e.g. Prettier) rather than something to decide
-  here first.
-
-The planned location for this code is **`web/ui/`**; ADR 0011's own research prototype lives
-in `web/poc/` and is frozen as a reference once the real UI replaces it. The implementation
-([issue #88](https://github.com/rrooding/QCRemote/issues/88)) is in review as of this writing
-and not yet merged — treat the exact source layout and tooling under `web/ui/` as the target
-shape this section describes, not yet as shipped fact, until that lands.
-
----
-
-## Web UI (Lit, no build step)
-
-See [ADR 0011](docs/adr/0011-web-ui-stack.md) for the full reasoning; this section is the
-quick reference. The real UI lives in [`web/ui/`](web/ui/README.md).
-[`web/poc/`](web/poc/README.md) is a frozen research artifact from that ADR - don't add
-to it.
-
-- **No build step.** Plain ES modules, Lit's own `html`/`css` tagged templates, served
-  as-is. Don't introduce bundling, minification, TypeScript or JSX under `web/ui/` -
-  ADR 0011 decision 2 names the specific triggers for revisiting that, and none of them
-  have fired.
-- **Lit is vendored, not fetched.** `web/ui/vendor/lit.js` is a single pinned bundle,
-  regenerated only on a Lit upgrade by `web/ui/tools/vendor-lit.mjs` (needs `npm`/`esbuild`,
-  run by hand, never by CI or by `west build`). **Firmware CI must never gain a Node
-  dependency** - the asset pipeline that actually ships the UI
-  (`firmware/app/tools/embed_assets.py`) is Python standard library only.
-- **Our own drawing, always.** No Neural DSP artwork, icons, typeface or colour values -
-  system font stack, a palette written from scratch, CSS/SVG shapes we drew. This is a
-  hard rule, not a style preference: it's the thing that keeps this project clearly
-  distinct from Neural DSP's own software.
+- **The page speaks exactly the contract in [`docs/api/`](docs/api/README.md)**
+  ([ADR 0012](docs/adr/0012-web-api-contract.md)): JSON over the `/ws` WebSocket, every
+  message typed by `t` and numbered by `seq`, a `snapshot` then `patch`es, with message types
+  and fields a side doesn't know ignored. Ground any protocol code in that README, its
+  schemas and examples, and the firmware's side of it (`QcWebApiSession.hpp`,
+  `QcWebApiMessages.hpp`, `QcWebApiRequest.hpp`) — not in `web/poc/`'s own (richer,
+  never-shipped) research protocol. A protocol change updates the contract, the firmware and
+  the page in the same change.
+- **Our own drawing, always.** No Neural DSP artwork, icons, typeface or colour values —
+  system font stack, a palette written from scratch, CSS/SVG shapes we drew; only the Quad
+  Cortex's layout and interaction model (a folder list, a current-preset header, a row of
+  scene buttons) is reproduced. This is a hard rule, not a style preference: it's the thing
+  that keeps this project clearly distinct from Neural DSP's own software.
 - **Native feel.** `display: standalone` in the manifest, `viewport-fit=cover` +
   `env(safe-area-inset-*)`, `100dvh` not `vh`, `touch-action: manipulation` (never
   `user-scalable=no`), `color-scheme: dark`, and real tap targets (~44px minimum, prefer
   larger) on anything interactive.
-- **The client store speaks exactly what the board sends** - ground any protocol code in
-  `firmware/app/src/QcLiveUpdateEnvelope.hpp` and `firmware/README.md`'s "Live WebSocket
-  updates" section, not in `web/poc/`'s own (richer, never-shipped) research protocol.
-  Unknown message types are ignored, per the versioned envelope.
-- **Formatting**: 2-space indent, single quotes, semicolons, matching the existing
-  `web/ui/` and `web/poc/` sources - no linter/formatter config is checked in yet; match
-  the surrounding file by eye until one is.
+- **Formatting**: 2-space indent, single quotes, semicolons, matching the existing `web/ui/`
+  and `web/poc/` sources. No JS/CSS formatter or linter config is checked in yet; match the
+  surrounding file by eye until one is. If the UI outgrows a handful of files, that's a
+  question for [#30](https://github.com/rrooding/QCRemote/issues/30) (which already notes it
+  as an open option, e.g. Prettier) rather than something to decide here first.
 
 ---
 
