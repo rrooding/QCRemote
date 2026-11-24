@@ -229,7 +229,7 @@ private:
     static constexpr size_t kMaxWsContexts = 2;
     // How often run() wakes even without a publish, to read the page's
     // frames (PR #74 review: a closed tab used to hold its slot until the
-    // next publish) and to let the session send a tick when one is due.
+    // next publish). A tick due sooner than this wakes it sooner - see run().
     static constexpr int kPollIntervalMs = 1000;
     // How long to wait for the rest of a frame whose start has arrived.
     static constexpr int32_t kFrameRestTimeoutMs = 500;
@@ -246,7 +246,12 @@ private:
 
     void run() {
         while (true) {
-            (void)k_sem_take(&wakeSem_, K_MSEC(kPollIntervalMs));
+            // A timeout (-EAGAIN) is the poll, not a failure. Never sleeping
+            // past the next tick's due time is what keeps docs/api's "a
+            // message at least every 5 s" within the interval rather than
+            // up to kPollIntervalMs late.
+            const int64_t tickDueMs = session_.msUntilTickDue(k_uptime_get()).value_or(kPollIntervalMs);
+            (void)k_sem_take(&wakeSem_, K_MSEC(std::min<int64_t>(kPollIntervalMs, tickDueMs)));
             adoptNewPages();
             forwardBoardState();
             readFromPage();
