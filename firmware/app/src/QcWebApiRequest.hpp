@@ -24,6 +24,11 @@ inline constexpr size_t kWebApiMaxRequestBytes = 256;
 inline constexpr size_t kWebApiMaxCommandIdLength = 16;
 using QcWebApiCommandId = etl::string<kWebApiMaxCommandIdLength>;
 
+// The largest Preset index a switchPreset may carry: the maximum of
+// presetIndex in docs/api/schema/server-message.schema.json, which the
+// client schema's switchPreset.index refers to.
+inline constexpr uint32_t kWebApiMaxPresetIndex = 65535;
+
 struct QcWebApiResync {};
 
 struct QcWebApiSwitchPreset {
@@ -262,6 +267,42 @@ inline std::optional<uint32_t> toUInt(std::string_view raw, uint32_t max) {
     return static_cast<uint32_t>(value);
 }
 
+inline std::optional<std::string_view> toText(std::string_view raw) { return raw; }
+
+// The value of a member whose key was just read, into `field`: a string
+// through `convert` (which yields nothing for a string of the wrong shape),
+// anything else marks the field present but unusable. False only when the
+// value isn't valid JSON at all.
+template <typename T, typename Convert>
+bool readStringField(QcJsonScanner& scanner, QcJsonField<T>& field, Convert convert) {
+    field.present = true;
+    field.value.reset();
+    if (!scanner.peek('"')) {
+        return scanner.skipValue();
+    }
+    const auto raw = scanner.string();
+    if (!raw) {
+        return false;
+    }
+    field.value = convert(*raw);
+    return true;
+}
+
+// Same, for a number that must be a plain integer from 0 to `max`.
+inline bool readUIntField(QcJsonScanner& scanner, QcJsonField<uint32_t>& field, uint32_t max) {
+    field.present = true;
+    field.value.reset();
+    if (scanner.peek('"')) {
+        return scanner.skipValue();
+    }
+    const auto raw = scanner.number();
+    if (!raw) {
+        return scanner.skipValue();
+    }
+    field.value = toUInt(*raw, max);
+    return true;
+}
+
 }  // namespace detail
 
 // `text` is the frame as received; `frameLength` its full length, which is
@@ -291,42 +332,15 @@ inline QcWebApiRequest parseWebApiRequest(std::string_view text, size_t frameLen
             if (!key || !scanner.consume(':')) {
                 return unparseable;
             }
-            const auto readString = [&](auto& field, auto convert) {
-                field.present = true;
-                field.value.reset();
-                if (scanner.peek('"')) {
-                    const auto raw = scanner.string();
-                    if (!raw) {
-                        return false;
-                    }
-                    field.value = convert(*raw);
-                    return true;
-                }
-                return scanner.skipValue();
-            };
-            const auto readNumber = [&](detail::QcJsonField<uint32_t>& field, uint32_t max) {
-                field.present = true;
-                field.value.reset();
-                if (scanner.peek('"')) {
-                    return scanner.skipValue();
-                }
-                const auto raw = scanner.number();
-                if (raw) {
-                    field.value = detail::toUInt(*raw, max);
-                    return true;
-                }
-                return scanner.skipValue();
-            };
-
             bool ok = false;
             if (*key == "t") {
-                ok = readString(type, [](std::string_view raw) { return std::optional<std::string_view>(raw); });
+                ok = detail::readStringField(scanner, type, detail::toText);
             } else if (*key == "id") {
-                ok = readString(id, detail::toCommandId);
+                ok = detail::readStringField(scanner, id, detail::toCommandId);
             } else if (*key == "index") {
-                ok = readNumber(index, 65535);
+                ok = detail::readUIntField(scanner, index, kWebApiMaxPresetIndex);
             } else if (*key == "generation") {
-                ok = readNumber(generation, UINT32_MAX);
+                ok = detail::readUIntField(scanner, generation, UINT32_MAX);
             } else {
                 ok = scanner.skipValue();
             }
