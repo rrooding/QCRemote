@@ -51,7 +51,10 @@ Node's built-in test runner, no `npm install`; Node 22 or newer, for its built-i
 client. `test/store.test.js` drives the `Store`
 through its public interface with a fake WebSocket, `location` and `sessionStorage`, feeding
 it the Board → page messages in `docs/api/examples/server/`. `test/mock-server.test.js` runs
-the mock on a free port and checks what it sends against the same examples.
+the mock on a free port and checks what it sends against the same examples, and every error
+code it can send against the schema. `test/store-controller.test.js` covers the Lit glue.
+CI runs the same command (the `web-ui-tests` job in `.github/workflows/api-contract.yml`,
+see `docs/api/README.md`'s CI section) on every change under `web/ui/` or `docs/api/`.
 
 ## Build id
 
@@ -89,7 +92,7 @@ vendor/lit.js               pinned Lit 3.3.3 bundle (see tools/vendor-lit.mjs) -
 tools/mock-server.mjs      dev-only mock board: static files + RFC 6455 WebSocket + replay
 tools/vendor-lit.mjs       regenerates vendor/lit.js on a Lit upgrade (needs npm, rarely run)
 fixtures/session.json      the mock's scripted session (Catalog, patches, an error, a 4001)
-test/                      node --test suites for the store and the mock
+test/                      node --test suites for the store, its controller and the mock
 ```
 
 `firmware/app/tools/embed_assets.py` (not duplicated here) is the asset pipeline itself -

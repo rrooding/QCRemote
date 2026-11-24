@@ -19,13 +19,21 @@ output against the example files.
 
 ## CI
 
-The [`api-contract`](../../.github/workflows/api-contract.yml) workflow runs
-`uv run docs/api/check_examples.py` on every pull request, and on every push to `master`,
-that touches `docs/api/**` or the workflow file. A change that breaks an example, or the schema
-it is checked against, fails the job. The checker verifies that every example validates
-(and every `examples/invalid/` one is rejected), that examples are compact, and that page → Board
-frames are at most 256 bytes. The job installs only `uv` and none of the firmware toolchain, so
-it is independent of the `firmware` workflow. Run the same command locally before pushing.
+The [`api-contract`](../../.github/workflows/api-contract.yml) workflow runs on every pull
+request, and on every push to `master`, that touches `docs/api/**`, `web/ui/**` or the
+workflow file. It has two jobs:
+
+- **`check-examples`** runs `uv run docs/api/check_examples.py`. A change that breaks an
+  example, or the schema it is checked against, fails it. The checker verifies that every
+  example validates (and every `examples/invalid/` one is rejected), that examples are compact,
+  and that page → Board frames are at most 256 bytes.
+- **`web-ui-tests`** runs `node --test web/ui/test/` (Node 22): the page's Store and the dev
+  mock Board, both tested against these examples.
+
+Neither installs any of the firmware toolchain, so the workflow is independent of the
+`firmware` one. The `firmware` workflow also runs on changes to `docs/api/**` and `web/ui/**`,
+because its `native_sim` suites compare the Board's frames with these examples byte for byte
+and embed `web/ui` into the image. Run the same commands locally before pushing.
 
 This document covers the rules a schema can't express. When it and a schema disagree, fix
 whichever is wrong in the same change.
@@ -75,6 +83,11 @@ Text frames, one JSON object per frame, UTF-8, no whitespace. Every message has 
 ```
 
 A page → Board frame is at most **256 bytes**. `id` is 1–16 characters of `[0-9A-Za-z_-]`.
+
+The page sends `t` and `id` exactly as written above, with no JSON escapes in them. The
+Board reads both without unescaping, so a frame that spells either with an escape (for
+example `{"t":"re\u0073ync"}`, which a general JSON parser reads as `resync`) is a
+`badRequest`. Other string members, which the Board doesn't read, may contain escapes.
 
 ## Sequence numbers
 
