@@ -27,6 +27,11 @@ const kLivenessTimeoutMs = kTickIntervalMs * 2.5;
 // Jitter keeps two open tabs from retrying in lockstep.
 const kBackoffMs = [250, 500, 1000, 2000, 5000, 10000];
 
+// The Board closes an older page's socket with this code when a newer
+// page connects (docs/api/README.md, "One page at a time").
+const kReplacedCloseCode = 4001;
+const kReplacedText = 'Opened on another device';
+
 // sessionStorage key holding the Board build this tab last reloaded for.
 const kReloadedForBuildKey = 'qcRemote.reloadedForBuild';
 const kPageOutdatedText = "This page doesn't match the Board's firmware. Reload it to update.";
@@ -44,7 +49,10 @@ const kErrorText = Object.freeze({
 const kUnknownErrorText = 'The Board refused that.';
 
 const emptyState = Object.freeze({
-  /** 'offline' | 'connecting' | 'online' - this page's Connection to the Board. */
+  /**
+   * This page's Connection to the Board: 'offline' | 'connecting' |
+   * 'online' | 'replaced' (another page took over; see takeOver()).
+   */
   connection: 'offline',
   /** Last problem worth showing, in the page's own words, or null. */
   error: null,
@@ -77,6 +85,7 @@ export class Store {
   #reconnectTimer = null;
   #closed = false;
   #commandCount = 0;
+  #listening = false;
 
   /**
    * @param {object} options
@@ -107,6 +116,27 @@ export class Store {
   connect() {
     this.#closed = false;
     this.#open();
+    // Coming back from a locked phone or a backgrounded tab is the single
+    // most common way this Connection dies on iOS. Both events are cheap
+    // and land well before the liveness timeout would. (Absent outside a
+    // browser, e.g. under node --test.)
+    if (!this.#listening && typeof globalThis.addEventListener === 'function') {
+      this.#listening = true;
+      globalThis.addEventListener('online', () => this.#retryNow());
+      globalThis.addEventListener('visibilitychange', () => {
+        if (globalThis.document?.visibilityState === 'visible') this.#retryNow();
+      });
+    }
+  }
+
+  /**
+   * Connect again after another page replaced this one (close code 4001).
+   * The Board then closes that other page's socket with 4001 in turn.
+   */
+  takeOver() {
+    if (this.#state.connection !== 'replaced') return;
+    this.#attempt = 0;
+    this.#open();
   }
 
   /**
@@ -136,19 +166,79 @@ export class Store {
 
     socket.onopen = () => {
       this.#attempt = 0;
+      // The page sends nothing on connect: the Board sends a snapshot as
+      // soon as the socket opens, and until it arrives nothing else applies.
       this.#seq = null;
       this.#setState({ connection: 'online', error: null });
+      this.#armLiveness();
     };
 
     socket.onmessage = (event) => {
+      if (socket !== this.#socket) return;
+      this.#armLiveness();
       let message;
       try {
         message = JSON.parse(event.data);
       } catch {
+        // A frame we can't parse is a Board bug, not a reason to drop the
+        // Connection - every other message still works.
         return;
       }
       this.#handle(message);
     };
+
+    socket.onclose = (event) => {
+      // A socket this store already replaced (liveness timeout, take-over)
+      // can still report its close late; only the current one counts.
+      if (socket !== this.#socket) return;
+      clearTimeout(this.#livenessTimer);
+      // Either way, a switch in flight on a dead socket is never answered,
+      // so `pending` clears.
+      if (event?.code === kReplacedCloseCode) {
+        // A newer page took the Board's one live socket. Reconnecting on
+        // our own would just replace it back, so the two would fight;
+        // only the user's take-over connects again.
+        this.#setState({ connection: 'replaced', error: kReplacedText, pending: null });
+        return;
+      }
+      this.#setState({ connection: 'offline', pending: null });
+      this.#scheduleReconnect();
+    };
+
+    // onerror is always followed by onclose, which handles the reconnect.
+    socket.onerror = () => {};
+  }
+
+  #armLiveness() {
+    clearTimeout(this.#livenessTimer);
+    this.#livenessTimer = setTimeout(() => {
+      // A half-open socket after a Wi-Fi drop looks exactly like an idle
+      // Board, except that the Board promises a message every tick
+      // interval. Treat the socket as dead and reconnect now rather than
+      // wait for TCP to notice.
+      const socket = this.#socket;
+      this.#socket = null;
+      socket?.close();
+      this.#setState({ connection: 'offline', pending: null });
+      this.#scheduleReconnect();
+    }, kLivenessTimeoutMs);
+  }
+
+  #scheduleReconnect() {
+    if (this.#closed) return;
+    const base = kBackoffMs[Math.min(this.#attempt, kBackoffMs.length - 1)];
+    this.#attempt += 1;
+    const delay = base + Math.random() * base * 0.3;
+    clearTimeout(this.#reconnectTimer);
+    this.#reconnectTimer = setTimeout(() => this.#open(), delay);
+  }
+
+  #retryNow() {
+    const { connection } = this.#state;
+    if (this.#closed || connection === 'online' || connection === 'replaced') return;
+    this.#attempt = 0;
+    clearTimeout(this.#reconnectTimer);
+    this.#open();
   }
 
   #handle(message) {

@@ -251,6 +251,55 @@ test('a current patch for the pending Preset clears the pending state', () => {
   assert.equal(store.state.current.index, 3);
 });
 
+test('a dropped Connection reconnects with backoff', () => {
+  const store = onlineStore();
+
+  socket().serverClose(1006);
+  assert.equal(store.state.connection, 'offline');
+  mock.timers.tick(10_000);
+
+  assert.equal(FakeWebSocket.instances.length, 2);
+  assert.equal(store.state.connection, 'connecting');
+});
+
+test('12.5 s of silence closes the Connection and reconnects', () => {
+  const store = onlineStore();
+
+  mock.timers.tick(12_000);
+  socket().receive(withSeq(example('tick'), 1));
+  mock.timers.tick(12_000);
+  assert.equal(FakeWebSocket.instances.length, 1);
+
+  mock.timers.tick(600);
+  assert.equal(store.state.connection, 'offline');
+  mock.timers.tick(10_000);
+  assert.equal(FakeWebSocket.instances.length, 2);
+});
+
+test('close code 4001 shows "Opened on another device" and stops reconnecting', () => {
+  const store = onlineStore();
+
+  socket().serverClose(4001);
+  mock.timers.tick(60_000);
+
+  assert.equal(store.state.connection, 'replaced');
+  assert.equal(store.state.error, 'Opened on another device');
+  assert.equal(FakeWebSocket.instances.length, 1);
+});
+
+test('taking over after 4001 connects again', () => {
+  const store = onlineStore();
+  socket().serverClose(4001);
+
+  store.takeOver();
+  socket().open();
+  socket().receive(example('snapshot'));
+
+  assert.equal(FakeWebSocket.instances.length, 2);
+  assert.equal(store.state.connection, 'online');
+  assert.equal(store.state.error, null);
+});
+
 test('ticks and errors count toward seq', () => {
   const store = onlineStore();
 
