@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string_view>
 
 #include <zephyr/kernel.h>
@@ -43,8 +44,7 @@ inline uint16_t g_qcWebPort = 80;
 struct QcWebAsset {
     const char* path;
     const char* contentType;
-    const uint8_t* gzipped;
-    size_t gzippedLength;
+    std::span<const uint8_t> gzipped;
 };
 
 // Issue #99 / docs/api: assets go out with Cache-Control: no-cache, so a
@@ -67,8 +67,8 @@ inline int serveWebAsset(http_client_ctx* /*client*/, http_transaction_status st
     const auto* asset = static_cast<const QcWebAsset*>(user_data);
     response_ctx->headers = kQcWebAssetHeaders;
     response_ctx->header_count = ARRAY_SIZE(kQcWebAssetHeaders);
-    response_ctx->body = asset->gzipped;
-    response_ctx->body_len = asset->gzippedLength;
+    response_ctx->body = asset->gzipped.data();
+    response_ctx->body_len = asset->gzipped.size();
     response_ctx->final_chunk = true;
     return 0;
 }

@@ -159,6 +159,7 @@ def emit_header(entries: list[tuple[str, str, bytes]], out: Path) -> None:
         "",
         "#include <cstddef>",
         "#include <cstdint>",
+        "#include <span>",
         "",
         "namespace webassets {",
         "",
@@ -176,7 +177,7 @@ def emit_header(entries: list[tuple[str, str, bytes]], out: Path) -> None:
     lines.append("inline constexpr QcWebAsset kAssets[] = {")
     for served, content_type, payload in entries:
         name = c_identifier(served)
-        lines.append(f'    {{"{served}", "{content_type}", k{name}Gz, sizeof(k{name}Gz)}},')
+        lines.append(f'    {{"{served}", "{content_type}", std::span<const uint8_t>(k{name}Gz)}},')
     lines += ["};", "", "}  // namespace webassets", ""]
 
     # user_data is a plain void* in Zephyr's struct; serveWebAsset() only

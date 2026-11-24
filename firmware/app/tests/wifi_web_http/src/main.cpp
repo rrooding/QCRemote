@@ -568,9 +568,8 @@ ZTEST(wifi_web_http, test_generated_web_asset_table_is_sane) {
     size_t foundIndex = 0;
     size_t foundVendorLit = 0;
     for (const auto& asset : qcbridge::webassets::kAssets) {
-        zassert_true(asset.gzippedLength >= 3, "%s too short to hold a gzip header", asset.path);
-        const auto bytes = std::span<const uint8_t>(asset.gzipped, asset.gzippedLength);
-        zassert_true(qcbridge::gzip::hasMagic(bytes), "%s isn't a gzip stream", asset.path);
+        zassert_true(asset.gzipped.size() >= 3, "%s too short to hold a gzip header", asset.path);
+        zassert_true(qcbridge::gzip::hasMagic(asset.gzipped), "%s isn't a gzip stream", asset.path);
         if (std::string_view(asset.path) == "/") {
             ++foundIndex;
             zassert_equal(std::string_view(asset.contentType), "text/html");
