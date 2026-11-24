@@ -1,0 +1,10 @@
+tests:
+  firmware.web_api_session:
+    # Pure C++, no Zephyr networking/HTTP stack - but the session holds a
+    # 16 KB catalog JSON buffer plus a frame buffer, and the tests a full
+    # QcCatalogSnapshot, so qemu_cortex_m3's 64KB RAM is excluded for the
+    # same reason ../preset_transport's own testcase.yaml gives.
+    platform_allow:
+      - native_sim
+      - mps2/an385
+    tags: firmware
