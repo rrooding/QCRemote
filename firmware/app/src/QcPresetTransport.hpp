@@ -1,10 +1,22 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 
 #include "QcCatalogSnapshot.hpp"
 
 namespace qcbridge {
+
+// The Current preset (GLOSSARY.md): the Catalog entry the Quad Cortex
+// reports as loaded, by its Catalog-wide index. Empty when the Board
+// doesn't know - before the Quad Cortex has reported a position, or when
+// that position isn't in the Catalog.
+using QcCurrentPreset = std::optional<QcCatalogSnapshot::PresetEntry>;
+
+// The Link (GLOSSARY.md): the Board's USB connection to the Quad Cortex.
+struct QcLinkState {
+    bool qcConnected = false;
+};
 
 // A preset-change notification forwarded from QcSession's own post-connect
 // tally (QcMessageTally.hpp) - issue #71's "live update when a preset

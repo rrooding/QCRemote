@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -88,9 +89,9 @@ inline void appendUInt(uint32_t value, etl::vector<char, N>& out) {
 }  // namespace detail
 
 // Encodes a QcCatalogSnapshot as a single JSON object:
-// {"generation":N,"presetCount":N,
-//  "folders":[{"name":"...","presets":[{"index":N,"name":"..."},...]},...],
-//  "incomplete":bool}
+// {"generation":N,"presetCount":N,"incomplete":bool,
+//  "folders":[{"name":"...","presets":[{"index":N,"name":"..."},...]},...]}
+// - the "catalog" section of docs/api's snapshot, in that key order.
 //
 // Writes into caller-provided, fixed-capacity storage (no heap, per
 // CODING_STANDARDS.md). If the snapshot doesn't fit, this stops *before*
@@ -110,8 +111,8 @@ inline void encodeCatalogJson(const QcCatalogSnapshot& snapshot, etl::vector<cha
     // escaped chars>\",\"presets\":[") or one preset entry
     // ("{\"index\":4294967295,\"name\":\"<=64 escaped chars>\"},") -
     // whichever is bigger, plus this function's own worst-case closing
-    // suffix (computed from the literal below, using "false" - one byte
-    // longer than "true" - so the reserve covers either outcome). Checked
+    // suffix (closing the open preset list, its folder, the folder list
+    // and the object). Checked
     // before writing anything for the next folder/preset, so this
     // function only ever stops at a point where it can still close the
     // JSON cleanly. kMaxUnitBytes is deliberately generous (the actual
@@ -119,7 +120,7 @@ inline void encodeCatalogJson(const QcCatalogSnapshot& snapshot, etl::vector<cha
     // escaped) rather than computed exactly - overshooting it only costs
     // reserve headroom, never correctness.
     constexpr size_t kMaxUnitBytes = 160;
-    constexpr size_t kClosingSuffixBytes = sizeof("]}],\"incomplete\":false}") - 1;
+    constexpr size_t kClosingSuffixBytes = sizeof("]}]}") - 1;
     constexpr size_t kReserve = kMaxUnitBytes + kClosingSuffixBytes;
     const auto roomFor = [&](size_t already) { return already + kReserve <= out.capacity(); };
 
@@ -127,6 +128,13 @@ inline void encodeCatalogJson(const QcCatalogSnapshot& snapshot, etl::vector<cha
     detail::appendUInt(snapshot.generation, out);
     detail::appendLiteral(",\"presetCount\":", out);
     detail::appendUInt(static_cast<uint32_t>(snapshot.presetCount), out);
+    // docs/api puts "incomplete" before "folders", but whether the folders
+    // fit is only known once they're written. So "false" goes in as a
+    // placeholder and is rewritten to "true" (one byte shorter) at the end
+    // if this encoder had to cut the listing short.
+    detail::appendLiteral(",\"incomplete\":", out);
+    const size_t incompleteAt = out.size();
+    detail::appendLiteral(snapshot.incomplete ? "true" : "false", out);
     detail::appendLiteral(",\"folders\":[", out);
 
     bool firstFolder = true;
@@ -166,9 +174,12 @@ inline void encodeCatalogJson(const QcCatalogSnapshot& snapshot, etl::vector<cha
             break;
         }
     }
-    detail::appendLiteral("],\"incomplete\":", out);
-    detail::appendLiteral((snapshot.incomplete || truncated) ? "true" : "false", out);
-    detail::appendLiteral("}", out);
+    detail::appendLiteral("]}", out);
+    if (truncated && !snapshot.incomplete) {
+        constexpr std::string_view kTrue = "true";
+        std::copy(kTrue.begin(), kTrue.end(), out.begin() + incompleteAt);
+        out.erase(out.begin() + incompleteAt + kTrue.size());
+    }
 }
 
 }  // namespace qcbridge

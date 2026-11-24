@@ -123,15 +123,60 @@ ZTEST(preset_transport, test_copy_catalog_snapshot_basic) {
 
     zassert_equal(snapshot.folders[0].name, "My Presets");
     zassert_equal(snapshot.folders[0].presets.size(), 2);
-    zassert_equal(snapshot.folders[0].presets[0].index, 0);
     zassert_equal(snapshot.folders[0].presets[0].name, "Practice 1");
-    zassert_equal(snapshot.folders[0].presets[1].index, 5);
     zassert_equal(snapshot.folders[0].presets[1].name, "Dark Jazz");
 
     // cloud-0-1's real empty folder name is special-cased to "Downloads" -
     // QcPresetCatalog.hpp's own labelFor(), exercised here through the
     // snapshot copy rather than re-tested directly.
     zassert_equal(snapshot.folders[1].name, "Downloads");
+    zassert_equal(snapshot.folders[1].presets[0].name, "Salaatti-Classic");
+}
+
+// Issue #99 / docs/api: a Preset's index counts across the whole Catalog,
+// in listing order - not its slot within its Folder (Dark Jazz sits in
+// slot 5 of My Presets, and Salaatti-Classic in slot 2 of Downloads).
+ZTEST(preset_transport, test_snapshot_indexes_presets_across_the_whole_catalog) {
+    QcPresetCatalog& catalog = freshCatalog();
+    addPreset(catalog, "my-presets", "My Presets", "Practice 1", 0);
+    addPreset(catalog, "my-presets", "My Presets", "Dark Jazz", 5);
+    addPreset(catalog, "cloud-0-1", "", "Salaatti-Classic", 2);
+
+    QcCatalogSnapshot& snapshot = freshSnapshot();
+    copyCatalogSnapshot(catalog, /*incomplete=*/false, snapshot);
+
+    zassert_equal(snapshot.folders[0].presets[0].index, 0);
+    zassert_equal(snapshot.folders[0].presets[1].index, 1);
+    zassert_equal(snapshot.folders[1].presets[0].index, 2);
+}
+
+// The Current preset comes from the Quad Cortex as a Folder key and a slot
+// in that Folder (SetlistPosition); the page addresses it by the same
+// Catalog-wide index the snapshot gives it.
+ZTEST(preset_transport, test_current_preset_is_found_by_folder_key_and_slot) {
+    QcPresetCatalog& catalog = freshCatalog();
+    addPreset(catalog, "my-presets", "My Presets", "Practice 1", 0);
+    addPreset(catalog, "my-presets", "My Presets", "Dark Jazz", 5);
+    addPreset(catalog, "cloud-0-1", "", "Salaatti-Classic", 2);
+
+    const QcCurrentPreset darkJazz = findCurrentPreset(catalog, "my-presets", 5);
+    zassert_true(darkJazz.has_value());
+    zassert_equal(darkJazz->index, 1u);
+    zassert_equal(darkJazz->name, "Dark Jazz");
+
+    const QcCurrentPreset salaatti = findCurrentPreset(catalog, "cloud-0-1", 2);
+    zassert_true(salaatti.has_value());
+    zassert_equal(salaatti->index, 2u);
+    zassert_equal(salaatti->name, "Salaatti-Classic");
+}
+
+ZTEST(preset_transport, test_current_preset_is_unknown_outside_the_catalog) {
+    QcPresetCatalog& catalog = freshCatalog();
+    addPreset(catalog, "my-presets", "My Presets", "Dark Jazz", 5);
+
+    zassert_false(findCurrentPreset(catalog, "my-presets", 4).has_value(), "an empty slot");
+    zassert_false(findCurrentPreset(catalog, "practice", 5).has_value(), "a folder with no named preset");
+    zassert_false(findCurrentPreset(freshCatalog(), "my-presets", 5).has_value(), "before any listing");
 }
 
 ZTEST(preset_transport, test_encode_catalog_json_basic) {
@@ -146,12 +191,11 @@ ZTEST(preset_transport, test_encode_catalog_json_basic) {
     encodeCatalogJson(snapshot, json);
     const std::string_view text(json.data(), json.size());
 
+    // docs/api's key order: incomplete before folders.
     zassert_true(text.starts_with("{\"generation\":"));
-    zassert_true(text.ends_with("\"incomplete\":false}"));
-    zassert_true(text.find("\"presetCount\":2") != std::string_view::npos);
-    zassert_true(text.find("\"name\":\"My Presets\"") != std::string_view::npos);
-    zassert_true(text.find("\"index\":0,\"name\":\"Practice 1\"") != std::string_view::npos);
-    zassert_true(text.find("\"index\":5,\"name\":\"Dark Jazz\"") != std::string_view::npos);
+    zassert_true(text.ends_with(R"(,"presetCount":2,"incomplete":false,"folders":[{"name":"My Presets",)"
+                                R"("presets":[{"index":0,"name":"Practice 1"},{"index":1,"name":"Dark Jazz"}]}]})"),
+                 "got %.*s", static_cast<int>(text.size()), text.data());
 }
 
 ZTEST(preset_transport, test_encode_catalog_json_escapes_special_characters) {
@@ -189,7 +233,8 @@ ZTEST(preset_transport, test_encode_catalog_json_truncates_when_undersized) {
     encodeCatalogJson(snapshot, json);
     const std::string_view text(json.data(), json.size());
 
-    zassert_true(text.ends_with("\"incomplete\":true}"));
+    zassert_true(text.find(R"("incomplete":true,"folders":[)") != std::string_view::npos, "got %.*s",
+                 static_cast<int>(text.size()), text.data());
     zassert_true(text.starts_with("{\"generation\":"));
 
     size_t openBraces = 0;
@@ -221,5 +266,5 @@ ZTEST(preset_transport, test_encode_catalog_json_reports_incomplete_from_snapsho
     encodeCatalogJson(snapshot, json);
     const std::string_view text(json.data(), json.size());
 
-    zassert_true(text.ends_with("\"incomplete\":true}"));
+    zassert_true(text.find(R"("incomplete":true,"folders":[)") != std::string_view::npos);
 }

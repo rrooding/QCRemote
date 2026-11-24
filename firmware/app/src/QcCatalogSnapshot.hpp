@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <string_view>
 
 #include <etl/vector.h>
 
@@ -23,6 +26,9 @@ namespace qcbridge {
 // read-only afterwards.
 struct QcCatalogSnapshot {
     struct PresetEntry {
+        // The Preset's index across the whole Catalog, in listing order
+        // (docs/api) - not QcPresetCatalog::PresetEntry::index, its slot
+        // within its Folder.
         uint32_t index = 0;
         QcPresetCatalog::NameString name;
     };
@@ -49,6 +55,7 @@ inline void copyCatalogSnapshot(const QcPresetCatalog& catalog, bool incomplete,
     out.incomplete = incomplete;
     out.generation = catalog.generation();
 
+    uint32_t catalogIndex = 0;
     for (const auto& folder : catalog.folders()) {
         out.folders.emplace_back();
         auto& folderOut = out.folders.back();
@@ -56,10 +63,34 @@ inline void copyCatalogSnapshot(const QcPresetCatalog& catalog, bool incomplete,
         for (const auto& preset : folder.presets) {
             folderOut.presets.emplace_back();
             auto& presetOut = folderOut.presets.back();
-            presetOut.index = preset.index;
+            presetOut.index = catalogIndex++;
             presetOut.name = preset.name;
         }
     }
+}
+
+// The Catalog entry at `slot` of the Folder keyed `folderKey` - how the
+// Quad Cortex names its Current preset (SetlistPosition's folder key and
+// position) - with the same Catalog-wide index copyCatalogSnapshot() gives
+// it. Empty when that slot holds no named Preset in this Catalog. Same
+// locking contract as copyCatalogSnapshot().
+inline std::optional<QcCatalogSnapshot::PresetEntry> findCurrentPreset(const QcPresetCatalog& catalog,
+                                                                         std::string_view folderKey,
+                                                                         uint32_t slot) {
+    uint32_t catalogIndex = 0;
+    for (const auto& folder : catalog.folders()) {
+        const bool isFolder = folder.isKey(folderKey);
+        for (const auto& preset : folder.presets) {
+            if (isFolder && preset.index == slot) {
+                QcCatalogSnapshot::PresetEntry entry;
+                entry.index = catalogIndex;
+                entry.name = preset.name;
+                return entry;
+            }
+            ++catalogIndex;
+        }
+    }
+    return std::nullopt;
 }
 
 }  // namespace qcbridge
