@@ -31,6 +31,18 @@ const kBackoffMs = [250, 500, 1000, 2000, 5000, 10000];
 const kReloadedForBuildKey = 'qcRemote.reloadedForBuild';
 const kPageOutdatedText = "This page doesn't match the Board's firmware. Reload it to update.";
 
+// The page's own wording for each error `code` (docs/api/README.md,
+// "Errors"). The Board's `message` is English detail for the console and
+// logs, and is never shown.
+const kErrorText = Object.freeze({
+  qcDisconnected: "The Quad Cortex isn't connected to the Board.",
+  badIndex: "That preset isn't on the Quad Cortex any more.",
+  staleCatalog: 'The preset list just changed. Pick the preset again.',
+  busy: 'Still switching to the last preset.',
+  badRequest: "The Board didn't understand the page's request.",
+});
+const kUnknownErrorText = 'The Board refused that.';
+
 const emptyState = Object.freeze({
   /** 'offline' | 'connecting' | 'online' - this page's Connection to the Board. */
   connection: 'offline',
@@ -42,6 +54,12 @@ const emptyState = Object.freeze({
   current: Object.freeze({ index: null, name: null, scene: null }),
   /** The Link to the Quad Cortex: { qcConnected }. */
   link: Object.freeze({ qcConnected: false }),
+  /**
+   * The switch the page asked for and the Board hasn't confirmed or
+   * rejected yet: { id, index }, or null. Confirmed, not optimistic
+   * (ADR 0011 decision 5): the selection only moves with `current`.
+   */
+  pending: null,
 });
 
 export class Store {
@@ -58,6 +76,7 @@ export class Store {
   #livenessTimer = null;
   #reconnectTimer = null;
   #closed = false;
+  #commandCount = 0;
 
   /**
    * @param {object} options
@@ -88,6 +107,18 @@ export class Store {
   connect() {
     this.#closed = false;
     this.#open();
+  }
+
+  /**
+   * Ask the Board to load the Preset with this Catalog-wide index. Marks it
+   * pending; the Board's `current` patch or an `error` with the same id
+   * settles it. (The 4 s give-up and refusing a tap while pending are #78.)
+   */
+  switchPreset(index) {
+    this.#commandCount += 1;
+    const id = `c${this.#commandCount}`;
+    this.#send({ t: 'switchPreset', id, index, generation: this.#state.catalog.generation });
+    this.#setState({ pending: { id, index }, error: null });
   }
 
   close() {
@@ -155,7 +186,20 @@ export class Store {
         const sections = {};
         if (message.current) sections.current = message.current;
         if (message.link) sections.link = message.link;
+        // The Board always sends a `current` patch when a switch completes,
+        // even if the Current preset didn't change.
+        if (message.current && message.current.index === this.#state.pending?.index) {
+          sections.pending = null;
+        }
         this.#setState(sections);
+        break;
+      }
+      case 'error': {
+        const update = { error: kErrorText[message.code] ?? kUnknownErrorText };
+        if (message.id !== undefined && message.id === this.#state.pending?.id) {
+          update.pending = null;
+        }
+        this.#setState(update);
         break;
       }
       default:

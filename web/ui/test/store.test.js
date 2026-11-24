@@ -200,6 +200,57 @@ test('a snapshot from the same build never reloads', () => {
   assert.equal(location.reloads, 0);
 });
 
+/** Sends a switch and returns the frame the store put on the wire. */
+function switchTo(store, index) {
+  store.switchPreset(index);
+  return JSON.parse(socket().sent.at(-1));
+}
+
+/** The error example, re-addressed to one of this page's own command ids. */
+const errorFor = (name, id, seq) => JSON.stringify({ ...JSON.parse(example(name)), id, seq });
+
+test('switching a Preset sends switchPreset and marks it pending', () => {
+  const store = onlineStore();
+
+  const frame = switchTo(store, 3);
+
+  // Same shape as the contract's example; only the page-chosen id differs.
+  assert.deepEqual(frame, { ...JSON.parse(clientExample('switch-preset')), id: frame.id });
+  assert.match(frame.id, /^[0-9A-Za-z_-]{1,16}$/);
+  assert.deepEqual(store.state.pending, { id: frame.id, index: 3 });
+});
+
+test('an error clears the pending state for its id, in the page\'s own words', () => {
+  const store = onlineStore();
+  const { id } = switchTo(store, 3);
+
+  socket().receive(errorFor('error-stale-catalog', id, 1));
+
+  assert.equal(store.state.pending, null);
+  assert.equal(typeof store.state.error, 'string');
+  assert.ok(!store.state.error.includes(JSON.parse(example('error-stale-catalog')).message));
+});
+
+test('an error for another id leaves the pending state alone', () => {
+  const store = onlineStore();
+  const { id } = switchTo(store, 3);
+
+  socket().receive(withSeq(example('error-bad-request'), 1));
+
+  assert.deepEqual(store.state.pending, { id, index: 3 });
+  assert.equal(typeof store.state.error, 'string');
+});
+
+test('a current patch for the pending Preset clears the pending state', () => {
+  const store = onlineStore();
+  switchTo(store, 3);
+
+  socket().receive(example('patch-current'));
+
+  assert.equal(store.state.pending, null);
+  assert.equal(store.state.current.index, 3);
+});
+
 test('ticks and errors count toward seq', () => {
   const store = onlineStore();
 
