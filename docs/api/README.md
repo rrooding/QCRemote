@@ -171,7 +171,7 @@ replaces the other page. Two pages never fight over the socket on their own.
 These come from the firmware's static buffers, not from the contract. The schema doesn't
 enforce them, so the page must not depend on them.
 
-- A `snapshot` is at most 16 KB plus a 64 B envelope (`QcWifiWebTransport::kJsonCapacity`,
+- A `snapshot` is at most 16 KB plus a 256 B envelope (`QcWebApiSession::kCatalogJsonCapacity`,
   `kEnvelopeOverhead`). A Catalog that doesn't fit is cut at a Folder or Preset boundary and
   sent with `incomplete:true`.
 - At most 8 Folders of 64 Presets (`QcPresetCatalog`, ADR 0008). Names are truncated to 32

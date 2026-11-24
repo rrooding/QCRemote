@@ -27,12 +27,15 @@ firmware/
     │   ├── HidChunker.hpp          # qc-mcp framing: a message in, reports out
     │   ├── QcGzip.hpp              # issue #6: gzip detection + inflate (ADR 0005)
     │   ├── QcGzipInflater.hpp      # issue #6: runs QcGzip.hpp off the usbh thread
-    │   └── QcMessageQueue.hpp      # issue #94: bounded SPSC hand-off from the usbh thread
+    │   ├── QcMessageQueue.hpp      # issue #94: bounded SPSC hand-off from the usbh thread
+    │   └── QcWebApiSession.hpp     # issue #99: the docs/api WebSocket contract, socket-free
     └── tests/
         ├── hid_framing/            # Ztest suite for HidReassembler/HidChunker - no hardware needed
         ├── gzip_inflate/           # Ztest suite for QcGzip.hpp, with real gzip fixtures
         ├── dispatch_queue/         # Ztest suite for QcMessageQueue/QcDispatcher, including a
         │                           # real preset-change burst on real threads
+        ├── web_api_session/        # Ztest suite for QcWebApiSession (the docs/api contract),
+        │                           # against docs/api/examples byte for byte
         └── wifi_web_http/          # Ztest suite driving the real HTTP/WebSocket resources over
                                     # the loopback interface - no Wi-Fi driver or board needed
 ```
@@ -1961,7 +1964,6 @@ numbers, by contrast, reproduce PR #90's CI figures exactly.
   and preset-change push are now confirmed on real hardware too (commit `0d1edcc`, see "Hardware
   results" in the #60/#61 section above) - a compressed `RecallPreset` arrived with the owner's
   preset change and inflated correctly.
-- Tier 2's `decodeModelRepo`/`decodeSetlistPosition`/`decodeFile` aren't called from anywhere
-  yet - wiring them into the session/message-dispatch path is for whichever issue actually
-  consumes them (`ModelRepo` needs #6's inflate first; a preset-list `SetlistPosition` READ and
-  the `File` request/dispatch are issue #10's scope).
+- Tier 2's `decodeModelRepo` isn't called from anywhere yet (`ModelRepo` replies are ignored
+  outright, ADR 0007). `decodeFile` feeds the Catalog (#60) and `decodeSetlistPosition` the
+  Current preset (#99).
