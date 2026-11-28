@@ -2074,11 +2074,11 @@ page <--patch{current}-- QcWebApiSession <-- publishCurrentPreset() <-- SetlistP
   the list while a switch is pending or the page is offline, and gives up after 4 s with
   "The Board didn't confirm the switch."
 
-**Not checked on hardware yet:** whether Downloads (`cloud-0-1`) and plugin Folders load by
-`folder_key` + `position` too. qc-mcp's `recall()` addresses those by the Preset's own cloud id
-(`is_downloads` + `key_in_downloads`) or plugin key instead, which the File listing gives this
-firmware no way to name yet. A switch the Quad Cortex refuses comes back as an unchanged
-SetlistPosition: the page then keeps waiting for its index and gives up after 4 s.
+**Downloads don't load yet** (checked on hardware, issue #108). Downloads (`cloud-0-1`), and
+likely plugin Folders, aren't loaded by `folder_key` + `position`: the Quad Cortex ignores the
+UPDATE and the page gives up after 4 s with "The Board didn't confirm the switch." qc-mcp's
+`recall()` loads them by the Preset's own cloud key (`is_downloads` + `key_in_downloads`)
+or plugin key. The Catalog doesn't keep those keys yet.
 
 ### Verified
 
@@ -2096,7 +2096,8 @@ a tap marks the row pending and the Current preset moves when the mock confirms.
 
 The RAM is the whole Folder keys (512 B) plus the in-flight switch state.
 
-Not verified: anything on hardware (see the smoke test below).
+On hardware (`frdm_rw612`, build `4c9afe5`): switching between user-folder Presets, across
+Folders, works, and re-selecting the loaded Preset is confirmed. Downloads don't load (#108).
 
 ### Smoke test
 
@@ -2104,8 +2105,8 @@ Not verified: anything on hardware (see the smoke test below).
    `Switching to preset N (folder "/media/p4/Presets/My Presets", slot S)`, and the page's
    Current preset moves to it.
 2. Tap the Preset that's already loaded. The pending outline clears at once.
-3. Tap a Preset in **Downloads**. If the Quad Cortex doesn't load it, the page says "The Board
-   didn't confirm the switch." after 4 s - that's the open question above.
+3. Tap a Preset in **Downloads**. Until #108 is fixed, the Quad Cortex doesn't load it and the
+   page says "The Board didn't confirm the switch." after 4 s.
 4. Unplug the Quad Cortex and tap: "The Quad Cortex isn't connected to the Board."
 
 ## Not yet done
