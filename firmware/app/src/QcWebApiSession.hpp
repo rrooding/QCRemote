@@ -25,8 +25,9 @@ namespace qcbridge {
 //
 // Switching (issue #78) is checked here too: a switchPreset the Board
 // accepts is handed out by takeSwitchRequest(), and the session holds it
-// in flight until the Quad Cortex reports a Current preset or the 4 s
-// give-up passes.
+// in flight until the Quad Cortex reports that Preset as the Current one,
+// or the 4 s give-up passes, or nothing can confirm it any more (the Link
+// went down, the Catalog or the page changed).
 //
 // It also keeps the Board state a snapshot needs (Catalog, Current preset,
 // Link) across Connections, so a page that connects later still gets all of
@@ -43,14 +44,14 @@ public:
     static constexpr size_t kEnvelopeOverhead = 256;
     using Frame = etl::vector<char, kCatalogJsonCapacity + kEnvelopeOverhead>;
 
-    // The Catalog before the first listing: what encodeCatalogJson() makes
-    // of an empty, incomplete snapshot (tests/web_api_session checks that),
-    // written out because a QcCatalogSnapshot is too big to build on the
-    // stack just for this.
     // docs/api/README.md, "Switching a Preset": the page gives up after 4 s,
     // and the Board within the same 4 s.
     static constexpr int64_t kSwitchTimeoutMs = 4000;
 
+    // The Catalog before the first listing: what encodeCatalogJson() makes
+    // of an empty, incomplete snapshot (tests/web_api_session checks that),
+    // written out because a QcCatalogSnapshot is too big to build on the
+    // stack just for this.
     static constexpr std::string_view kEmptyCatalogJson =
         R"({"generation":0,"presetCount":0,"incomplete":true,"folders":[]})";
 
@@ -68,22 +69,33 @@ public:
     }
 
     // The page's WebSocket is gone. Board state is kept for the next one.
-    void connectionClosed() { open_ = false; }
+    // A switch it had in flight is dropped too: the next page didn't ask
+    // for it, and shouldn't be refused as busy because of it.
+    void connectionClosed() {
+        open_ = false;
+        switchInFlight_.reset();
+    }
 
     // A Catalog change is always a snapshot, never a patch.
     std::optional<std::string_view> catalogPublished(const QcCatalogSnapshot& catalog, int64_t nowMs) {
         encodeCatalogJson(catalog, catalogJson_);
         catalogGeneration_ = catalog.generation;
         catalogPresetCount_ = catalog.presetCount;
+        // QcSession drops a request from a replaced Catalog, so nothing
+        // will confirm it.
+        switchInFlight_.reset();
         return open_ ? snapshot(nowMs) : std::optional<std::string_view>{};
     }
 
-    // While a switch is in flight, any Current preset the Quad Cortex
-    // reports completes it and is always sent, changed or not: the page
-    // clears its pending state on that patch.
+    // The Quad Cortex reporting the Preset a switch asked for completes
+    // it, and that report is always sent, changed or not: the page clears
+    // its pending state on it. Any other report (a footswitch at the unit,
+    // the re-publish after a listing) leaves the switch in flight.
     std::optional<std::string_view> currentPresetChanged(const QcCurrentPreset& current, int64_t nowMs) {
-        const bool completesSwitch = switchDeadlineMs_.has_value();
-        switchDeadlineMs_.reset();
+        const bool completesSwitch = switchInFlight_ && current && current->index == switchInFlight_->index;
+        if (completesSwitch) {
+            switchInFlight_.reset();
+        }
         if (!completesSwitch && sameCurrent(current, current_)) {
             return std::nullopt;
         }
@@ -102,7 +114,7 @@ public:
         link_ = link;
         if (!link_.qcConnected) {
             // The Quad Cortex that would have confirmed it is gone.
-            switchDeadlineMs_.reset();
+            switchInFlight_.reset();
             pendingSwitch_.reset();
         }
         if (!open_) {
@@ -138,8 +150,8 @@ public:
     // Liveness (docs/api/README.md): a tick once nothing else has gone out
     // for the tick interval.
     std::optional<std::string_view> timePassed(int64_t nowMs) {
-        if (switchDeadlineMs_ && nowMs >= *switchDeadlineMs_) {
-            switchDeadlineMs_.reset();
+        if (switchInFlight_ && nowMs >= switchInFlight_->deadlineMs) {
+            switchInFlight_.reset();
         }
         if (!open_ || nowMs - lastSentMs_ < tickIntervalMs_) {
             return std::nullopt;
@@ -161,9 +173,9 @@ public:
     }
 
 private:
-    // The checks in docs/api/README.md's error table, in the order that
-    // gives the page the most useful answer: no Quad Cortex makes the rest
-    // moot, and an index only means something in its own generation.
+    // The checks in the order docs/api/README.md's "Errors" gives: no Quad
+    // Cortex makes the rest moot, and an index only means something in its
+    // own generation.
     std::optional<std::string_view> switchRequested(const QcWebApiSwitchPreset& request, int64_t nowMs) {
         etl::vector<char, 48> message;
         if (!link_.qcConnected) {
@@ -183,11 +195,11 @@ private:
             detail::appendUInt(static_cast<uint32_t>(catalogPresetCount_), message);
             return error(request.id, QcWebApiErrorCode::BadIndex, view(message), nowMs);
         }
-        if (switchDeadlineMs_) {
+        if (switchInFlight_) {
             return error(request.id, QcWebApiErrorCode::Busy, "a switch is in flight", nowMs);
         }
         pendingSwitch_ = QcSwitchRequest{.generation = request.generation, .index = request.index};
-        switchDeadlineMs_ = nowMs + kSwitchTimeoutMs;
+        switchInFlight_ = SwitchInFlight{.index = request.index, .deadlineMs = nowMs + kSwitchTimeoutMs};
         return std::nullopt;
     }
 
@@ -235,7 +247,11 @@ private:
     uint32_t catalogGeneration_ = 0;
     size_t catalogPresetCount_ = 0;
     std::optional<QcSwitchRequest> pendingSwitch_;
-    std::optional<int64_t> switchDeadlineMs_;
+    struct SwitchInFlight {
+        uint32_t index;
+        int64_t deadlineMs;
+    };
+    std::optional<SwitchInFlight> switchInFlight_;
     etl::vector<char, kCatalogJsonCapacity> catalogJson_;
     Frame frame_;
 };

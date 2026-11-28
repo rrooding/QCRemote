@@ -364,6 +364,41 @@ ZTEST(web_api_session, test_the_board_gives_up_on_an_unconfirmed_switch_after_4_
                 R"({"t":"patch","seq":2,"current":{"index":1,"name":"Edge Crunch","scene":null}})");
 }
 
+// Only the report of the Preset asked for completes a switch: the unit's
+// own footswitch, or the re-publish that follows a listing, isn't it.
+ZTEST(web_api_session, test_a_report_of_another_preset_doesnt_complete_the_switch) {
+    QcWebApiSession& session = connectedSession();
+    (void)receive(session, examples::kClientSwitchPreset, 100);
+    (void)session.takeSwitchRequest();
+
+    assertNoFrame(session.currentPresetChanged(preset(2, "Opener"), 200));
+    zassert_true(receive(session, switchFrame("c8", 1, 7), 300)->find("busy") != std::string_view::npos);
+    assertFrame(session.currentPresetChanged(preset(3, "Verse 1"), 400),
+                R"({"t":"patch","seq":2,"current":{"index":3,"name":"Verse 1","scene":null}})");
+}
+
+// QcSession drops a request from a Catalog that's been replaced, so nothing
+// will confirm it - the Board stops waiting rather than refuse as busy.
+ZTEST(web_api_session, test_a_new_catalog_drops_the_switch_in_flight) {
+    QcWebApiSession& session = connectedSession();
+    (void)receive(session, examples::kClientSwitchPreset, 100);
+    (void)session.takeSwitchRequest();
+    (void)session.catalogPublished(exampleCatalog(), 200);
+
+    assertNoFrame(receive(session, switchFrame("c8", 1, 7), 300));
+    assertSwitchRequested(session, 7, 1);
+}
+
+ZTEST(web_api_session, test_a_page_that_takes_over_isnt_refused_for_the_last_pages_switch) {
+    QcWebApiSession& session = connectedSession();
+    (void)receive(session, examples::kClientSwitchPreset, 100);
+    session.connectionClosed();
+    (void)session.connectionOpened(200);
+
+    assertNoFrame(receive(session, switchFrame("c1", 1, 7), 300));
+    assertSwitchRequested(session, 7, 1);
+}
+
 ZTEST(web_api_session, test_the_link_going_down_drops_the_switch_in_flight) {
     QcWebApiSession& session = connectedSession();
     (void)receive(session, examples::kClientSwitchPreset, 100);

@@ -955,8 +955,9 @@ private:
         LOG_INF("Switching to preset %u (folder \"%s\", slot %u)", index, folderKey.c_str(), slot);
     }
 
-    // The handshake and heartbeat threads both take request ids. 32 bits
-    // because Cortex-M33 has no 64-bit atomics; it never wraps in practice.
+    // The handshake and heartbeat threads both take request ids. The
+    // counter is 32 bits because Cortex-M33 has no 64-bit atomics; the
+    // protocol field stays 64 bits, and a session never sends 2^32 requests.
     uint64_t nextRequestId() { return requestIdCounter_.fetch_add(1, std::memory_order_relaxed) + 1; }
 
     K_KERNEL_STACK_MEMBER(stack_, 2048);

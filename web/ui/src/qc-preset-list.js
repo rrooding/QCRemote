@@ -130,7 +130,7 @@ export class QcPresetList extends LitElement {
     // While one switch is pending (or there's no Board to ask) the other
     // rows can't be picked - the store would ignore the tap anyway, so
     // saying so is more honest than a button that does nothing.
-    const locked = pending !== null || connection !== 'online';
+    const rowsDisabled = pending !== null || connection !== 'online';
     if (catalog.folders.length === 0) {
       return html`<p class="empty">
         No presets yet${catalog.incomplete ? ' - waiting for the board to finish listing' : ''}.
@@ -152,7 +152,7 @@ export class QcPresetList extends LitElement {
                   type="button"
                   aria-current=${preset.index === current.index ? 'true' : 'false'}
                   aria-busy=${preset.index === pending?.index ? 'true' : 'false'}
-                  ?disabled=${locked}
+                  ?disabled=${rowsDisabled}
                   @click=${() => this.#store.switchPreset(preset.index)}
                 >
                   <span class="slot">${preset.index}</span>

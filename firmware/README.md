@@ -2054,6 +2054,10 @@ page <--patch{current}-- QcWebApiSession <-- publishCurrentPreset() <-- SetlistP
   patch, changed or not - or until 4 s pass (`kSwitchTimeoutMs`), or the Link goes down.
 - **`QcPresetSwitcher`** (`QcPresetTransport.hpp`) is the way back from a transport to
   `QcSession`. `requestSwitchPreset()` only records the request under a `k_spinlock`.
+- **Only the requested Preset completes a switch.** A report of another one (a footswitch at
+  the unit, the re-publish after a listing) is an ordinary change and leaves the switch in
+  flight. A new Catalog, a closed page or the Link going down drops it, since nothing will
+  confirm it then.
 - **`QcSession`** sends it on the KeepAlive heartbeat thread, right after the KeepAlive, so it
   waits at most one ~200 ms tick. It resolves the index with `findPresetLocation()` against
   the Catalog the page picked from (a newer listing drops it, and the page's 4 s give-up shows
@@ -2079,7 +2083,7 @@ SetlistPosition: the page then keeps waiting for its index and gives up after 4 
 ### Verified
 
 QEMU (macOS can't run `native_sim`): `west twister -p mps2/an385 -K -T firmware/app/tests`,
-12 of 12 configurations, 166 of 166 cases pass (15 new: 11 in `web_api_session`, 2 each in
+12 of 12 configurations, 169 of 169 cases pass (18 new: 14 in `web_api_session`, 2 each in
 `preset_transport` and `catalog_messages`; the one "not implemented" case is gone). `web/ui`: `npm test`, 31/31. Tried against the mock Board in a browser:
 a tap marks the row pending and the Current preset moves when the mock confirms.
 
@@ -2087,8 +2091,8 @@ a tap marks the row pending and the Current preset moves when the mock confirms.
 
 | | Before | After |
 | --- | --- | --- |
-| RAM | 762 640 B | 763 200 B (**+560 B**) |
-| FLASH | 743 668 B | 745 976 B (**+2 308 B**) |
+| RAM | 762 640 B | 763 208 B (**+568 B**) |
+| FLASH | 743 668 B | 746 576 B (**+2 908 B**) |
 
 The RAM is the whole Folder keys (512 B) plus the in-flight switch state.
 

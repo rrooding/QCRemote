@@ -151,6 +151,9 @@ decision 5: confirmed, not optimistic).
 | `busy` | Another switch is still in flight. The Board doesn't queue or replace it |
 | `badRequest` | The frame isn't JSON, is over 256 bytes, has an unknown `t`, or is missing or has malformed fields. `id` is present only if one could be read |
 
+When more than one applies, the Board answers with the first of `qcDisconnected`,
+`staleCatalog`, `badIndex`, `busy`: an `index` only means something in its own `generation`.
+
 `message` is English detail for the console and logs. The page never shows it. It maps `code`
 to its own wording.
 
