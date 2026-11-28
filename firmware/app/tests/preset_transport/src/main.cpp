@@ -188,6 +188,49 @@ ZTEST(preset_transport, test_current_preset_is_unknown_outside_the_catalog) {
     zassert_false(findCurrentPreset(freshCatalog(), "my-presets", 5).has_value(), "before any listing");
 }
 
+// Issue #78: the way back - a Catalog-wide index to the Folder key and
+// slot the Quad Cortex addresses a Preset by (SetlistPosition).
+ZTEST(preset_transport, test_a_catalog_index_names_its_folder_key_and_slot) {
+    QcPresetCatalog& catalog = freshCatalog();
+    addPreset(catalog, "my-presets", "My Presets", "Practice 1", 0);
+    addPreset(catalog, "my-presets", "My Presets", "Dark Jazz", 5);
+    addPreset(catalog, "cloud-0-1", "", "Salaatti-Classic", 2);
+
+    const auto darkJazz = findPresetLocation(catalog, 1);
+    zassert_true(darkJazz.has_value());
+    zassert_equal(darkJazz->folderKey, "my-presets");
+    zassert_equal(darkJazz->slot, 5u);
+
+    const auto salaatti = findPresetLocation(catalog, 2);
+    zassert_true(salaatti.has_value());
+    zassert_equal(salaatti->folderKey, "cloud-0-1");
+    zassert_equal(salaatti->slot, 2u);
+
+    zassert_false(findPresetLocation(catalog, 3).has_value(), "past the end");
+    zassert_false(findPresetLocation(freshCatalog(), 0).has_value(), "before any listing");
+}
+
+// Plugin "User" folder keys run past the 32-character display names, so
+// the key is kept whole - a cut one would address a Folder that isn't there.
+ZTEST(preset_transport, test_a_long_folder_key_is_kept_whole_and_one_too_long_to_keep_names_nothing) {
+    static constexpr std::string_view kLongKey =
+        "/media/p4/Plugins/Some Long Plugin Vendor Name/User Presets/Fancy";
+    static_assert(kLongKey.size() > QcPresetCatalog::kNameCapacity);
+    static constexpr std::string_view kTooLongKey =
+        "/media/p4/Plugins/A Plugin Vendor Whose Name Goes On And On/A Bank Name That Also Goes On/User Presets/Even More";
+    static_assert(kTooLongKey.size() > QcPresetCatalog::kKeyCapacity);
+
+    QcPresetCatalog& catalog = freshCatalog();
+    addPreset(catalog, kLongKey, "Fancy", "Shimmer", 4);
+    addPreset(catalog, kTooLongKey, "User", "Lost", 1);
+
+    const auto shimmer = findPresetLocation(catalog, 0);
+    zassert_true(shimmer.has_value());
+    zassert_equal(shimmer->folderKey, kLongKey);
+    zassert_equal(shimmer->slot, 4u);
+    zassert_false(findPresetLocation(catalog, 1).has_value());
+}
+
 ZTEST(preset_transport, test_encode_catalog_json_basic) {
     QcPresetCatalog& catalog = freshCatalog();
     addPreset(catalog, "my-presets", "My Presets", "Practice 1", 0);

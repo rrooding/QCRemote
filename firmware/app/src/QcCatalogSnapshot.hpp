@@ -93,4 +93,31 @@ inline std::optional<QcCatalogSnapshot::PresetEntry> findCurrentPreset(const QcP
     return std::nullopt;
 }
 
+// Where the Quad Cortex keeps a Preset: the Folder key and slot a
+// SetlistPosition UPDATE loads it by (issue #78).
+struct QcPresetLocation {
+    // A view into the catalog's storage - copy it before releasing the lock.
+    std::string_view folderKey;
+    uint32_t slot = 0;
+};
+
+// The inverse of findCurrentPreset(): the Preset at Catalog-wide `index`.
+// Empty past the end of the Catalog, or when its Folder's key was too long
+// to keep whole and so can't be named back to the Quad Cortex. Same locking
+// contract as copyCatalogSnapshot().
+inline std::optional<QcPresetLocation> findPresetLocation(const QcPresetCatalog& catalog, uint32_t index) {
+    uint32_t catalogIndex = 0;
+    for (const auto& folder : catalog.folders()) {
+        if (index - catalogIndex < folder.presets.size()) {
+            if (!folder.keyIsWhole()) {
+                return std::nullopt;
+            }
+            return QcPresetLocation{.folderKey = std::string_view(folder.key.data(), folder.key.size()),
+                                    .slot = folder.presets[index - catalogIndex].index};
+        }
+        catalogIndex += static_cast<uint32_t>(folder.presets.size());
+    }
+    return std::nullopt;
+}
+
 }  // namespace qcbridge

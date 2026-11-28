@@ -39,6 +39,24 @@ struct QcLinkState {
 // transport can run side by side, or the build can enable just one -
 // issue #71's "allow running Wi-Fi and BLE side by side, or letting the
 // user choose which is active" requirement.
+// A switch the page asked for and the Board accepted (issue #78): the
+// Preset at Catalog-wide `index` of the Catalog numbered `generation`.
+struct QcSwitchRequest {
+    uint32_t generation = 0;
+    uint32_t index = 0;
+};
+
+// The way back from a transport to the Quad Cortex (issue #78) - QcSession
+// implements it, a transport calls it. Same rule as the calls below, the
+// other way round: it must return at once, since the transport's own
+// thread is waiting, so QcSession only records the request here and sends
+// it from its own thread.
+class QcPresetSwitcher {
+public:
+    virtual ~QcPresetSwitcher() = default;
+    virtual void requestSwitchPreset(const QcSwitchRequest& request) = 0;
+};
+
 class QcPresetTransport {
 public:
     virtual ~QcPresetTransport() = default;

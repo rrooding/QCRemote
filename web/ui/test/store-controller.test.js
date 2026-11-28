@@ -18,3 +18,12 @@ test('takeOver() asks the store to take over', () => {
 
   assert.equal(takeOvers, 1);
 });
+
+test('switchPreset() hands the tapped Preset to the store', () => {
+  const switched = [];
+  const controller = new StoreController(fakeHost(), { state: {}, switchPreset: (index) => switched.push(index) });
+
+  controller.switchPreset(3);
+
+  assert.deepEqual(switched, [3]);
+});

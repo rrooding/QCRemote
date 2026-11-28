@@ -6,6 +6,7 @@
 // from docs/api/README.md otherwise.
 
 #include <cstdint>
+#include <cstdio>
 #include <optional>
 #include <string_view>
 #include <variant>
@@ -127,8 +128,8 @@ ZTEST(web_api_session, test_seq_runs_through_snapshot_patch_tick_error_and_resta
     assertFrame(session.timePassed(16000), R"({"t":"tick","seq":1})");
 }
 
-// The one error example the session can't produce until #78 (a stale
-// generation needs an in-flight switch): checked at the encoder directly.
+// The example's seq 3 is a point in a Connection the replay above doesn't
+// reach, so it's checked at the encoder directly.
 ZTEST(web_api_session, test_error_encoder_matches_the_stale_catalog_example) {
     static QcWebApiSession::Frame frame;
     encodeErrorMessage(3, std::string_view("c7"), QcWebApiErrorCode::StaleCatalog, "generation 6 != 7", frame);
@@ -222,14 +223,156 @@ ZTEST(web_api_session, test_the_client_examples_parse) {
     zassert_equal(switchPreset->generation, 7u);
 }
 
-// Until #78 a well-formed switch is refused, with the page's own id so its
-// pending state clears.
-ZTEST(web_api_session, test_a_switch_preset_is_refused_as_not_implemented_yet) {
+// --- Switching a Preset (issue #78, docs/api/README.md) --------------------
+
+namespace {
+
+constexpr int64_t kSwitchTimeoutMs = 4000;
+
+std::string_view switchFrame(std::string_view id, uint32_t index, uint32_t generation) {
+    static char text[96];
+    const int n = snprintf(text, sizeof(text), R"({"t":"switchPreset","id":"%.*s","index":%u,"generation":%u})",
+                           static_cast<int>(id.size()), id.data(), index, generation);
+    return {text, static_cast<size_t>(n)};
+}
+
+std::optional<std::string_view> receive(QcWebApiSession& session, std::string_view frame, int64_t nowMs) {
+    return session.frameReceived(frame, frame.size(), nowMs);
+}
+
+// The example Board, Link up, with the example Catalog (generation 7, four
+// Presets) and Opener (2) loaded, and a page that just got its snapshot -
+// so the next frame is seq 1.
+QcWebApiSession& connectedSession() {
     QcWebApiSession& session = freshSession();
+    (void)session.linkChanged(QcLinkState{.qcConnected = true}, 0);
+    (void)session.catalogPublished(exampleCatalog(), 0);
+    (void)session.currentPresetChanged(preset(2, "Opener"), 0);
+    assertFrame(session.connectionOpened(0), examples::kServerSnapshot);
+    return session;
+}
+
+void assertSwitchRequested(QcWebApiSession& session, uint32_t generation, uint32_t index) {
+    const auto request = session.takeSwitchRequest();
+    zassert_true(request.has_value(), "no switch was asked of the Quad Cortex");
+    zassert_equal(request->generation, generation);
+    zassert_equal(request->index, index);
+    zassert_false(session.takeSwitchRequest().has_value(), "a switch is asked for once");
+}
+
+}  // namespace
+
+ZTEST(web_api_session, test_an_accepted_switch_asks_the_quad_cortex_once_and_answers_nothing_yet) {
+    QcWebApiSession& session = connectedSession();
+
+    assertNoFrame(receive(session, examples::kClientSwitchPreset, 100));
+
+    assertSwitchRequested(session, 7, 3);
+}
+
+ZTEST(web_api_session, test_the_quad_cortex_reporting_the_load_is_the_confirmation) {
+    QcWebApiSession& session = connectedSession();
+    (void)receive(session, examples::kClientSwitchPreset, 100);
+
+    assertFrame(session.currentPresetChanged(preset(3, "Verse 1"), 500), examples::kServerPatchCurrent);
+}
+
+// "It always sends this patch when a switch completes, even if current
+// didn't change" - the page clears pending on it.
+ZTEST(web_api_session, test_switching_to_the_loaded_preset_still_gets_a_current_patch) {
+    QcWebApiSession& session = connectedSession();
+    (void)receive(session, switchFrame("c8", 2, 7), 100);
+
+    assertFrame(session.currentPresetChanged(preset(2, "Opener"), 500),
+                R"({"t":"patch","seq":1,"current":{"index":2,"name":"Opener","scene":null}})");
+    assertNoFrame(session.currentPresetChanged(preset(2, "Opener"), 600));
+}
+
+ZTEST(web_api_session, test_a_switch_while_the_link_is_down_is_refused) {
+    QcWebApiSession& session = connectedSession();
+    (void)session.linkChanged(QcLinkState{.qcConnected = false}, 100);
+
+    const auto frame = receive(session, examples::kClientSwitchPreset, 200);
+
+    zassert_true(frame.has_value() &&
+                     frame->starts_with(R"({"t":"error","seq":2,"id":"c7","code":"qcDisconnected",)"),
+                 "got %.*s", frame ? static_cast<int>(frame->size()) : 0, frame ? frame->data() : "");
+    zassert_false(session.takeSwitchRequest().has_value());
+}
+
+ZTEST(web_api_session, test_a_switch_from_an_old_catalog_is_refused_as_stale) {
+    QcWebApiSession& session = connectedSession();
+
+    assertFrame(receive(session, switchFrame("c7", 3, 6), 100),
+                R"({"t":"error","seq":1,"id":"c7","code":"staleCatalog","message":"generation 6 != 7"})");
+    zassert_false(session.takeSwitchRequest().has_value());
+}
+
+ZTEST(web_api_session, test_a_switch_past_the_end_of_the_catalog_is_a_bad_index) {
+    QcWebApiSession& session = connectedSession();
+
+    assertFrame(receive(session, switchFrame("c7", 4, 7), 100),
+                R"({"t":"error","seq":1,"id":"c7","code":"badIndex","message":"no preset 4 in 4"})");
+    zassert_false(session.takeSwitchRequest().has_value());
+}
+
+ZTEST(web_api_session, test_a_switch_before_the_first_listing_is_a_bad_index) {
+    QcWebApiSession& session = freshSession();
+    (void)session.linkChanged(QcLinkState{.qcConnected = true}, 0);
     (void)session.connectionOpened(0);
 
-    assertFrame(session.frameReceived(examples::kClientSwitchPreset, examples::kClientSwitchPreset.size(), 0),
-                R"({"t":"error","seq":1,"id":"c7","code":"badRequest","message":"not implemented"})");
+    assertFrame(receive(session, switchFrame("c1", 0, 0), 100),
+                R"({"t":"error","seq":1,"id":"c1","code":"badIndex","message":"no preset 0 in 0"})");
+}
+
+ZTEST(web_api_session, test_a_second_switch_while_one_is_in_flight_is_busy_and_not_queued) {
+    QcWebApiSession& session = connectedSession();
+    (void)receive(session, examples::kClientSwitchPreset, 100);
+    (void)session.takeSwitchRequest();
+
+    assertFrame(receive(session, switchFrame("c8", 1, 7), 200),
+                R"({"t":"error","seq":1,"id":"c8","code":"busy","message":"a switch is in flight"})");
+    zassert_false(session.takeSwitchRequest().has_value());
+}
+
+ZTEST(web_api_session, test_a_confirmed_switch_frees_the_board_for_the_next_one) {
+    QcWebApiSession& session = connectedSession();
+    (void)receive(session, examples::kClientSwitchPreset, 100);
+    (void)session.takeSwitchRequest();
+    (void)session.currentPresetChanged(preset(3, "Verse 1"), 500);
+
+    assertNoFrame(receive(session, switchFrame("c8", 1, 7), 600));
+    assertSwitchRequested(session, 7, 1);
+}
+
+// "The Board gives up on its side of an in-flight switch within the same
+// 4 s, so a lost switch never leaves it stuck at busy."
+ZTEST(web_api_session, test_the_board_gives_up_on_an_unconfirmed_switch_after_4_s) {
+    QcWebApiSession& session = connectedSession();
+    (void)receive(session, examples::kClientSwitchPreset, 100);
+    (void)session.takeSwitchRequest();
+
+    assertNoFrame(session.timePassed(100 + kSwitchTimeoutMs - 1));
+    zassert_true(receive(session, switchFrame("c8", 1, 7), 100 + kSwitchTimeoutMs - 1)->find("busy") !=
+                 std::string_view::npos);
+    assertNoFrame(session.timePassed(100 + kSwitchTimeoutMs));
+
+    assertNoFrame(receive(session, switchFrame("c9", 1, 7), 100 + kSwitchTimeoutMs));
+    assertSwitchRequested(session, 7, 1);
+    // A late report of the given-up switch is an ordinary change again.
+    assertFrame(session.currentPresetChanged(preset(1, "Edge Crunch"), 100 + kSwitchTimeoutMs + 10),
+                R"({"t":"patch","seq":2,"current":{"index":1,"name":"Edge Crunch","scene":null}})");
+}
+
+ZTEST(web_api_session, test_the_link_going_down_drops_the_switch_in_flight) {
+    QcWebApiSession& session = connectedSession();
+    (void)receive(session, examples::kClientSwitchPreset, 100);
+    (void)session.takeSwitchRequest();
+    (void)session.linkChanged(QcLinkState{.qcConnected = false}, 200);
+    (void)session.linkChanged(QcLinkState{.qcConnected = true}, 300);
+
+    assertNoFrame(receive(session, switchFrame("c8", 1, 7), 400));
+    assertSwitchRequested(session, 7, 1);
 }
 
 namespace {

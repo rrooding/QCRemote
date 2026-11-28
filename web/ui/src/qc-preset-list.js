@@ -4,9 +4,10 @@ import { StoreController } from './store-controller.js';
 // The Quad Cortex's own folder/preset structure, drawn with our own CSS
 // (ADR 0011 decision 8 - no Neural DSP artwork, icons or fonts).
 //
-// The Current preset's row is marked (aria-current). Read-only otherwise:
-// tapping a row to switch presets is issue #78's job, not this one's - rendering rows as fake buttons with no
-// handler would be a lie to a screen reader, so these are plain list items.
+// The Current preset's row is marked (aria-current). Tapping a row asks the
+// Board to switch to it (issue #78): the row is marked pending (aria-busy),
+// and the Current preset mark only moves when the Board reports the switch
+// - confirmed, not optimistic (ADR 0011 decision 5).
 //
 // `repeat()` rather than a plain `.map()`: keyed by the board's own preset
 // index, so a catalog update that changes one name patches one <li>
@@ -38,17 +39,37 @@ export class QcPresetList extends LitElement {
       list-style: none;
     }
 
-    li {
+    button {
       display: flex;
       align-items: center;
       gap: 0.75rem;
+      width: 100%;
       /* 56px: comfortably past the ~44px minimum tap target (ADR 0011
-         question 6) - kept even though these rows aren't tappable yet, so
-         the list doesn't have to be re-sized once #78 wires taps back in. */
+         question 6). */
       min-height: 56px;
       padding: 0 0.75rem;
+      border: 0;
       border-radius: 10px;
+      background: none;
       color: var(--qc-text);
+      font: inherit;
+      text-align: left;
+      cursor: pointer;
+      touch-action: manipulation;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    button:active {
+      background: var(--qc-surface-2);
+    }
+
+    button:focus-visible {
+      outline: 2px solid var(--qc-accent);
+      outline-offset: -2px;
+    }
+
+    button:disabled {
+      cursor: default;
     }
 
     .slot {
@@ -69,12 +90,30 @@ export class QcPresetList extends LitElement {
       font-size: 1rem;
     }
 
-    li[aria-current='true'] {
+    button[aria-current='true'] {
       background: var(--qc-accent-dim);
     }
 
-    li[aria-current='true'] .slot {
+    button[aria-current='true'] .slot {
       color: var(--qc-accent);
+    }
+
+    /* Waiting on the Board: an outline that breathes, not the Current mark. */
+    button[aria-busy='true'] {
+      box-shadow: inset 0 0 0 2px var(--qc-accent);
+      animation: pending 1s ease-in-out infinite alternate;
+    }
+
+    @keyframes pending {
+      from {
+        box-shadow: inset 0 0 0 2px var(--qc-accent-dim);
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      button[aria-busy='true'] {
+        animation: none;
+      }
     }
 
     .empty {
@@ -87,7 +126,11 @@ export class QcPresetList extends LitElement {
   #store = new StoreController(this, window.qcStore);
 
   render() {
-    const { catalog, current } = this.#store.state;
+    const { catalog, current, pending, connection } = this.#store.state;
+    // While one switch is pending (or there's no Board to ask) the other
+    // rows can't be picked - the store would ignore the tap anyway, so
+    // saying so is more honest than a button that does nothing.
+    const locked = pending !== null || connection !== 'online';
     if (catalog.folders.length === 0) {
       return html`<p class="empty">
         No presets yet${catalog.incomplete ? ' - waiting for the board to finish listing' : ''}.
@@ -104,9 +147,17 @@ export class QcPresetList extends LitElement {
             folder.presets,
             (preset) => preset.index,
             (preset) => html`
-              <li aria-current=${preset.index === current.index ? 'true' : 'false'}>
-                <span class="slot">${preset.index}</span>
-                <span class="name">${preset.name}</span>
+              <li>
+                <button
+                  type="button"
+                  aria-current=${preset.index === current.index ? 'true' : 'false'}
+                  aria-busy=${preset.index === pending?.index ? 'true' : 'false'}
+                  ?disabled=${locked}
+                  @click=${() => this.#store.switchPreset(preset.index)}
+                >
+                  <span class="slot">${preset.index}</span>
+                  <span class="name">${preset.name}</span>
+                </button>
               </li>
             `
           )}

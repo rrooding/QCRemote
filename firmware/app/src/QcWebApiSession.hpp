@@ -23,6 +23,11 @@ namespace qcbridge {
 // errors. QcWifiWebTransport.hpp only moves the frames, and tests/
 // web_api_session drives this directly.
 //
+// Switching (issue #78) is checked here too: a switchPreset the Board
+// accepts is handed out by takeSwitchRequest(), and the session holds it
+// in flight until the Quad Cortex reports a Current preset or the 4 s
+// give-up passes.
+//
 // It also keeps the Board state a snapshot needs (Catalog, Current preset,
 // Link) across Connections, so a page that connects later still gets all of
 // it. Each method returns the frame to send, if any - a view into this
@@ -42,6 +47,10 @@ public:
     // of an empty, incomplete snapshot (tests/web_api_session checks that),
     // written out because a QcCatalogSnapshot is too big to build on the
     // stack just for this.
+    // docs/api/README.md, "Switching a Preset": the page gives up after 4 s,
+    // and the Board within the same 4 s.
+    static constexpr int64_t kSwitchTimeoutMs = 4000;
+
     static constexpr std::string_view kEmptyCatalogJson =
         R"({"generation":0,"presetCount":0,"incomplete":true,"folders":[]})";
 
@@ -64,11 +73,18 @@ public:
     // A Catalog change is always a snapshot, never a patch.
     std::optional<std::string_view> catalogPublished(const QcCatalogSnapshot& catalog, int64_t nowMs) {
         encodeCatalogJson(catalog, catalogJson_);
+        catalogGeneration_ = catalog.generation;
+        catalogPresetCount_ = catalog.presetCount;
         return open_ ? snapshot(nowMs) : std::optional<std::string_view>{};
     }
 
+    // While a switch is in flight, any Current preset the Quad Cortex
+    // reports completes it and is always sent, changed or not: the page
+    // clears its pending state on that patch.
     std::optional<std::string_view> currentPresetChanged(const QcCurrentPreset& current, int64_t nowMs) {
-        if (sameCurrent(current, current_)) {
+        const bool completesSwitch = switchDeadlineMs_.has_value();
+        switchDeadlineMs_.reset();
+        if (!completesSwitch && sameCurrent(current, current_)) {
             return std::nullopt;
         }
         current_ = current;
@@ -84,6 +100,11 @@ public:
             return std::nullopt;
         }
         link_ = link;
+        if (!link_.qcConnected) {
+            // The Quad Cortex that would have confirmed it is gone.
+            switchDeadlineMs_.reset();
+            pendingSwitch_.reset();
+        }
         if (!open_) {
             return std::nullopt;
         }
@@ -104,15 +125,22 @@ public:
         if (const auto* bad = std::get_if<QcWebApiBadRequest>(&request)) {
             return error(bad->id, QcWebApiErrorCode::BadRequest, bad->reason, nowMs);
         }
-        // Executing a switch is issue #78. Until then a well-formed one is
-        // refused, so the page's pending state clears instead of timing out.
-        const auto& switchPreset = std::get<QcWebApiSwitchPreset>(request);
-        return error(switchPreset.id, QcWebApiErrorCode::BadRequest, "not implemented", nowMs);
+        return switchRequested(std::get<QcWebApiSwitchPreset>(request), nowMs);
+    }
+
+    // The switch accepted since the last call, for the Quad Cortex - once.
+    std::optional<QcSwitchRequest> takeSwitchRequest() {
+        const auto request = pendingSwitch_;
+        pendingSwitch_.reset();
+        return request;
     }
 
     // Liveness (docs/api/README.md): a tick once nothing else has gone out
     // for the tick interval.
     std::optional<std::string_view> timePassed(int64_t nowMs) {
+        if (switchDeadlineMs_ && nowMs >= *switchDeadlineMs_) {
+            switchDeadlineMs_.reset();
+        }
         if (!open_ || nowMs - lastSentMs_ < tickIntervalMs_) {
             return std::nullopt;
         }
@@ -133,6 +161,41 @@ public:
     }
 
 private:
+    // The checks in docs/api/README.md's error table, in the order that
+    // gives the page the most useful answer: no Quad Cortex makes the rest
+    // moot, and an index only means something in its own generation.
+    std::optional<std::string_view> switchRequested(const QcWebApiSwitchPreset& request, int64_t nowMs) {
+        etl::vector<char, 48> message;
+        if (!link_.qcConnected) {
+            return error(request.id, QcWebApiErrorCode::QcDisconnected, "link down", nowMs);
+        }
+        if (request.generation != catalogGeneration_) {
+            detail::appendLiteral("generation ", message);
+            detail::appendUInt(request.generation, message);
+            detail::appendLiteral(" != ", message);
+            detail::appendUInt(catalogGeneration_, message);
+            return error(request.id, QcWebApiErrorCode::StaleCatalog, view(message), nowMs);
+        }
+        if (request.index >= catalogPresetCount_) {
+            detail::appendLiteral("no preset ", message);
+            detail::appendUInt(request.index, message);
+            detail::appendLiteral(" in ", message);
+            detail::appendUInt(static_cast<uint32_t>(catalogPresetCount_), message);
+            return error(request.id, QcWebApiErrorCode::BadIndex, view(message), nowMs);
+        }
+        if (switchDeadlineMs_) {
+            return error(request.id, QcWebApiErrorCode::Busy, "a switch is in flight", nowMs);
+        }
+        pendingSwitch_ = QcSwitchRequest{.generation = request.generation, .index = request.index};
+        switchDeadlineMs_ = nowMs + kSwitchTimeoutMs;
+        return std::nullopt;
+    }
+
+    template <size_t N>
+    static std::string_view view(const etl::vector<char, N>& text) {
+        return {text.data(), text.size()};
+    }
+
     static bool sameCurrent(const QcCurrentPreset& a, const QcCurrentPreset& b) {
         if (a.has_value() != b.has_value()) {
             return false;
@@ -169,6 +232,10 @@ private:
     int64_t lastSentMs_ = 0;
     QcCurrentPreset current_;
     QcLinkState link_;
+    uint32_t catalogGeneration_ = 0;
+    size_t catalogPresetCount_ = 0;
+    std::optional<QcSwitchRequest> pendingSwitch_;
+    std::optional<int64_t> switchDeadlineMs_;
     etl::vector<char, kCatalogJsonCapacity> catalogJson_;
     Frame frame_;
 };

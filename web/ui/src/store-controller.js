@@ -27,6 +27,12 @@ export class StoreController {
     this.#store.takeOver();
   }
 
+  // The user tapped a Preset (issue #78). The store decides whether it goes
+  // out: one switch at a time, and only on a live Connection.
+  switchPreset(index) {
+    this.#store.switchPreset(index);
+  }
+
   hostConnected() {
     this.#unsubscribe = this.#store.subscribe(() => this.#host.requestUpdate());
   }

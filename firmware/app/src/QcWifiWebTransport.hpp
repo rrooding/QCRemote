@@ -112,6 +112,11 @@ public:
         instance_ = this;
     }
 
+    // Issue #78: where an accepted switch goes - QcSession, in the
+    // firmware. Call once at startup, before start(); without one, switches
+    // are still checked and answered but never reach a Quad Cortex.
+    void setSwitcher(QcPresetSwitcher& switcher) { switcher_ = &switcher; }
+
     // Brings up Wi-Fi, starts Zephyr's HTTP server, and starts the worker
     // thread that talks to the page. Call once at startup (Main.cpp),
     // before QcSession::addTransport(*this).
@@ -381,6 +386,10 @@ private:
 
         const std::string_view text(reinterpret_cast<const char*>(frameBuffer_), kept);
         send(session_.frameReceived(text, frameLength, k_uptime_get()));
+        const auto request = session_.takeSwitchRequest();
+        if (request && switcher_ != nullptr) {
+            switcher_->requestSwitchPreset(*request);
+        }
     }
 
     // Sends one of the session's frames to the live page, if there is one
@@ -782,6 +791,7 @@ private:
     // page's socket, and the buffer one inbound frame is read into
     // (docs/api's 256-byte limit).
     QcWebApiSession session_;
+    QcPresetSwitcher* switcher_ = nullptr;
     int liveSocket_ = -1;
     uint8_t frameBuffer_[kWebApiMaxRequestBytes]{};
 

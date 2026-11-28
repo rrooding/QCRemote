@@ -62,6 +62,7 @@ int main() {
     // bridge meet.
 #if defined(CONFIG_WIFI)
     g_qcHidBridge.session().addTransport(g_qcWifiWebTransport);
+    g_qcWifiWebTransport.setSwitcher(g_qcHidBridge.session());
     g_qcWifiWebTransport.start();
 #endif
 
