@@ -1,10 +1,13 @@
 import { LitElement, html, css, classMap } from '../vendor/lit.js';
 import { StoreController } from './store-controller.js';
+import { connectionStatus } from './store.js';
 import './qc-status.js';
 import './qc-preset-list.js';
 
-// The shell: a fixed header carrying the link state, a fixed status panel,
-// and the scrolling preset list under it.
+// The shell: a fixed header carrying the connection state (Board
+// unreachable / Quad Cortex disconnected / connected, see
+// connectionStatus()), a fixed status panel, and the scrolling preset list
+// under it.
 //
 // The safe-area padding is on this element rather than on <body> because in
 // iOS standalone mode the status bar and home indicator overlap the page,
@@ -56,16 +59,24 @@ export class QcApp extends LitElement {
       background: var(--qc-text-dim);
     }
 
-    .dot.online {
+    .dot.connected {
       background: var(--qc-ok);
+    }
+
+    .dot.qcDisconnected {
+      background: var(--qc-warn);
+    }
+
+    .dot.connecting,
+    .dot.unreachable {
+      animation: blink 1s steps(2, end) infinite;
     }
 
     .dot.connecting {
       background: var(--qc-warn);
-      animation: blink 1s steps(2, end) infinite;
     }
 
-    .dot.offline,
+    .dot.unreachable,
     .dot.replaced {
       background: var(--qc-bad);
     }
@@ -77,7 +88,8 @@ export class QcApp extends LitElement {
     }
 
     @media (prefers-reduced-motion: reduce) {
-      .dot.connecting {
+      .dot.connecting,
+      .dot.unreachable {
         animation: none;
       }
     }
@@ -89,6 +101,13 @@ export class QcApp extends LitElement {
          page, which in standalone mode looks like the app coming unstuck. */
       overscroll-behavior: contain;
       -webkit-overflow-scrolling: touch;
+    }
+
+    /* What is shown while the Board is unreachable is the last state it
+       reported, not its current one. */
+    .scroll.stale {
+      opacity: 0.55;
+      transition: opacity 0.2s;
     }
 
     .error {
@@ -122,12 +141,13 @@ export class QcApp extends LitElement {
 
   render() {
     const { connection, error } = this.#store.state;
+    const status = connectionStatus(this.#store.state);
     return html`
       <header>
         <span class="title">QC Remote</span>
-        <span class="link">
-          <span class=${classMap({ dot: true, [connection]: true })}></span>
-          ${connection}
+        <span class="link" role="status">
+          <span class=${classMap({ dot: true, [status.kind]: true })}></span>
+          ${status.label}
         </span>
       </header>
       ${error
@@ -138,7 +158,7 @@ export class QcApp extends LitElement {
               : null}
           </p>`
         : html`<span></span>`}
-      <div class="scroll">
+      <div class=${classMap({ scroll: true, stale: status.kind === 'unreachable' })}>
         <qc-status></qc-status>
         <qc-preset-list></qc-preset-list>
       </div>
