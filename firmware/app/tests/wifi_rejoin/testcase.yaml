@@ -1,0 +1,10 @@
+tests:
+  firmware.wifi_rejoin:
+    # QcWifiRejoin is plain C++ with no Zephyr networking in it, so it runs
+    # anywhere: native_sim in CI, and qemu_cortex_m3 / mps2/an385 on a Mac,
+    # where native_sim doesn't build.
+    platform_allow:
+      - native_sim
+      - qemu_cortex_m3
+      - mps2/an385
+    tags: firmware
