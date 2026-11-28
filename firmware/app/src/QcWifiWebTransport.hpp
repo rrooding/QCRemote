@@ -616,11 +616,17 @@ private:
     // Issue #20: one station join request. Recorded with rejoin_ whatever
     // the result, so a request the driver refused is retried like one that
     // failed later.
+    // Compiled out without Wi-Fi management: tests/wifi_web_http builds this
+    // class with no Wi-Fi driver, and run() reaches this through
+    // rejoinIfDue(), so the request handler would be an undefined reference
+    // (staIface_ is never set there anyway).
     void issueStationJoin() {
+#if defined(CONFIG_NET_L2_WIFI_MGMT)
         const int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, staIface_, &staParams_, sizeof(staParams_));
         if (ret != 0) {
             LOG_ERR("NET_REQUEST_WIFI_CONNECT failed: %d", ret);
         }
+#endif
         K_SPINLOCK(&rejoinLock_) {
             rejoin_.joinIssued(k_uptime_get());
         }
