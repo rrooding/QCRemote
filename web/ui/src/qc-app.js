@@ -65,7 +65,8 @@ export class QcApp extends LitElement {
       animation: blink 1s steps(2, end) infinite;
     }
 
-    .dot.offline {
+    .dot.offline,
+    .dot.replaced {
       background: var(--qc-bad);
     }
 
@@ -91,26 +92,52 @@ export class QcApp extends LitElement {
     }
 
     .error {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin: 0;
       padding: 0.5rem 1rem;
       background: var(--qc-bad-dim);
       color: var(--qc-text);
       font-size: 0.75rem;
+    }
+
+    .error span {
+      flex: 1;
+    }
+
+    button {
+      min-height: 44px;
+      padding: 0 1rem;
+      border: 1px solid var(--qc-line);
+      border-radius: 8px;
+      background: var(--qc-surface-2);
+      color: var(--qc-text);
+      font: inherit;
+      font-weight: 600;
     }
   `;
 
   #store = new StoreController(this, window.qcStore);
 
   render() {
-    const { link, error } = this.#store.state;
+    const { connection, error } = this.#store.state;
     return html`
       <header>
         <span class="title">QC Remote</span>
         <span class="link">
-          <span class=${classMap({ dot: true, [link]: true })}></span>
-          ${link}
+          <span class=${classMap({ dot: true, [connection]: true })}></span>
+          ${connection}
         </span>
       </header>
-      ${error ? html`<p class="error">${error}</p>` : html`<span></span>`}
+      ${error
+        ? html`<p class="error" role="status">
+            <span>${error}</span>
+            ${connection === 'replaced'
+              ? html`<button @click=${() => this.#store.takeOver()}>Use here</button>`
+              : null}
+          </p>`
+        : html`<span></span>`}
       <div class="scroll">
         <qc-status></qc-status>
         <qc-preset-list></qc-preset-list>

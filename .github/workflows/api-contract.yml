@@ -1,0 +1,49 @@
+name: api-contract
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "docs/api/**"
+      - "web/ui/**"
+      - ".github/workflows/api-contract.yml"
+  pull_request:
+    paths:
+      - "docs/api/**"
+      - "web/ui/**"
+      - ".github/workflows/api-contract.yml"
+
+# Issue #101: keeps the web UI <-> Board API contract (docs/api) and its
+# examples honest, and the page's own tests against them. check_examples.py
+# declares its own dependencies inline (PEP 723), so `uv run` is the whole
+# setup; the web UI's tests use Node's built-in runner with no npm install
+# (web/ui has no package.json). Deliberately separate from the firmware
+# workflow: no Zephyr image, no firmware build, and firmware CI never gains
+# a Node dependency (CODING_STANDARDS.md, Web UI).
+jobs:
+  check-examples:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out QCRemote
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.4.0
+
+      - name: Check the API examples against the schemas
+        run: uv run docs/api/check_examples.py
+
+  web-ui-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out QCRemote
+        uses: actions/checkout@v7
+
+      # 22 or later: the mock server's test uses the global WebSocket client.
+      - name: Install Node
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Run the web UI tests
+        run: node --test 'web/ui/test/*.test.js'

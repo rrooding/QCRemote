@@ -1,14 +1,22 @@
 name: firmware
 
+# docs/api/** and web/ui/** too: the native_sim suites compare the Board's
+# frames with docs/api/examples byte for byte (cmake/ApiExamples.cmake), and
+# every image embeds web/ui (cmake/EmbedWebAssets.cmake), so a change to
+# either can break this workflow without touching firmware/.
 on:
   push:
     branches: [master]
     paths:
       - "firmware/**"
+      - "docs/api/**"
+      - "web/ui/**"
       - ".github/workflows/firmware.yml"
   pull_request:
     paths:
       - "firmware/**"
+      - "docs/api/**"
+      - "web/ui/**"
       - ".github/workflows/firmware.yml"
 
 # Issue #46: the Zephyr version, both toolchains, the pinned v4.5.0 workspace

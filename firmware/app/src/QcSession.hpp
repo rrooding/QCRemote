@@ -28,6 +28,7 @@
 #include "QcPresetCatalog.hpp"
 #include "QcPresetPrinter.hpp"
 #include "QcPresetTransport.hpp"
+#include "QcSetlistPositionMessage.hpp"
 #include "QcStateReads.hpp"
 #include "ScopedKMutex.hpp"
 #include "UsbHostClass.hpp"
@@ -92,8 +93,16 @@ public:
         dispatcher_.start();
         gzipInflater_.start();
         presetPrinter_.start();
+        // Published from the heartbeat thread (publishLinkIfChanged()) -
+        // this runs on the host stack thread, where a transport's lock
+        // must not be taken.
+        linkUp_.store(true, std::memory_order_relaxed);
         k_sem_give(&deviceReadySem_);
     }
+
+    // Called from onRemoved() (host stack thread) when the Quad Cortex goes
+    // away. Same contract as deviceConnected(): never blocks.
+    void deviceRemoved() { linkUp_.store(false, std::memory_order_relaxed); }
 
     // Called from onReportIn() (host stack thread) once HidReassembler has
     // completed a message. Hands the message off to a thread that can
@@ -160,6 +169,10 @@ public:
             // of this.
             LOG_DBG("File message: wire=%zu inflated=%zu compressed=%d", wireSize, inflatedSize,
                     compressed);
+        }
+
+        if (command == kCommandSetlistPosition) {
+            onSetlistPosition(protoBytes);
         }
 
         ScopedKMutex lock(fileStreamMutex_);
@@ -288,6 +301,101 @@ private:
         static_cast<QcSession*>(p1)->run();
     }
 
+    // Issue #99: the Quad Cortex reports its Current preset as a Folder key
+    // and a slot in that Folder (SetlistPosition - pushed on every preset
+    // change, and answered to the post-connect state READ). The position is
+    // kept, so a Catalog that arrives later (the READ's reply comes before
+    // the File listing) can still name it - see logFileStreamSummary().
+    // Runs on the dispatcher/gzip-inflater worker thread.
+    void onSetlistPosition(std::span<const uint8_t> protoBytes) {
+        const auto position = decodeSetlistPosition(protoBytes);
+        if (!position) {
+            return;
+        }
+        QcCurrentPreset current;
+        bool catalogReady = false;
+        {
+            ScopedKMutex lock(fileStreamMutex_);
+            // Downloads and plugin folders are named by their own key fields;
+            // folder_key is the user-folder path. Which of these the File
+            // listing's folder keys match is the one thing here not yet
+            // checked against real traffic - the log line below says so
+            // when one doesn't resolve.
+            if (position->isDownloads && !position->keyInDownloads.empty()) {
+                setlistFolderKey_ = position->keyInDownloads;
+            } else if (position->isPlugin && !position->keyInPluginFolder.empty()) {
+                setlistFolderKey_ = position->keyInPluginFolder;
+            } else {
+                setlistFolderKey_ = position->folderKey;
+            }
+            setlistSlot_ = position->position;
+            haveSetlistPosition_ = true;
+            catalogReady = catalogPublished_;
+            if (catalogReady) {
+                current = currentPresetLocked();
+                if (!current) {
+                    LOG_INF("Current preset (folder \"%s\", slot %u) isn't in the Catalog",
+                            setlistFolderKey_.c_str(), setlistSlot_);
+                }
+            }
+        }
+        if (!catalogReady) {
+            return;
+        }
+        for (auto* transport : transports_) {
+            transport->publishCurrentPreset(current);
+        }
+    }
+
+    // Issue #99: a new connection (first connect or a replug, maybe of a
+    // different unit) starts knowing no Current preset. Done here, before
+    // the handshake, rather than at the File READ where the Catalog is
+    // reset: the post-connect state READ's SetlistPosition reply arrives
+    // before that and must survive it. The old Catalog stops being one a
+    // new position can resolve against, so until the new listing is
+    // published the page shows no Current preset rather than this unit's
+    // slot named from the last unit's Catalog. Not unit-tested: QcSession
+    // has no seam without the USB host stack; tests/web_api_session covers
+    // what the page does with the empty Current preset.
+    void forgetPreviousUnit() {
+        {
+            ScopedKMutex lock(fileStreamMutex_);
+            haveSetlistPosition_ = false;
+            setlistFolderKey_.clear();
+            setlistSlot_ = 0;
+            catalogPublished_ = false;
+        }
+        for (auto* transport : transports_) {
+            transport->publishCurrentPreset(QcCurrentPreset{});
+        }
+    }
+
+    // Call with fileStreamMutex_ held, once the listing is complete.
+    QcCurrentPreset currentPresetLocked() const {
+        if (!haveSetlistPosition_) {
+            return std::nullopt;
+        }
+        return findCurrentPreset(presetCatalog_, std::string_view(setlistFolderKey_.data(), setlistFolderKey_.size()),
+                                 setlistSlot_);
+    }
+
+    // Heartbeat thread only - see deviceConnected() for why the Link isn't
+    // published where it changes. Runs after this tick's KeepAlive is sent,
+    // and stays off the time-sensitive budget anyway: no log and no lock
+    // here, and publishLink() is lock-free by contract
+    // (QcPresetTransport.hpp) - QcWifiWebTransport logs the change from its
+    // own worker thread.
+    void publishLinkIfChanged() {
+        const bool up = linkUp_.load(std::memory_order_relaxed);
+        if (up == publishedLinkUp_) {
+            return;
+        }
+        publishedLinkUp_ = up;
+        for (auto* transport : transports_) {
+            transport->publishLink(QcLinkState{.qcConnected = up});
+        }
+    }
+
     void run() {
         while (true) {
             k_sem_take(&deviceReadySem_, K_FOREVER);
@@ -296,6 +404,8 @@ private:
     }
 
     void runHandshake() {
+        forgetPreviousUnit();
+
         // Starts the heartbeat first, before any handshake message - see
         // this class's header comment for why.
         startHeartbeat();
@@ -403,6 +513,7 @@ private:
             // reach here via runHandshake()) must not carry over a previous
             // one's presets.
             presetCatalog_.reset();
+            catalogPublished_ = false;
             dispatcherDroppedAtStart_ = dispatcher_.droppedCount();
             gzipDroppedAtStart_ = gzipInflater_.droppedCount();
             reassemblyOverflowAtStart_ = reassemblyOverflowCount_.load(std::memory_order_relaxed);
@@ -582,21 +693,14 @@ private:
             // not just when the File stream finishes - see this function's
             // own comment.
             checkTrafficHealth();
+            publishLinkIfChanged();
             if (postStreamChanged) {
+                // Diagnostics only: issue #99 took this tally off the wire
+                // (it was the page's "lastChange"). A transport now gets the
+                // Current preset itself - see onSetlistPosition().
                 for (size_t i = 0; i < postStreamEntryCount; ++i) {
                     LOG_INF("Post-connect tally: command=%u count=%u", postStreamEntries[i].command,
                             postStreamEntries[i].count);
-                    // Issue #71: the same new-or-bumped tally entry that
-                    // just got logged is what a transport's client needs
-                    // to know a preset may have changed on the unit - see
-                    // QcPresetTransport.hpp's own comment on why this
-                    // already-throttled signal is forwarded as-is rather
-                    // than re-deriving a separate "did a preset change"
-                    // check.
-                    for (auto* transport : transports_) {
-                        transport->publishPresetChange(QcPresetChangeEvent{
-                            .command = postStreamEntries[i].command, .count = postStreamEntries[i].count});
-                    }
                 }
                 if (postStreamOtherCount > 0) {
                     LOG_INF("Post-connect tally: %u messages from other distinct commands "
@@ -648,12 +752,18 @@ private:
         // storage, then published with the lock released, same split as
         // presetPrinter_'s own copy-then-print above. publishCatalog()
         // itself must not block (see QcPresetTransport.hpp's contract).
+        // Issue #99: and the Current preset as this Catalog names it - the
+        // position may well have arrived before the listing did.
+        QcCurrentPreset current;
         {
             ScopedKMutex lock(fileStreamMutex_);
             copyCatalogSnapshot(presetCatalog_, incomplete, catalogSnapshot_);
+            catalogPublished_ = true;
+            current = currentPresetLocked();
         }
         for (auto* transport : transports_) {
             transport->publishCatalog(catalogSnapshot_);
+            transport->publishCurrentPreset(current);
         }
 
         LOG_INF("Post-connect tally started: watching for preset-change pushes "
@@ -863,6 +973,20 @@ private:
     uint32_t reassemblyOverflowAtStart_ = 0;
     uint32_t reassemblyMalformedAtStart_ = 0;
     uint32_t totalInTransfersAtStart_ = 0;
+
+    // Issue #99, also guarded by fileStreamMutex_: the Quad Cortex's last
+    // reported preset position (onSetlistPosition()), and whether the
+    // current listing is finished and published, so it can be resolved.
+    SetlistPathString setlistFolderKey_;
+    uint32_t setlistSlot_ = 0;
+    bool haveSetlistPosition_ = false;
+    bool catalogPublished_ = false;
+
+    // Issue #99: the Link. Written from the host stack thread
+    // (deviceConnected()/deviceRemoved()); published from the heartbeat
+    // thread, which alone touches publishedLinkUp_.
+    std::atomic<bool> linkUp_{false};
+    bool publishedLinkUp_ = false;
 
     // checkTrafficHealth()'s own "did anything change since last time"
     // state - read and written only from the heartbeat thread, so no lock

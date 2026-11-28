@@ -1,13 +1,8 @@
 import { LitElement, html, css } from '../vendor/lit.js';
 import { StoreController } from './store-controller.js';
 
-// What the board has actually told us, live. This mirrors what the inline
-// test page this replaces showed (QcWifiWebTransport.hpp's kIndexHtml,
-// before issue #88): a catalog summary and the last preset-change event's
-// command/count - the board has no "currently loaded preset" on this wire
-// yet (see store.js's own header comment), so that pair is genuinely the
-// most "live" information there is to show. Preset identity by index/name
-// is issue #15's job once the board emits it.
+// What the Board has told us, live: the Current preset, the Link to the
+// Quad Cortex, and a Catalog summary (docs/api/README.md).
 export class QcStatus extends LitElement {
   static styles = css`
     :host {
@@ -45,12 +40,14 @@ export class QcStatus extends LitElement {
   #store = new StoreController(this, window.qcStore);
 
   render() {
-    const { catalog, lastChange } = this.#store.state;
+    const { catalog, current, link } = this.#store.state;
     return html`
-      ${lastChange
-        ? html`<p class="headline">Preset change (cmd ${lastChange.command}, #${lastChange.count})</p>`
-        : html`<p class="headline idle">Waiting for a preset change&hellip;</p>`}
+      ${current.name !== null
+        ? html`<p class="headline">${current.name}</p>`
+        : html`<p class="headline idle">No preset reported yet</p>`}
       <p class="meta">
+        ${current.index !== null ? html`<span>#${current.index}</span>` : null}
+        <span>${link.qcConnected ? 'Quad Cortex connected' : 'Quad Cortex not connected'}</span>
         <span>${catalog.presetCount} presets</span>
         <span>generation ${catalog.generation}</span>
         ${catalog.incomplete ? html`<span>listing incomplete</span>` : null}

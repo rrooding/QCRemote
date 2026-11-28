@@ -17,6 +17,24 @@ The schemas and examples are documentation and test fixtures only. Nothing here 
 into the firmware: the Board's encoder stays hand-written, and its unit tests compare its
 output against the example files.
 
+## CI
+
+The [`api-contract`](../../.github/workflows/api-contract.yml) workflow runs on every pull
+request, and on every push to `master`, that touches `docs/api/**`, `web/ui/**` or the
+workflow file. It has two jobs:
+
+- **`check-examples`** runs `uv run docs/api/check_examples.py`. A change that breaks an
+  example, or the schema it is checked against, fails it. The checker verifies that every
+  example validates (and every `examples/invalid/` one is rejected), that examples are compact,
+  and that page → Board frames are at most 256 bytes.
+- **`web-ui-tests`** runs `node --test 'web/ui/test/*.test.js'` (Node 22): the page's Store and the dev
+  mock Board, both tested against these examples.
+
+Neither installs any of the firmware toolchain, so the workflow is independent of the
+`firmware` one. The `firmware` workflow also runs on changes to `docs/api/**` and `web/ui/**`,
+because its `native_sim` suites compare the Board's frames with these examples byte for byte
+and embed `web/ui` into the image. Run the same commands locally before pushing.
+
 This document covers the rules a schema can't express. When it and a schema disagree, fix
 whichever is wrong in the same change.
 
@@ -65,6 +83,11 @@ Text frames, one JSON object per frame, UTF-8, no whitespace. Every message has 
 ```
 
 A page → Board frame is at most **256 bytes**. `id` is 1–16 characters of `[0-9A-Za-z_-]`.
+
+The page sends `t` and `id` exactly as written above, with no JSON escapes in them. The
+Board reads both without unescaping, so a frame that spells either with an escape (for
+example `{"t":"re\u0073ync"}`, which a general JSON parser reads as `resync`) is a
+`badRequest`. Other string members, which the Board doesn't read, may contain escapes.
 
 ## Sequence numbers
 
@@ -137,7 +160,9 @@ There is no protocol version number. The page and the firmware are built into th
 so they can only disagree when a page that was loaded *before* a firmware update reconnects
 to the new firmware. The page's reconnect logic makes this likely, not rare.
 
-- `snapshot.build` is the firmware's build id, the git commit it was built from.
+- `snapshot.build` is the firmware's build id, the git commit it was built from, with
+  `-dirty` appended when it was built from uncommitted changes (`unknown` outside a git
+  checkout).
 - The page has the same id baked in by the asset embed step at build time.
 - When they differ, the page calls `location.reload()` and doesn't apply the snapshot.
   To guard against a reload loop (an asset cache that ignores `no-cache`), it reloads at most
@@ -171,7 +196,7 @@ replaces the other page. Two pages never fight over the socket on their own.
 These come from the firmware's static buffers, not from the contract. The schema doesn't
 enforce them, so the page must not depend on them.
 
-- A `snapshot` is at most 16 KB plus a 64 B envelope (`QcWifiWebTransport::kJsonCapacity`,
+- A `snapshot` is at most 16 KB plus a 256 B envelope (`QcWebApiSession::kCatalogJsonCapacity`,
   `kEnvelopeOverhead`). A Catalog that doesn't fit is cut at a Folder or Preset boundary and
   sent with `incomplete:true`.
 - At most 8 Folders of 64 Presets (`QcPresetCatalog`, ADR 0008). Names are truncated to 32

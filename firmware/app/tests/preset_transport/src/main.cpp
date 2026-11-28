@@ -43,8 +43,8 @@ QcCatalogSnapshot& freshSnapshot() {
 // issue #71's seam proof: a transport that only needs plain fields - no
 // Zephyr/Wi-Fi/HTTP dependency at all - standing in for a real
 // QcWifiWebTransport (or a future BLE one) to show QcSession's own
-// addTransport()/publishCatalog()/publishPresetChange() call pattern works
-// against nothing but this interface.
+// addTransport()/publishCatalog()/publishCurrentPreset()/publishLink() call
+// pattern works against nothing but this interface.
 class FakeTransport : public QcPresetTransport {
 public:
     void publishCatalog(const QcCatalogSnapshot& snapshot) override {
@@ -54,24 +54,29 @@ public:
         lastIncomplete = snapshot.incomplete;
     }
 
-    void publishPresetChange(const QcPresetChangeEvent& event) override {
-        ++presetChangeCount;
-        lastChangeCommand = event.command;
-        lastChangeCount = event.count;
+    void publishCurrentPreset(const QcCurrentPreset& current) override {
+        ++currentPublishCount;
+        lastCurrent = current;
+    }
+
+    void publishLink(const QcLinkState& link) override {
+        ++linkPublishCount;
+        lastLink = link;
     }
 
     size_t catalogPublishCount = 0;
-    size_t presetChangeCount = 0;
+    size_t currentPublishCount = 0;
+    size_t linkPublishCount = 0;
     size_t lastPresetCount = 0;
     uint32_t lastGeneration = 0;
     bool lastIncomplete = false;
-    uint16_t lastChangeCommand = 0;
-    uint32_t lastChangeCount = 0;
+    QcCurrentPreset lastCurrent;
+    QcLinkState lastLink;
 };
 
 }  // namespace
 
-ZTEST(preset_transport, test_fake_transport_receives_catalog_and_change_events) {
+ZTEST(preset_transport, test_fake_transport_receives_catalog_current_preset_and_link) {
     QcPresetCatalog& catalog = freshCatalog();
     addPreset(catalog, "my-presets", "My Presets", "Practice 1", 0);
     addPreset(catalog, "my-presets", "My Presets", "Dark Jazz", 1);
@@ -93,7 +98,8 @@ ZTEST(preset_transport, test_fake_transport_receives_catalog_and_change_events) 
         transport->publishCatalog(snapshot);
     }
     for (auto* transport : transports) {
-        transport->publishPresetChange(QcPresetChangeEvent{.command = 9, .count = 3});
+        transport->publishCurrentPreset(findCurrentPreset(catalog, "my-presets", 1));
+        transport->publishLink(QcLinkState{.qcConnected = true});
     }
 
     zassert_equal(wifi.catalogPublishCount, 1);
@@ -101,10 +107,13 @@ ZTEST(preset_transport, test_fake_transport_receives_catalog_and_change_events) 
     zassert_equal(wifi.lastPresetCount, 2);
     zassert_equal(wifi.lastGeneration, snapshot.generation);
     zassert_false(wifi.lastIncomplete);
-    zassert_equal(wifi.presetChangeCount, 1);
-    zassert_equal(wifi.lastChangeCommand, 9);
-    zassert_equal(wifi.lastChangeCount, 3);
-    zassert_equal(ble.presetChangeCount, 1);
+    zassert_equal(wifi.currentPublishCount, 1);
+    zassert_true(wifi.lastCurrent.has_value());
+    zassert_equal(wifi.lastCurrent->name, "Dark Jazz");
+    zassert_equal(wifi.linkPublishCount, 1);
+    zassert_true(wifi.lastLink.qcConnected);
+    zassert_equal(ble.currentPublishCount, 1);
+    zassert_equal(ble.linkPublishCount, 1);
 }
 
 ZTEST(preset_transport, test_copy_catalog_snapshot_basic) {
@@ -123,15 +132,60 @@ ZTEST(preset_transport, test_copy_catalog_snapshot_basic) {
 
     zassert_equal(snapshot.folders[0].name, "My Presets");
     zassert_equal(snapshot.folders[0].presets.size(), 2);
-    zassert_equal(snapshot.folders[0].presets[0].index, 0);
     zassert_equal(snapshot.folders[0].presets[0].name, "Practice 1");
-    zassert_equal(snapshot.folders[0].presets[1].index, 5);
     zassert_equal(snapshot.folders[0].presets[1].name, "Dark Jazz");
 
     // cloud-0-1's real empty folder name is special-cased to "Downloads" -
     // QcPresetCatalog.hpp's own labelFor(), exercised here through the
     // snapshot copy rather than re-tested directly.
     zassert_equal(snapshot.folders[1].name, "Downloads");
+    zassert_equal(snapshot.folders[1].presets[0].name, "Salaatti-Classic");
+}
+
+// Issue #99 / docs/api: a Preset's index counts across the whole Catalog,
+// in listing order - not its slot within its Folder (Dark Jazz sits in
+// slot 5 of My Presets, and Salaatti-Classic in slot 2 of Downloads).
+ZTEST(preset_transport, test_snapshot_indexes_presets_across_the_whole_catalog) {
+    QcPresetCatalog& catalog = freshCatalog();
+    addPreset(catalog, "my-presets", "My Presets", "Practice 1", 0);
+    addPreset(catalog, "my-presets", "My Presets", "Dark Jazz", 5);
+    addPreset(catalog, "cloud-0-1", "", "Salaatti-Classic", 2);
+
+    QcCatalogSnapshot& snapshot = freshSnapshot();
+    copyCatalogSnapshot(catalog, /*incomplete=*/false, snapshot);
+
+    zassert_equal(snapshot.folders[0].presets[0].index, 0);
+    zassert_equal(snapshot.folders[0].presets[1].index, 1);
+    zassert_equal(snapshot.folders[1].presets[0].index, 2);
+}
+
+// The Current preset comes from the Quad Cortex as a Folder key and a slot
+// in that Folder (SetlistPosition); the page addresses it by the same
+// Catalog-wide index the snapshot gives it.
+ZTEST(preset_transport, test_current_preset_is_found_by_folder_key_and_slot) {
+    QcPresetCatalog& catalog = freshCatalog();
+    addPreset(catalog, "my-presets", "My Presets", "Practice 1", 0);
+    addPreset(catalog, "my-presets", "My Presets", "Dark Jazz", 5);
+    addPreset(catalog, "cloud-0-1", "", "Salaatti-Classic", 2);
+
+    const QcCurrentPreset darkJazz = findCurrentPreset(catalog, "my-presets", 5);
+    zassert_true(darkJazz.has_value());
+    zassert_equal(darkJazz->index, 1u);
+    zassert_equal(darkJazz->name, "Dark Jazz");
+
+    const QcCurrentPreset salaatti = findCurrentPreset(catalog, "cloud-0-1", 2);
+    zassert_true(salaatti.has_value());
+    zassert_equal(salaatti->index, 2u);
+    zassert_equal(salaatti->name, "Salaatti-Classic");
+}
+
+ZTEST(preset_transport, test_current_preset_is_unknown_outside_the_catalog) {
+    QcPresetCatalog& catalog = freshCatalog();
+    addPreset(catalog, "my-presets", "My Presets", "Dark Jazz", 5);
+
+    zassert_false(findCurrentPreset(catalog, "my-presets", 4).has_value(), "an empty slot");
+    zassert_false(findCurrentPreset(catalog, "practice", 5).has_value(), "a folder with no named preset");
+    zassert_false(findCurrentPreset(freshCatalog(), "my-presets", 5).has_value(), "before any listing");
 }
 
 ZTEST(preset_transport, test_encode_catalog_json_basic) {
@@ -146,12 +200,11 @@ ZTEST(preset_transport, test_encode_catalog_json_basic) {
     encodeCatalogJson(snapshot, json);
     const std::string_view text(json.data(), json.size());
 
+    // docs/api's key order: incomplete before folders.
     zassert_true(text.starts_with("{\"generation\":"));
-    zassert_true(text.ends_with("\"incomplete\":false}"));
-    zassert_true(text.find("\"presetCount\":2") != std::string_view::npos);
-    zassert_true(text.find("\"name\":\"My Presets\"") != std::string_view::npos);
-    zassert_true(text.find("\"index\":0,\"name\":\"Practice 1\"") != std::string_view::npos);
-    zassert_true(text.find("\"index\":5,\"name\":\"Dark Jazz\"") != std::string_view::npos);
+    zassert_true(text.ends_with(R"(,"presetCount":2,"incomplete":false,"folders":[{"name":"My Presets",)"
+                                R"("presets":[{"index":0,"name":"Practice 1"},{"index":1,"name":"Dark Jazz"}]}]})"),
+                 "got %.*s", static_cast<int>(text.size()), text.data());
 }
 
 ZTEST(preset_transport, test_encode_catalog_json_escapes_special_characters) {
@@ -189,7 +242,8 @@ ZTEST(preset_transport, test_encode_catalog_json_truncates_when_undersized) {
     encodeCatalogJson(snapshot, json);
     const std::string_view text(json.data(), json.size());
 
-    zassert_true(text.ends_with("\"incomplete\":true}"));
+    zassert_true(text.find(R"("incomplete":true,"folders":[)") != std::string_view::npos, "got %.*s",
+                 static_cast<int>(text.size()), text.data());
     zassert_true(text.starts_with("{\"generation\":"));
 
     size_t openBraces = 0;
@@ -221,5 +275,5 @@ ZTEST(preset_transport, test_encode_catalog_json_reports_incomplete_from_snapsho
     encodeCatalogJson(snapshot, json);
     const std::string_view text(json.data(), json.size());
 
-    zassert_true(text.ends_with("\"incomplete\":true}"));
+    zassert_true(text.find(R"("incomplete":true,"folders":[)") != std::string_view::npos);
 }

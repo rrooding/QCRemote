@@ -6,7 +6,8 @@
 #
 # qc_embed_web_assets(<target>) runs the build-time asset pipeline
 # (firmware/app/tools/embed_assets.py, over web/ui) into
-# <CMAKE_CURRENT_BINARY_DIR>/generated/qc_web_assets_generated.hpp, adds
+# <CMAKE_CURRENT_BINARY_DIR>/generated/qc_web_assets_generated.hpp (and the
+# build id, issue #99, into qc_build_id_generated.hpp next to it), adds
 # that directory to <target>'s include path, and makes <target> depend on
 # the generation step - so editing a file under web/ui needs no firmware
 # code change at all, just a rebuild.
@@ -23,21 +24,22 @@ function(qc_embed_web_assets target)
   set(ui_dir "${QC_EMBED_WEB_ASSETS_MODULE_DIR}/../../../web/ui")
   cmake_path(ABSOLUTE_PATH ui_dir NORMALIZE)
   set(script "${QC_EMBED_WEB_ASSETS_MODULE_DIR}/../tools/embed_assets.py")
-  set(generated "${CMAKE_CURRENT_BINARY_DIR}/generated/qc_web_assets_generated.hpp")
+  set(generated_dir "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  set(generated "${generated_dir}/qc_web_assets_generated.hpp")
+  set(build_id "${generated_dir}/qc_build_id_generated.hpp")
 
-  # A conservative rebuild trigger (anything under web/ui, not just the
-  # files embed_assets.py actually serves) - correct is more important than
-  # minimal here, and CONFIGURE_DEPENDS means a new/removed file is picked
-  # up on the next build without re-running cmake by hand.
-  file(GLOB_RECURSE ui_files CONFIGURE_DEPENDS "${ui_dir}/*")
-
-  add_custom_command(
-    OUTPUT "${generated}"
+  # Issue #99: runs on every build, not only when a file under web/ui
+  # changes, because the build id it stamps into the page and the firmware
+  # (qc_build_id_generated.hpp, web/ui/src/build.js) is the git commit
+  # (plus -dirty), and a new commit or an edit elsewhere touches nothing here. The script only rewrites a header
+  # whose content changed, and BYPRODUCTS lets Ninja see that (restat), so
+  # an unchanged build recompiles nothing.
+  add_custom_target(${target}_qc_web_assets
     COMMAND ${PYTHON_EXECUTABLE} "${script}" --ui-dir "${ui_dir}" --out "${generated}"
-    DEPENDS "${script}" ${ui_files}
-    COMMENT "Embedding web/ui assets as gzipped C++ arrays (ADR 0011)"
+            --build-id-out "${build_id}"
+    BYPRODUCTS "${generated}" "${build_id}"
+    COMMENT "Embedding web/ui assets as gzipped C++ arrays (ADR 0011) and stamping the build id"
   )
-  add_custom_target(${target}_qc_web_assets DEPENDS "${generated}")
   add_dependencies(${target} ${target}_qc_web_assets)
-  target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  target_include_directories(${target} PRIVATE "${generated_dir}")
 endfunction()

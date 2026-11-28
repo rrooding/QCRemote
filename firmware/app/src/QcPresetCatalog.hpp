@@ -91,6 +91,11 @@ public:
         NameString key;   // display/debug only - see keyLength/keyHash for identity
         NameString name;
         etl::vector<PresetEntry, kMaxPresetsPerFolder> presets;
+
+        // Whether `fullKey` (untruncated) is this folder's key.
+        bool isKey(std::string_view fullKey) const {
+            return keyLength == fullKey.size() && keyHash == fnv1a64(fullKey);
+        }
     };
 
     // Clears every folder/preset and bumps generation() - call when a new
@@ -184,10 +189,8 @@ private:
     }
 
     Folder* findFolder(std::string_view key) {
-        const auto length = static_cast<uint32_t>(key.size());
-        const uint64_t hash = fnv1a64(key);
         for (size_t i = 0; i < folderCount_; ++i) {
-            if (folders_[i].keyLength == length && folders_[i].keyHash == hash) {
+            if (folders_[i].isKey(key)) {
                 return &folders_[i];
             }
         }
