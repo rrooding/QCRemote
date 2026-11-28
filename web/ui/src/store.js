@@ -10,6 +10,7 @@
 //                  tick      {t,seq}                                liveness only
 //                  error     {t,seq,id?,code,message}               a rejected command
 //   page -> Board  resync    {t}                                    after a seq gap
+//                  switchPreset {t,id,index,generation}             the user picked a Preset
 //
 // There is no protocol version: a snapshot whose `build` differs from the
 // page's own BUILD (src/build.js, rewritten by the firmware's embed step)
@@ -31,6 +32,12 @@ const kBackoffMs = [250, 500, 1000, 2000, 5000, 10000];
 // page connects (docs/api/README.md, "One page at a time").
 const kReplacedCloseCode = 4001;
 const kReplacedText = 'Opened on another device';
+
+// A switch neither confirmed nor refused within this long is given up
+// (docs/api/README.md, "Switching a Preset"). The Board gives up on its
+// side within the same time, so the next tap isn't refused as busy.
+const kSwitchTimeoutMs = 4000;
+const kSwitchUnconfirmedText = "The Board didn't confirm the switch.";
 
 // sessionStorage key holding the Board build this tab last reloaded for.
 const kReloadedForBuildKey = 'qcRemote.reloadedForBuild';
@@ -85,6 +92,7 @@ export class Store {
   #reconnectTimer = null;
   #closed = false;
   #commandCount = 0;
+  #switchTimer = null;
   #listening = false;
 
   /**
@@ -142,18 +150,29 @@ export class Store {
   /**
    * Ask the Board to load the Preset with this Catalog-wide index. Marks it
    * pending; the Board's `current` patch or an `error` with the same id
-   * settles it. (The 4 s give-up and refusing a tap while pending are #78.)
+   * settles it, and after 4 s with neither the page gives up and says so.
+   * One switch at a time: a tap while one is pending is ignored (the Board
+   * would refuse it as `busy`), and so is a tap with no live Connection,
+   * since nothing would answer it.
    */
   switchPreset(index) {
+    if (this.#state.pending || this.#state.connection !== 'online') return;
     this.#commandCount += 1;
     const id = `c${this.#commandCount}`;
     this.#send({ t: 'switchPreset', id, index, generation: this.#state.catalog.generation });
+    clearTimeout(this.#switchTimer);
+    this.#switchTimer = setTimeout(() => {
+      if (this.#state.pending?.id === id) {
+        this.#setState({ pending: null, error: kSwitchUnconfirmedText });
+      }
+    }, kSwitchTimeoutMs);
     this.#setState({ pending: { id, index }, error: null });
   }
 
   close() {
     this.#closed = true;
     clearTimeout(this.#reconnectTimer);
+    clearTimeout(this.#switchTimer);
     this.#socket?.close();
   }
 

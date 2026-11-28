@@ -20,8 +20,8 @@ Node 18 or newer, no `npm install`, no dependencies. Open the page: the mock rep
 `fixtures/session.json` - a 3-folder / 48-preset Catalog, two preset changes at the unit, the
 Link dropping and coming back, an error, a Catalog change (a new snapshot), and after 40 s one
 replace with close code 4001, so the "Opened on another device" banner and its take-over button
-can be tried. Tapping is not wired yet (#78), but the mock already answers `switchPreset`
-with a `current` patch or a `qcDisconnected` / `staleCatalog` / `badIndex` error.
+can be tried. Tapping a Preset switches to it (#78): the mock answers `switchPreset` with a
+`current` patch or a `qcDisconnected` / `staleCatalog` / `badIndex` error.
 
 The mock serves one live page at a time like the Board: opening a second tab closes the first
 with 4001. It sends the page's own build id (`src/build.js`), so the page never reloads
@@ -88,7 +88,7 @@ src/build.js               the page's build id ("dev"; rewritten by the firmware
 src/store-controller.js    Lit ReactiveController that ties the store to component updates
 src/qc-app.js              shell: header with link state, scroll container
 src/qc-status.js           the Current preset, the Link and a Catalog summary
-src/qc-preset-list.js      folders and presets, keyed, the Current preset marked, read-only
+src/qc-preset-list.js      folders and presets, keyed; tap to switch, pending and Current marked
 vendor/lit.js               pinned Lit 3.3.3 bundle (see tools/vendor-lit.mjs) - this
                            tree's own copy, not shared with web/poc/vendor/lit.js
 tools/mock-server.mjs      dev-only mock board: static files + RFC 6455 WebSocket + replay
@@ -103,9 +103,7 @@ reaches the board.
 
 ## What's deliberately not here
 
-- **Tapping to switch presets, its 4 s timeout and the `staleCatalog`/`busy` wording in
-  context.** Issue #78. The store already has `switchPreset()`, pending state and error
-  mapping. Scenes, the grid, parameters and footswitches are Milestone 3.
+- **Scenes, the grid, parameters and footswitches.** Milestone 3.
 - **Any Neural DSP artwork, icon, typeface or colour.** Everything drawn is ours - the
   system font stack and a palette written from scratch (ADR 0011 decision 8). The preset
   names in the fixture are invented.

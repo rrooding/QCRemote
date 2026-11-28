@@ -3,10 +3,12 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string_view>
 
 #include <etl/string.h>
 
-#include "QcHandshakeMessages.hpp"  // MessageAction
+#include "QcHandshakeMessages.hpp"  // MessageAction, HandshakeMessageBuffer
+#include "QcMessage.hpp"
 #include "QcProtobuf.hpp"
 
 namespace qcbridge {
@@ -109,6 +111,23 @@ inline std::optional<SetlistPositionReply> decodeSetlistPosition(std::span<const
     }
 
     return reply;
+}
+
+// Loads the Preset at `slot` of the Folder keyed `folderKey` (issue #78):
+// an UPDATE with folder_key and position, the shape qc-mcp's recall() sends
+// for a user Folder. The Quad Cortex answers with a SetlistPosition push of
+// where it actually is (onSetlistPosition() in QcSession.hpp).
+//
+// Worst case: a 96-byte key, a 10-byte request id and a slot under 256 come to
+// 122 bytes with the trailer, inside the 128-byte buffer.
+inline void encodeSetlistPositionUpdate(HandshakeMessageBuffer& out, uint64_t requestId, std::string_view folderKey,
+                                        uint32_t slot) {
+    etl::vector<uint8_t, kHandshakeMessageCapacity> proto;
+    writeEnum(proto, 1, static_cast<int>(MessageAction::Update));
+    writeUInt64(proto, 2, requestId);
+    writeString(proto, 3, folderKey);
+    writeUInt64(proto, 4, slot);
+    encodeMessage(out, kCommandSetlistPosition, {proto.data(), proto.size()});
 }
 
 }  // namespace qcbridge

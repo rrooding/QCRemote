@@ -61,7 +61,7 @@ namespace qcbridge {
 // File-read stream (fileStream_, see QcFileStream.hpp) gets its per-message
 // hook, kicked off right after the handshake in runHandshake() and polled
 // for its quiet/overall timeout from the heartbeat thread in runHeartbeat().
-class QcSession : public QcMessageSink {
+class QcSession : public QcMessageSink, public QcPresetSwitcher {
 public:
     QcSession() {
         k_sem_init(&deviceReadySem_, 0, 1);
@@ -248,6 +248,15 @@ public:
         }
     }
 
+    // Issue #78: a transport asking for a Preset the page picked, already
+    // checked against the Catalog the page was shown (QcWebApiSession.hpp).
+    // Called on the transport's own thread, so it only records the request
+    // - the newest wins, though the transport never has two in flight - and
+    // the heartbeat thread sends it (sendPendingSwitch()).
+    void requestSwitchPreset(const QcSwitchRequest& request) override {
+        K_SPINLOCK(&pendingSwitchLock_) { pendingSwitch_ = request; }
+    }
+
 private:
     // Below the main LED-blink loop's priority; documented since nothing
     // else contends for the CPU yet.
@@ -361,6 +370,7 @@ private:
         {
             ScopedKMutex lock(fileStreamMutex_);
             haveSetlistPosition_ = false;
+            K_SPINLOCK(&pendingSwitchLock_) { pendingSwitch_.reset(); }
             setlistFolderKey_.clear();
             setlistSlot_ = 0;
             catalogPublished_ = false;
@@ -609,6 +619,7 @@ private:
             if (!sendMessage(msg)) {
                 LOG_WRN("KeepAlive send failed");
             }
+            sendPendingSwitch(msg);
 
             // Piggybacks on the heartbeat's own ~200ms cadence rather than
             // running a separate timer - plenty of resolution against
@@ -900,7 +911,54 @@ private:
         return true;
     }
 
-    uint64_t nextRequestId() { return ++requestIdCounter_; }
+    // Heartbeat thread, right after the KeepAlive, so a switch waits at most
+    // one ~200 ms tick and its send never interleaves with the next one
+    // (sendMutex_ would keep them apart anyway). The index is resolved here
+    // rather than by the transport because only this class holds the
+    // Folder keys - and only against the Catalog the page picked from: a
+    // listing that replaced it in the meantime drops the request, and the
+    // page's own 4 s give-up reports that.
+    void sendPendingSwitch(HandshakeMessageBuffer& msg) {
+        std::optional<QcSwitchRequest> request;
+        K_SPINLOCK(&pendingSwitchLock_) {
+            request = pendingSwitch_;
+            pendingSwitch_.reset();
+        }
+        if (!request) {
+            return;
+        }
+        const uint32_t generation = request->generation;
+        const uint32_t index = request->index;
+
+        SetlistPathString folderKey;
+        uint32_t slot = 0;
+        {
+            ScopedKMutex lock(fileStreamMutex_);
+            const auto location = catalogPublished_ && presetCatalog_.generation() == generation
+                                      ? findPresetLocation(presetCatalog_, index)
+                                      : std::nullopt;
+            if (!location) {
+                LOG_WRN("Switch to preset %u of generation %u dropped: not in the current Catalog", index,
+                        generation);
+                return;
+            }
+            folderKey.assign(location->folderKey.data(), location->folderKey.size());
+            slot = location->slot;
+        }
+
+        msg.clear();
+        encodeSetlistPositionUpdate(msg, nextRequestId(), std::string_view(folderKey.data(), folderKey.size()), slot);
+        if (!sendMessage(msg)) {
+            LOG_WRN("Switch to preset %u: SetlistPosition UPDATE send failed", index);
+            return;
+        }
+        LOG_INF("Switching to preset %u (folder \"%s\", slot %u)", index, folderKey.c_str(), slot);
+    }
+
+    // The handshake and heartbeat threads both take request ids. The
+    // counter is 32 bits because Cortex-M33 has no 64-bit atomics; the
+    // protocol field stays 64 bits, and a session never sends 2^32 requests.
+    uint64_t nextRequestId() { return requestIdCounter_.fetch_add(1, std::memory_order_relaxed) + 1; }
 
     K_KERNEL_STACK_MEMBER(stack_, 2048);
     struct k_thread thread_ {};
@@ -918,7 +976,15 @@ private:
     struct k_sem versionReplySem_ {};
     std::atomic<bool> waitingForVersionReply_{false};
     std::optional<VersionReply> pendingVersionReply_;
-    uint64_t requestIdCounter_ = 0;
+    std::atomic<uint32_t> requestIdCounter_{0};
+
+    // Issue #78: the switch requestSwitchPreset() recorded, not yet sent.
+    // A spinlock, not a mutex: the heartbeat thread takes it, and it's only
+    // ever held for a copy of eight bytes.
+    struct k_spinlock pendingSwitchLock_ {};
+    std::optional<QcSwitchRequest> pendingSwitch_;
+    static_assert(QcPresetCatalog::kKeyCapacity == kSetlistPathCapacity,
+                  "a Folder key the Catalog keeps whole must fit a SetlistPosition folder_key");
 
     QcDispatcher dispatcher_;
     QcGzipInflater gzipInflater_;

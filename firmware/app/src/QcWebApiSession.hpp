@@ -23,6 +23,12 @@ namespace qcbridge {
 // errors. QcWifiWebTransport.hpp only moves the frames, and tests/
 // web_api_session drives this directly.
 //
+// Switching (issue #78) is checked here too: a switchPreset the Board
+// accepts is handed out by takeSwitchRequest(), and the session holds it
+// in flight until the Quad Cortex reports that Preset as the Current one,
+// or the 4 s give-up passes, or nothing can confirm it any more (the Link
+// went down, the Catalog or the page changed).
+//
 // It also keeps the Board state a snapshot needs (Catalog, Current preset,
 // Link) across Connections, so a page that connects later still gets all of
 // it. Each method returns the frame to send, if any - a view into this
@@ -37,6 +43,10 @@ public:
     static constexpr size_t kCatalogJsonCapacity = 16384;
     static constexpr size_t kEnvelopeOverhead = 256;
     using Frame = etl::vector<char, kCatalogJsonCapacity + kEnvelopeOverhead>;
+
+    // docs/api/README.md, "Switching a Preset": the page gives up after 4 s,
+    // and the Board within the same 4 s.
+    static constexpr int64_t kSwitchTimeoutMs = 4000;
 
     // The Catalog before the first listing: what encodeCatalogJson() makes
     // of an empty, incomplete snapshot (tests/web_api_session checks that),
@@ -59,16 +69,34 @@ public:
     }
 
     // The page's WebSocket is gone. Board state is kept for the next one.
-    void connectionClosed() { open_ = false; }
+    // A switch it had in flight is dropped too: the next page didn't ask
+    // for it, and shouldn't be refused as busy because of it.
+    void connectionClosed() {
+        open_ = false;
+        switchInFlight_.reset();
+    }
 
     // A Catalog change is always a snapshot, never a patch.
     std::optional<std::string_view> catalogPublished(const QcCatalogSnapshot& catalog, int64_t nowMs) {
         encodeCatalogJson(catalog, catalogJson_);
+        catalogGeneration_ = catalog.generation;
+        catalogPresetCount_ = catalog.presetCount;
+        // QcSession drops a request from a replaced Catalog, so nothing
+        // will confirm it.
+        switchInFlight_.reset();
         return open_ ? snapshot(nowMs) : std::optional<std::string_view>{};
     }
 
+    // The Quad Cortex reporting the Preset a switch asked for completes
+    // it, and that report is always sent, changed or not: the page clears
+    // its pending state on it. Any other report (a footswitch at the unit,
+    // the re-publish after a listing) leaves the switch in flight.
     std::optional<std::string_view> currentPresetChanged(const QcCurrentPreset& current, int64_t nowMs) {
-        if (sameCurrent(current, current_)) {
+        const bool completesSwitch = switchInFlight_ && current && current->index == switchInFlight_->index;
+        if (completesSwitch) {
+            switchInFlight_.reset();
+        }
+        if (!completesSwitch && sameCurrent(current, current_)) {
             return std::nullopt;
         }
         current_ = current;
@@ -84,6 +112,11 @@ public:
             return std::nullopt;
         }
         link_ = link;
+        if (!link_.qcConnected) {
+            // The Quad Cortex that would have confirmed it is gone.
+            switchInFlight_.reset();
+            pendingSwitch_.reset();
+        }
         if (!open_) {
             return std::nullopt;
         }
@@ -104,15 +137,22 @@ public:
         if (const auto* bad = std::get_if<QcWebApiBadRequest>(&request)) {
             return error(bad->id, QcWebApiErrorCode::BadRequest, bad->reason, nowMs);
         }
-        // Executing a switch is issue #78. Until then a well-formed one is
-        // refused, so the page's pending state clears instead of timing out.
-        const auto& switchPreset = std::get<QcWebApiSwitchPreset>(request);
-        return error(switchPreset.id, QcWebApiErrorCode::BadRequest, "not implemented", nowMs);
+        return switchRequested(std::get<QcWebApiSwitchPreset>(request), nowMs);
+    }
+
+    // The switch accepted since the last call, for the Quad Cortex - once.
+    std::optional<QcSwitchRequest> takeSwitchRequest() {
+        const auto request = pendingSwitch_;
+        pendingSwitch_.reset();
+        return request;
     }
 
     // Liveness (docs/api/README.md): a tick once nothing else has gone out
     // for the tick interval.
     std::optional<std::string_view> timePassed(int64_t nowMs) {
+        if (switchInFlight_ && nowMs >= switchInFlight_->deadlineMs) {
+            switchInFlight_.reset();
+        }
         if (!open_ || nowMs - lastSentMs_ < tickIntervalMs_) {
             return std::nullopt;
         }
@@ -133,6 +173,41 @@ public:
     }
 
 private:
+    // The checks in the order docs/api/README.md's "Errors" gives: no Quad
+    // Cortex makes the rest moot, and an index only means something in its
+    // own generation.
+    std::optional<std::string_view> switchRequested(const QcWebApiSwitchPreset& request, int64_t nowMs) {
+        etl::vector<char, 48> message;
+        if (!link_.qcConnected) {
+            return error(request.id, QcWebApiErrorCode::QcDisconnected, "link down", nowMs);
+        }
+        if (request.generation != catalogGeneration_) {
+            detail::appendLiteral("generation ", message);
+            detail::appendUInt(request.generation, message);
+            detail::appendLiteral(" != ", message);
+            detail::appendUInt(catalogGeneration_, message);
+            return error(request.id, QcWebApiErrorCode::StaleCatalog, view(message), nowMs);
+        }
+        if (request.index >= catalogPresetCount_) {
+            detail::appendLiteral("no preset ", message);
+            detail::appendUInt(request.index, message);
+            detail::appendLiteral(" in ", message);
+            detail::appendUInt(static_cast<uint32_t>(catalogPresetCount_), message);
+            return error(request.id, QcWebApiErrorCode::BadIndex, view(message), nowMs);
+        }
+        if (switchInFlight_) {
+            return error(request.id, QcWebApiErrorCode::Busy, "a switch is in flight", nowMs);
+        }
+        pendingSwitch_ = QcSwitchRequest{.generation = request.generation, .index = request.index};
+        switchInFlight_ = SwitchInFlight{.index = request.index, .deadlineMs = nowMs + kSwitchTimeoutMs};
+        return std::nullopt;
+    }
+
+    template <size_t N>
+    static std::string_view view(const etl::vector<char, N>& text) {
+        return {text.data(), text.size()};
+    }
+
     static bool sameCurrent(const QcCurrentPreset& a, const QcCurrentPreset& b) {
         if (a.has_value() != b.has_value()) {
             return false;
@@ -169,6 +244,14 @@ private:
     int64_t lastSentMs_ = 0;
     QcCurrentPreset current_;
     QcLinkState link_;
+    uint32_t catalogGeneration_ = 0;
+    size_t catalogPresetCount_ = 0;
+    std::optional<QcSwitchRequest> pendingSwitch_;
+    struct SwitchInFlight {
+        uint32_t index;
+        int64_t deadlineMs;
+    };
+    std::optional<SwitchInFlight> switchInFlight_;
     etl::vector<char, kCatalogJsonCapacity> catalogJson_;
     Frame frame_;
 };

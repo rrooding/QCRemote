@@ -1963,8 +1963,8 @@ browser no longer retries forever (see "One page at a time" below).
   was published, the Current preset or the Link changed, a frame arrived, time passed), frames
   out. It owns `seq`, snapshot vs. patch, ticks, the build id, inbound parsing and errors.
   `QcWebApiMessages.hpp` has the hand-written encoders, `QcWebApiRequest.hpp` the inbound
-  extractor (no JSON library, at most 256 bytes). A well-formed `switchPreset` is answered with
-  `badRequest` "not implemented" until #78 executes it.
+  extractor (no JSON library, at most 256 bytes). `switchPreset` is handled since #78 - see
+  "Preset switching" below.
 - **`QcWifiWebTransport.hpp`** only moves bytes: it hands the session what `QcSession`
   publishes, reads the page's frames on its worker thread, serves HTTP, and keeps one page.
 - **The transport seam** (`QcPresetTransport.hpp`) carries the Current preset and the Link
@@ -2028,6 +2028,86 @@ Not verified: anything on hardware (see the smoke test below).
    reconnecting; the log shows `Websocket client <fd> replaced by a newer page, closed with 4001`.
 4. `curl -i http://<board>/api/presets.json` is a 404; `curl -i http://<board>/` shows
    `Cache-Control: no-cache`.
+
+## Preset switching (issue #78)
+
+Tapping a Preset on the page loads it on the Quad Cortex, confirmed rather than optimistic
+([docs/api](../docs/api/README.md#switching-a-preset), ADR 0011 decision 5).
+
+```
+page --switchPreset{id,index,generation}--> QcWebApiSession ── checks: qcDisconnected,
+                                                 │               staleCatalog, badIndex, busy
+                                                 │ takeSwitchRequest()
+                                     QcWifiWebTransport ──requestSwitchPreset()──> QcSession
+                                                                                      │ heartbeat tick:
+                                                                                      │ index -> folder key + slot
+                                                                                      ▼
+                                                           SetlistPosition UPDATE {folder_key, position}
+                                                                                      │
+page <--patch{current}-- QcWebApiSession <-- publishCurrentPreset() <-- SetlistPosition push
+```
+
+- **`QcWebApiSession`** checks a `switchPreset` against the Link, the Catalog's `generation`
+  and `presetCount`, and whether another switch is in flight, and answers a refusal with
+  `error`. An accepted one is handed out once by `takeSwitchRequest()` and stays in flight
+  until the Quad Cortex reports a Current preset - which then always goes out as a `current`
+  patch, changed or not - or until 4 s pass (`kSwitchTimeoutMs`), or the Link goes down.
+- **`QcPresetSwitcher`** (`QcPresetTransport.hpp`) is the way back from a transport to
+  `QcSession`. `requestSwitchPreset()` only records the request under a `k_spinlock`.
+- **Only the requested Preset completes a switch.** A report of another one (a footswitch at
+  the unit, the re-publish after a listing) is an ordinary change and leaves the switch in
+  flight. A new Catalog, a closed page or the Link going down drops it, since nothing will
+  confirm it then.
+- **`QcSession`** sends it on the KeepAlive heartbeat thread, right after the KeepAlive, so it
+  waits at most one ~200 ms tick. It resolves the index with `findPresetLocation()` against
+  the Catalog the page picked from (a newer listing drops it, and the page's 4 s give-up shows
+  that), then sends `encodeSetlistPositionUpdate()`: the `folder_key` + `position` UPDATE
+  qc-mcp's `recall()` sends. The log shows `Switching to preset N (folder "...", slot S)`.
+- **Folder keys are kept whole.** `QcPresetCatalog::Folder::key` used to be cut to the 32
+  characters of a display name and was never read. It is now `kKeyCapacity` (96, the same
+  bound as SetlistPosition's own path strings) because it's sent back to the Quad Cortex. A
+  Folder whose key is longer still can't be switched to: `findPresetLocation()` returns
+  nothing for it. Costs 8 × 64 B of RAM.
+- **The request id counter is a 32-bit atomic** now that two threads take ids: Cortex-M33 has
+  no 64-bit atomics (`__atomic_*_8` doesn't link).
+- **The page** (`web/ui`) makes each row a button, marks the pending row (`aria-busy`), locks
+  the list while a switch is pending or the page is offline, and gives up after 4 s with
+  "The Board didn't confirm the switch."
+
+**Downloads don't load yet** (checked on hardware, issue #108). Downloads (`cloud-0-1`), and
+likely plugin Folders, aren't loaded by `folder_key` + `position`: the Quad Cortex ignores the
+UPDATE and the page gives up after 4 s with "The Board didn't confirm the switch." qc-mcp's
+`recall()` loads them by the Preset's own cloud key (`is_downloads` + `key_in_downloads`)
+or plugin key. The Catalog doesn't keep those keys yet.
+
+### Verified
+
+QEMU (macOS can't run `native_sim`): `west twister -p mps2/an385 -K -T firmware/app/tests`,
+12 of 12 configurations, 169 of 169 cases pass (18 new: 14 in `web_api_session`, 2 each in
+`preset_transport` and `catalog_messages`; the one "not implemented" case is gone). `web/ui`: `npm test`, 31/31. Tried against the mock Board in a browser:
+a tap marks the row pending and the Current preset moves when the mock confirms.
+
+`frdm_rw612` (default config), against `9c87119`:
+
+| | Before | After |
+| --- | --- | --- |
+| RAM | 762 640 B | 763 208 B (**+568 B**) |
+| FLASH | 743 668 B | 746 576 B (**+2 908 B**) |
+
+The RAM is the whole Folder keys (512 B) plus the in-flight switch state.
+
+On hardware (`frdm_rw612`, build `4c9afe5`): switching between user-folder Presets, across
+Folders, works, and re-selecting the loaded Preset is confirmed. Downloads don't load (#108).
+
+### Smoke test
+
+1. Tap a Preset in **My Presets**. Within a second the Quad Cortex loads it, the log shows
+   `Switching to preset N (folder "/media/p4/Presets/My Presets", slot S)`, and the page's
+   Current preset moves to it.
+2. Tap the Preset that's already loaded. The pending outline clears at once.
+3. Tap a Preset in **Downloads**. Until #108 is fixed, the Quad Cortex doesn't load it and the
+   page says "The Board didn't confirm the switch." after 4 s.
+4. Unplug the Quad Cortex and tap: "The Quad Cortex isn't connected to the Board."
 
 ## Not yet done
 

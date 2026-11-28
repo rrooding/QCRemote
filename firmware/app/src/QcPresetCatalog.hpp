@@ -66,6 +66,13 @@ public:
 
     using NameString = etl::string<kNameCapacity>;
 
+    // A Folder's key, kept whole because switching to one of its Presets
+    // (issue #78) names the Folder back to the Quad Cortex by it. Matches
+    // kSetlistPathCapacity, SetlistPosition's own bound for the same keys
+    // (QcSetlistPositionMessage.hpp; QcSession.hpp checks the two agree).
+    static constexpr size_t kKeyCapacity = 96;
+    using KeyString = etl::string<kKeyCapacity>;
+
     struct PresetEntry {
         // The preset's real position within the folder's `files` array
         // (decodeFile()'s FilePreset::index) - not reassigned here, so a
@@ -88,7 +95,9 @@ public:
         // depending on where display truncation happens.
         uint32_t keyLength = 0;
         uint64_t keyHash = 0;
-        NameString key;   // display/debug only - see keyLength/keyHash for identity
+        // Identity is keyLength/keyHash; this is the key to send back, unless
+        // keyLength says it didn't fit.
+        KeyString key;
         NameString name;
         etl::vector<PresetEntry, kMaxPresetsPerFolder> presets;
 
@@ -96,6 +105,8 @@ public:
         bool isKey(std::string_view fullKey) const {
             return keyLength == fullKey.size() && keyHash == fnv1a64(fullKey);
         }
+
+        bool keyIsWhole() const { return keyLength == key.size(); }
     };
 
     // Clears every folder/preset and bumps generation() - call when a new

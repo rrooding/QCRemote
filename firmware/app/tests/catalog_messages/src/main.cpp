@@ -1,11 +1,13 @@
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
 #include <zephyr/ztest.h>
 
 #include "QcHandshakeMessages.hpp"
+#include "QcMessage.hpp"
 #include "QcModelRepoMessage.hpp"
 #include "QcProtobuf.hpp"
 #include "QcSetlistPositionMessage.hpp"
@@ -56,6 +58,38 @@ ZTEST(catalog_messages, test_decode_model_repo_empty_input_fails)
 }
 
 // --- QcSetlistPositionMessage.hpp ---------------------------------------
+
+// Issue #78: the request that loads a Preset - qc-mcp's recall(), which
+// sends folder_key and position on an UPDATE (a folderless recall is
+// silently refused by the device, per its server.py).
+ZTEST(catalog_messages, test_setlist_position_update_bytes)
+{
+    HandshakeMessageBuffer msg;
+    encodeSetlistPositionUpdate(msg, 9, "abc", 5);
+
+    const std::vector<uint8_t> expected = {0x08, 0x01, 0x10, 0x09, 0x1a, 0x03, 'a',  'b',  'c',  0x20,
+                                           0x05, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    zassert_equal(msg.size(), expected.size(), "size %zu", msg.size());
+    zassert_mem_equal(msg.data(), expected.data(), expected.size());
+}
+
+ZTEST(catalog_messages, test_setlist_position_update_decodes_back_with_the_longest_folder_key)
+{
+    const std::string key(kSetlistPathCapacity, 'k');
+    HandshakeMessageBuffer msg;
+    encodeSetlistPositionUpdate(msg, 0xFFFFFFFFFFFFFFFFull, key, 255);
+
+    const auto decoded = decodeMessage({msg.data(), msg.size()});
+    zassert_true(decoded.has_value());
+    zassert_equal(decoded->command, kCommandSetlistPosition);
+    const auto position = decodeSetlistPosition(decoded->protoBytes);
+    zassert_true(position.has_value());
+    zassert_equal(position->action, MessageAction::Update);
+    zassert_equal(position->requestId, 0xFFFFFFFFFFFFFFFFull);
+    zassert_equal(std::string_view(position->folderKey.data(), position->folderKey.size()), key);
+    zassert_equal(position->position, 255u);
+    zassert_false(position->isFactory || position->isDownloads || position->isPlugin);
+}
 
 ZTEST(catalog_messages, test_decode_setlist_position_my_presets_addressing)
 {

@@ -18,6 +18,24 @@ struct QcLinkState {
     bool qcConnected = false;
 };
 
+// A switch the page asked for and the Board accepted (issue #78): the
+// Preset at Catalog-wide `index` of the Catalog numbered `generation`.
+struct QcSwitchRequest {
+    uint32_t generation = 0;
+    uint32_t index = 0;
+};
+
+// The way back from a transport to the Quad Cortex (issue #78) - QcSession
+// implements it, a transport calls it. Same rule as the calls below, the
+// other way round: it must return at once, since the transport's own
+// thread is waiting, so QcSession only records the request here and sends
+// it from its own thread.
+class QcPresetSwitcher {
+public:
+    virtual ~QcPresetSwitcher() = default;
+    virtual void requestSwitchPreset(const QcSwitchRequest& request) = 0;
+};
+
 // The seam issue #71 asks for: a generic layer between QcSession/
 // QcPresetCatalog (protocol/session logic, see QcSession.hpp) and whatever
 // carries updates out to a client - Wi-Fi/HTTP today (QcWifiWebTransport.hpp),

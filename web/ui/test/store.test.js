@@ -251,6 +251,87 @@ test('a current patch for the pending Preset clears the pending state', () => {
   assert.equal(store.state.current.index, 3);
 });
 
+// docs/api/README.md, "Switching a Preset", step 4.
+test('a switch the Board never answers clears after 4 s and says so', () => {
+  const store = onlineStore();
+  switchTo(store, 3);
+
+  mock.timers.tick(3_999);
+  assert.deepEqual(store.state.pending?.index, 3);
+  assert.equal(store.state.error, null);
+
+  mock.timers.tick(1);
+  assert.equal(store.state.pending, null);
+  assert.equal(store.state.error, "The Board didn't confirm the switch.");
+});
+
+test('a confirmed switch is not reported as unconfirmed 4 s later', () => {
+  const store = onlineStore();
+  switchTo(store, 3);
+  socket().receive(example('patch-current'));
+
+  mock.timers.tick(4_000);
+
+  assert.equal(store.state.pending, null);
+  assert.equal(store.state.error, null);
+});
+
+test('a refused switch is not reported as unconfirmed 4 s later', () => {
+  const store = onlineStore();
+  const { id } = switchTo(store, 3);
+  socket().receive(errorFor('error-stale-catalog', id, 1));
+  const refused = store.state.error;
+
+  mock.timers.tick(4_000);
+
+  assert.equal(store.state.error, refused);
+});
+
+// One switch at a time: the Board would answer a second one with `busy`
+// anyway, and the selection the user is waiting on shouldn't change under them.
+test('a tap while a switch is pending is ignored', () => {
+  const store = onlineStore();
+  const { id } = switchTo(store, 3);
+  const sent = socket().sent.length;
+
+  store.switchPreset(1);
+
+  assert.equal(socket().sent.length, sent);
+  assert.deepEqual(store.state.pending, { id, index: 3 });
+});
+
+test('the next tap works once the switch is settled', () => {
+  const store = onlineStore();
+  switchTo(store, 3);
+  socket().receive(example('patch-current'));
+
+  const frame = switchTo(store, 1);
+
+  assert.equal(frame.index, 1);
+  assert.deepEqual(store.state.pending, { id: frame.id, index: 1 });
+});
+
+// Nothing would answer it, so it would only sit pending for 4 s.
+test('a tap with no live Connection sends nothing and marks nothing pending', () => {
+  const store = makeStore();
+
+  store.switchPreset(3);
+
+  assert.equal(socket().sent.length, 0);
+  assert.equal(store.state.pending, null);
+});
+
+test('a dropped Connection clears a pending switch without a later timeout message', () => {
+  const store = onlineStore();
+  switchTo(store, 3);
+  socket().close();
+
+  mock.timers.tick(4_000);
+
+  assert.equal(store.state.pending, null);
+  assert.notEqual(store.state.error, "The Board didn't confirm the switch.");
+});
+
 test('a dropped Connection reconnects with backoff', () => {
   const store = onlineStore();
 
