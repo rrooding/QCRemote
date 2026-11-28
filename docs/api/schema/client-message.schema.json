@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/rrooding/QCRemote/docs/api/schema/client-message.schema.json",
+  "title": "Page → Board WebSocket message",
+  "description": "Every text frame the page sends on /ws. A frame is at most 256 bytes. The Board answers anything that doesn't match this schema with an error of code badRequest.",
+  "type": "object",
+  "required": ["t"],
+  "properties": {
+    "t": { "type": "string" }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/resync" },
+    { "$ref": "#/$defs/switchPreset" }
+  ],
+  "$defs": {
+    "commandId": {
+      "description": "Chosen by the page so it can match an error to the command that caused it. Unique among the page's own commands on one connection.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16,
+      "pattern": "^[0-9A-Za-z_-]+$"
+    },
+
+    "resync": {
+      "description": "Ask for a fresh snapshot, after the page saw a seq gap. Carries no id: the answer is the snapshot itself.",
+      "type": "object",
+      "required": ["t"],
+      "properties": {
+        "t": { "const": "resync" }
+      }
+    },
+
+    "switchPreset": {
+      "description": "Ask the Quad Cortex to load a Preset. Confirmed by a current patch (always sent once the switch completes, even if the Current preset didn't change), or rejected by an error carrying the same id.",
+      "type": "object",
+      "required": ["t", "id", "index", "generation"],
+      "properties": {
+        "t": { "const": "switchPreset" },
+        "id": { "$ref": "#/$defs/commandId" },
+        "index": {
+          "description": "The Preset's index across the whole Catalog.",
+          "$ref": "server-message.schema.json#/$defs/presetIndex"
+        },
+        "generation": {
+          "description": "The Catalog generation the page was showing when the user picked the Preset. The Board rejects a mismatch with staleCatalog.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      }
+    }
+  }
+}

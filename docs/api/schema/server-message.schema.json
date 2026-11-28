@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/rrooding/QCRemote/docs/api/schema/server-message.schema.json",
+  "title": "Board → page WebSocket message",
+  "description": "Every text frame the Board sends on /ws. See docs/api/README.md for the rules (seq, liveness, patch semantics) that a schema cannot express. Receivers ignore fields they don't know, so object schemas here do not set additionalProperties:false.",
+  "type": "object",
+  "required": ["t", "seq"],
+  "properties": {
+    "t": { "type": "string" },
+    "seq": { "$ref": "#/$defs/seq" }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/snapshot" },
+    { "$ref": "#/$defs/patch" },
+    { "$ref": "#/$defs/tick" },
+    { "$ref": "#/$defs/error" }
+  ],
+  "$defs": {
+    "seq": {
+      "description": "Per-connection message counter. A snapshot is always 0; every later message on the same connection is exactly one more than the previous one, ticks and errors included.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+
+    "snapshot": {
+      "description": "The complete state. Sent right after the WebSocket opens, after a resync, and whenever the Catalog changes.",
+      "type": "object",
+      "required": ["t", "seq", "build", "catalog", "current", "link"],
+      "properties": {
+        "t": { "const": "snapshot" },
+        "seq": { "const": 0 },
+        "build": { "$ref": "#/$defs/build" },
+        "catalog": { "$ref": "#/$defs/catalog" },
+        "current": { "$ref": "#/$defs/current" },
+        "link": { "$ref": "#/$defs/link" }
+      }
+    },
+
+    "patch": {
+      "description": "One or more top-level sections that changed. Each section present replaces that section of the page's state wholesale; there is no merging inside a section. The Catalog never changes by patch: a Catalog change is always a new snapshot.",
+      "type": "object",
+      "required": ["t", "seq"],
+      "properties": {
+        "t": { "const": "patch" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "current": { "$ref": "#/$defs/current" },
+        "link": { "$ref": "#/$defs/link" }
+      },
+      "not": { "required": ["catalog"] },
+      "anyOf": [{ "required": ["current"] }, { "required": ["link"] }]
+    },
+
+    "tick": {
+      "description": "Liveness only. Sent when nothing else has gone out for the tick interval.",
+      "type": "object",
+      "required": ["t", "seq"],
+      "properties": {
+        "t": { "const": "tick" },
+        "seq": { "$ref": "#/$defs/seq" }
+      }
+    },
+
+    "error": {
+      "description": "The Board rejected a command. Success is never acknowledged with a message of its own; it shows up as the state change (a current patch).",
+      "type": "object",
+      "required": ["t", "seq", "code"],
+      "properties": {
+        "t": { "const": "error" },
+        "seq": { "$ref": "#/$defs/seq" },
+        "id": {
+          "description": "The id of the rejected command. Absent only when the command was so malformed that no id could be read.",
+          "$ref": "client-message.schema.json#/$defs/commandId"
+        },
+        "code": {
+          "enum": ["qcDisconnected", "badIndex", "staleCatalog", "busy", "badRequest"]
+        },
+        "message": {
+          "description": "English detail for logs and the console. The page never shows it to the user.",
+          "type": "string"
+        }
+      }
+    },
+
+    "build": {
+      "description": "Identifies the firmware image (and therefore the page) the Board is running: the git commit it was built from. The page has its own build id baked in at build time and reloads itself when they differ.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 40,
+      "pattern": "^[0-9A-Za-z._+-]+$"
+    },
+
+    "catalog": {
+      "description": "The Board's listing of the Quad Cortex's Folders and Presets.",
+      "type": "object",
+      "required": ["generation", "presetCount", "incomplete", "folders"],
+      "properties": {
+        "generation": {
+          "description": "Identifies this version of the Catalog. Changes whenever the Board re-reads the listing. A switchPreset must quote it.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "presetCount": {
+          "description": "How many Presets the Quad Cortex reported, which can be more than are listed when incomplete is true.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "incomplete": {
+          "description": "True when the listing is partial: it is still being read, or it did not fit the Board's buffers.",
+          "type": "boolean"
+        },
+        "folders": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/folder" }
+        }
+      }
+    },
+
+    "folder": {
+      "type": "object",
+      "required": ["name", "presets"],
+      "properties": {
+        "name": { "type": "string" },
+        "presets": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/preset" }
+        }
+      }
+    },
+
+    "preset": {
+      "type": "object",
+      "required": ["index", "name"],
+      "properties": {
+        "index": {
+          "description": "The Preset's position across the whole Catalog (not within its Folder). Unique within one generation.",
+          "$ref": "#/$defs/presetIndex"
+        },
+        "name": { "type": "string" }
+      }
+    },
+
+    "presetIndex": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535
+    },
+
+    "current": {
+      "description": "The Current preset: what the Quad Cortex reports as loaded. All fields are null when the Board doesn't know.",
+      "type": "object",
+      "required": ["index", "name", "scene"],
+      "properties": {
+        "index": {
+          "oneOf": [{ "$ref": "#/$defs/presetIndex" }, { "type": "null" }]
+        },
+        "name": { "type": ["string", "null"] },
+        "scene": {
+          "description": "Reserved for scene support (#21). Always null for now.",
+          "type": "null"
+        }
+      }
+    },
+
+    "link": {
+      "description": "The Link: the Board's USB connection to the Quad Cortex.",
+      "type": "object",
+      "required": ["qcConnected"],
+      "properties": {
+        "qcConnected": { "type": "boolean" }
+      }
+    }
+  }
+}
