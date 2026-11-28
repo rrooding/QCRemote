@@ -25,8 +25,17 @@ const kLivenessTimeoutMs = kTickIntervalMs * 2.5;
 
 // Reconnect backoff: fast enough that walking back into Wi-Fi range feels
 // instant, capped so a Board that is simply off doesn't get hammered.
-// Jitter keeps two open tabs from retrying in lockstep.
+// Jitter (up to +30 %) keeps two open tabs from retrying in lockstep. The
+// count only starts over once a snapshot arrives, so a Board that accepts
+// the socket and then drops it straight away still backs off.
 const kBackoffMs = [250, 500, 1000, 2000, 5000, 10000];
+const kBackoffJitter = 0.3;
+
+// A WebSocket to a Board that has dropped off the network can sit in
+// CONNECTING for over a minute while TCP retries its SYN. On a LAN a
+// healthy Board opens in well under a second, so an attempt still not
+// open after this long is abandoned and retried on the backoff.
+const kConnectTimeoutMs = 5000;
 
 // The Board closes an older page's socket with this code when a newer
 // page connects (docs/api/README.md, "One page at a time").
@@ -61,6 +70,19 @@ const emptyState = Object.freeze({
    * 'online' | 'replaced' (another page took over; see takeOver()).
    */
   connection: 'offline',
+  /**
+   * Whether the Catalog, Current preset and Link came from a snapshot on
+   * the live socket. False from a drop until the next snapshot: what is
+   * shown in between is the last known state, not the Board's.
+   */
+  synced: false,
+  /**
+   * Whether the Connection has failed or dropped and the page is retrying.
+   * Stays true across attempts until a snapshot arrives, so the page shows
+   * one steady "Board unreachable" rather than flickering through every
+   * attempt. See connectionStatus().
+   */
+  retrying: false,
   /** Last problem worth showing, in the page's own words, or null. */
   error: null,
   /** { generation, presetCount, incomplete, folders: [{ name, presets: [{ index, name }] }] } */
@@ -90,6 +112,10 @@ export class Store {
   #seq = null;
   #livenessTimer = null;
   #reconnectTimer = null;
+  #connectTimer = null;
+  #lastMessageAt = 0;
+  #events;
+  #document;
   #closed = false;
   #commandCount = 0;
   #switchTimer = null;
@@ -102,13 +128,18 @@ export class Store {
    * @param {typeof WebSocket} options.WebSocket
    * @param {{ reload(): void }} options.location
    * @param {Storage} options.sessionStorage
+   * @param {EventTarget} [options.events]   where 'online' and 'visibilitychange'
+   *                                         fire: `window` in the page
+   * @param {{ visibilityState: string }} [options.document]
    */
-  constructor({ url, build, WebSocket, location, sessionStorage }) {
+  constructor({ url, build, WebSocket, location, sessionStorage, events, document }) {
     this.#url = url;
     this.#build = build;
     this.#WebSocket = WebSocket;
     this.#location = location;
     this.#sessionStorage = sessionStorage;
+    this.#events = events;
+    this.#document = document;
   }
 
   get state() {
@@ -126,13 +157,12 @@ export class Store {
     this.#open();
     // Coming back from a locked phone or a backgrounded tab is the single
     // most common way this Connection dies on iOS. Both events are cheap
-    // and land well before the liveness timeout would. (Absent outside a
-    // browser, e.g. under node --test.)
-    if (!this.#listening && typeof globalThis.addEventListener === 'function') {
+    // and land well before the liveness timeout would.
+    if (!this.#listening && this.#events) {
       this.#listening = true;
-      globalThis.addEventListener('online', () => this.#retryNow());
-      globalThis.addEventListener('visibilitychange', () => {
-        if (globalThis.document?.visibilityState === 'visible') this.#retryNow();
+      this.#events.addEventListener('online', () => this.#retryNow());
+      this.#events.addEventListener('visibilitychange', () => {
+        if (this.#document?.visibilityState === 'visible') this.#retryNow();
       });
     }
   }
@@ -173,18 +203,30 @@ export class Store {
     this.#closed = true;
     clearTimeout(this.#reconnectTimer);
     clearTimeout(this.#switchTimer);
+    clearTimeout(this.#connectTimer);
+    clearTimeout(this.#livenessTimer);
     this.#socket?.close();
   }
 
   // --- internals -----------------------------------------------------------
 
   #open() {
+    // At most one socket at a time: an attempt still in progress when the
+    // page retries at once (online, visibilitychange) is abandoned.
+    this.#abandonSocket();
+    clearTimeout(this.#reconnectTimer);
     this.#setState({ connection: 'connecting' });
     const socket = new this.#WebSocket(this.#url);
     this.#socket = socket;
 
+    clearTimeout(this.#connectTimer);
+    this.#connectTimer = setTimeout(() => {
+      if (socket === this.#socket) this.#dropped();
+    }, kConnectTimeoutMs);
+
     socket.onopen = () => {
-      this.#attempt = 0;
+      if (socket !== this.#socket) return;
+      clearTimeout(this.#connectTimer);
       // The page sends nothing on connect: the Board sends a snapshot as
       // soon as the socket opens, and until it arrives nothing else applies.
       this.#seq = null;
@@ -195,6 +237,7 @@ export class Store {
     socket.onmessage = (event) => {
       if (socket !== this.#socket) return;
       this.#armLiveness();
+      this.#lastMessageAt = Date.now();
       let message;
       try {
         message = JSON.parse(event.data);
@@ -210,18 +253,25 @@ export class Store {
       // A socket this store already replaced (liveness timeout, take-over)
       // can still report its close late; only the current one counts.
       if (socket !== this.#socket) return;
-      clearTimeout(this.#livenessTimer);
       // Either way, a switch in flight on a dead socket is never answered,
       // so `pending` clears.
       if (event?.code === kReplacedCloseCode) {
+        clearTimeout(this.#livenessTimer);
+        clearTimeout(this.#connectTimer);
+        this.#socket = null;
         // A newer page took the Board's one live socket. Reconnecting on
         // our own would just replace it back, so the two would fight;
         // only the user's take-over connects again.
-        this.#setState({ connection: 'replaced', error: kReplacedText, pending: null });
+        this.#setState({
+          connection: 'replaced',
+          error: kReplacedText,
+          pending: null,
+          synced: false,
+          retrying: false,
+        });
         return;
       }
-      this.#setState({ connection: 'offline', pending: null });
-      this.#scheduleReconnect();
+      this.#dropped();
     };
 
     // onerror is always followed by onclose, which handles the reconnect.
@@ -235,28 +285,52 @@ export class Store {
       // Board, except that the Board promises a message every tick
       // interval. Treat the socket as dead and reconnect now rather than
       // wait for TCP to notice.
-      const socket = this.#socket;
-      this.#socket = null;
-      socket?.close();
-      this.#setState({ connection: 'offline', pending: null });
-      this.#scheduleReconnect();
+      this.#dropped();
     }, kLivenessTimeoutMs);
+  }
+
+  // The current socket is dead, whichever way that was found out (closed,
+  // never opened, gone silent): forget it and retry on the backoff.
+  #dropped() {
+    this.#abandonSocket();
+    this.#setState({ connection: 'offline', pending: null, synced: false, retrying: true });
+    this.#scheduleReconnect();
+  }
+
+  // Detaches and closes the current socket, so nothing it reports later -
+  // a late open, message or close - reaches this store.
+  #abandonSocket() {
+    const socket = this.#socket;
+    this.#socket = null;
+    clearTimeout(this.#livenessTimer);
+    clearTimeout(this.#connectTimer);
+    if (!socket) return;
+    socket.onopen = socket.onmessage = socket.onclose = socket.onerror = null;
+    socket.close();
   }
 
   #scheduleReconnect() {
     if (this.#closed) return;
     const base = kBackoffMs[Math.min(this.#attempt, kBackoffMs.length - 1)];
     this.#attempt += 1;
-    const delay = base + Math.random() * base * 0.3;
+    const delay = base + Math.random() * base * kBackoffJitter;
     clearTimeout(this.#reconnectTimer);
     this.#reconnectTimer = setTimeout(() => this.#open(), delay);
   }
 
+  // 'online' or the page becoming visible. While retrying, try now instead
+  // of waiting out the backoff. While online, the socket may have died
+  // while the phone was locked: its timers were frozen, so the liveness
+  // timeout hasn't fired, but the clock moved on - check it directly.
   #retryNow() {
     const { connection } = this.#state;
-    if (this.#closed || connection === 'online' || connection === 'replaced') return;
+    if (this.#closed || connection === 'replaced') return;
+    if (connection === 'online') {
+      if (Date.now() - this.#lastMessageAt <= kLivenessTimeoutMs) return;
+      this.#abandonSocket();
+      this.#setState({ connection: 'offline', pending: null, synced: false, retrying: true });
+    }
     this.#attempt = 0;
-    clearTimeout(this.#reconnectTimer);
     this.#open();
   }
 
@@ -281,10 +355,15 @@ export class Store {
       case 'snapshot':
         if (message.build !== this.#build && this.#reloadForBuild(message.build)) return;
         this.#seq = message.seq;
+        // A snapshot is the Connection working end to end: the backoff
+        // starts over from here, not from the socket merely opening.
+        this.#attempt = 0;
         this.#setState({
           catalog: message.catalog,
           current: message.current,
           link: message.link,
+          synced: true,
+          retrying: false,
         });
         break;
       case 'patch': {
@@ -353,6 +432,35 @@ export class Store {
     this.#state = { ...this.#state, ...partial };
     for (const listener of this.#listeners) listener(this.#state);
   }
+}
+
+// What the page shows about its Connection to the Board and the Board's
+// Link to the Quad Cortex (GLOSSARY.md), as one of:
+//
+//   connecting      the first attempt, before the first snapshot
+//   unreachable     the Connection failed or dropped; retrying until a
+//                   snapshot arrives again
+//   qcDisconnected  the Connection is fine, the Link is down
+//   connected       both are up
+//   replaced        another page took over (close code 4001)
+//
+// `label` is the page's own wording for it.
+const kStatusLabel = Object.freeze({
+  connecting: 'Connecting…',
+  unreachable: 'Board unreachable',
+  qcDisconnected: 'Quad Cortex disconnected',
+  connected: 'Connected',
+  replaced: kReplacedText,
+});
+
+export function connectionStatus(state) {
+  let kind;
+  if (state.connection === 'replaced') kind = 'replaced';
+  else if (state.retrying) kind = 'unreachable';
+  else if (!state.synced) kind = 'connecting';
+  else if (!state.link.qcConnected) kind = 'qcDisconnected';
+  else kind = 'connected';
+  return { kind, label: kStatusLabel[kind] };
 }
 
 // Where the WebSocket lives. Served from the Board, that's the same

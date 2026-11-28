@@ -28,7 +28,8 @@ firmware/
     │   ├── QcGzip.hpp              # issue #6: gzip detection + inflate (ADR 0005)
     │   ├── QcGzipInflater.hpp      # issue #6: runs QcGzip.hpp off the usbh thread
     │   ├── QcMessageQueue.hpp      # issue #94: bounded SPSC hand-off from the usbh thread
-    │   └── QcWebApiSession.hpp     # issue #99: the docs/api WebSocket contract, socket-free
+    │   ├── QcWebApiSession.hpp     # issue #99: the docs/api WebSocket contract, socket-free
+    │   └── QcWifiRejoin.hpp        # issue #20: when the station rejoins Wi-Fi after a drop
     └── tests/
         ├── hid_framing/            # Ztest suite for HidReassembler/HidChunker - no hardware needed
         ├── gzip_inflate/           # Ztest suite for QcGzip.hpp, with real gzip fixtures
@@ -36,8 +37,9 @@ firmware/
         │                           # real preset-change burst on real threads
         ├── web_api_session/        # Ztest suite for QcWebApiSession (the docs/api contract),
         │                           # against docs/api/examples byte for byte
-        └── wifi_web_http/          # Ztest suite driving the real HTTP/WebSocket resources over
-                                    # the loopback interface - no Wi-Fi driver or board needed
+        ├── wifi_web_http/          # Ztest suite driving the real HTTP/WebSocket resources over
+        │                           # the loopback interface - no Wi-Fi driver or board needed
+        └── wifi_rejoin/            # Ztest suite for QcWifiRejoin's grace period and backoff
 ```
 
 This repo does **not** vendor its own `west.yml`/manifest. `firmware/app` is a standard

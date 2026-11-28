@@ -27,6 +27,12 @@ The mock serves one live page at a time like the Board: opening a second tab clo
 with 4001. It sends the page's own build id (`src/build.js`), so the page never reloads
 against it.
 
+To try reconnecting (#20), stop the mock with Ctrl-C while the page is open and start it
+again: the header shows "Board unreachable" and dims the last known state, and the page
+reconnects on its own within its backoff (at most about 13 s) and takes the fresh snapshot,
+with no reload. Switching the browser's network off and on, or hiding and showing the tab,
+retries at once.
+
 Useful flags:
 
 | Flag | What it does |
@@ -86,7 +92,7 @@ manifest.webmanifest       standalone/home-screen metadata (works over plain HTT
 src/store.js               the state model: the docs/api contract, reconnect, take-over
 src/build.js               the page's build id ("dev"; rewritten by the firmware embed step)
 src/store-controller.js    Lit ReactiveController that ties the store to component updates
-src/qc-app.js              shell: header with link state, scroll container
+src/qc-app.js              shell: header with the connection state, scroll container
 src/qc-status.js           the Current preset, the Link and a Catalog summary
 src/qc-preset-list.js      folders and presets, keyed; tap to switch, pending and Current marked
 vendor/lit.js               pinned Lit 3.3.3 bundle (see tools/vendor-lit.mjs) - this

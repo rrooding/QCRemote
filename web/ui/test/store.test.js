@@ -13,7 +13,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { Store } from '../src/store.js';
+import { Store, connectionStatus } from '../src/store.js';
 
 const examplesDir = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -84,13 +84,25 @@ class FakeStorage {
 
 let location;
 let sessionStorage;
+/** Stands in for `window`: where 'online' and 'visibilitychange' fire. */
+let events;
+/** Stands in for `document`: only its visibilityState is read. */
+let document;
 
 beforeEach(() => {
   FakeWebSocket.instances = [];
   location = { reloads: 0, reload() { this.reloads += 1; } };
   sessionStorage = new FakeStorage();
-  mock.timers.enable({ apis: ['setTimeout'] });
+  events = new EventTarget();
+  document = { visibilityState: 'visible' };
+  mock.timers.enable({ apis: ['setTimeout', 'Date'] });
 });
+
+/** The phone wakes up: the page becomes visible again. */
+function becomeVisible() {
+  document.visibilityState = 'visible';
+  events.dispatchEvent(new Event('visibilitychange'));
+}
 
 afterEach(() => {
   mock.timers.reset();
@@ -103,6 +115,8 @@ function makeStore({ build = kExampleBuild } = {}) {
     WebSocket: FakeWebSocket,
     location,
     sessionStorage,
+    events,
+    document,
   });
   store.connect();
   return store;
@@ -390,4 +404,214 @@ test('ticks and errors count toward seq', () => {
 
   assert.deepEqual(socket().sent, []);
   assert.equal(store.state.current.index, 3);
+});
+
+// --- reconnecting (#20) ------------------------------------------------
+
+/** Lets every connection attempt fail at once, `count` times in a row. */
+function failAttempts(count) {
+  const delays = [];
+  for (let i = 0; i < count; i += 1) {
+    const before = FakeWebSocket.instances.length;
+    socket().serverClose(1006);
+    let waited = 0;
+    while (FakeWebSocket.instances.length === before) {
+      mock.timers.tick(10);
+      waited += 10;
+    }
+    delays.push(waited);
+  }
+  return delays;
+}
+
+test('reconnect delays grow, with jitter, and are capped', () => {
+  onlineStore();
+
+  const delays = failAttempts(10);
+
+  for (let i = 1; i < 6; i += 1) assert.ok(delays[i] > delays[i - 1], `delay ${i} grows`);
+  for (const delay of delays) assert.ok(delay <= 13_000, `delay ${delay} is capped`);
+  assert.ok(delays.at(-1) >= 10_000, 'the cap is reached');
+});
+
+test('a Connection that comes back starts the backoff over', () => {
+  onlineStore();
+  failAttempts(6);
+  socket().open();
+  socket().receive(example('snapshot'));
+
+  const [delay] = failAttempts(1);
+
+  assert.ok(delay <= 400, `first delay after a good connection is short (${delay} ms)`);
+});
+
+test('a connection attempt that never opens is given up and retried', () => {
+  makeStore();
+
+  mock.timers.tick(4_999);
+
+  assert.equal(socket().readyState, FakeWebSocket.CONNECTING);
+  mock.timers.tick(1);
+  assert.equal(FakeWebSocket.instances[0].readyState, FakeWebSocket.CLOSED);
+  mock.timers.tick(1_000);
+  assert.equal(FakeWebSocket.instances.length, 2);
+});
+
+test('going back online retries at once instead of waiting out the backoff', () => {
+  onlineStore();
+  failAttempts(6);
+  socket().serverClose(1006);
+  const before = FakeWebSocket.instances.length;
+
+  events.dispatchEvent(new Event('online'));
+
+  assert.equal(FakeWebSocket.instances.length, before + 1);
+});
+
+test('the page becoming visible retries at once', () => {
+  onlineStore();
+  socket().serverClose(1006);
+  const before = FakeWebSocket.instances.length;
+
+  becomeVisible();
+
+  assert.equal(FakeWebSocket.instances.length, before + 1);
+});
+
+test('an immediate retry abandons an attempt still in progress', () => {
+  const store = onlineStore();
+  socket().serverClose(1006);
+  mock.timers.tick(1_000);
+  const stale = socket();
+
+  events.dispatchEvent(new Event('online'));
+  const staleState = stale.readyState;
+  stale.open();
+
+  assert.equal(staleState, FakeWebSocket.CLOSED);
+  assert.notEqual(socket(), stale);
+  assert.equal(store.state.connection, 'connecting', "the stale socket's open is ignored");
+});
+
+test('becoming visible while online leaves a live Connection alone', () => {
+  onlineStore();
+  mock.timers.tick(3_000);
+
+  becomeVisible();
+
+  assert.equal(FakeWebSocket.instances.length, 1);
+  assert.equal(socket().readyState, FakeWebSocket.OPEN);
+});
+
+test('waking up on a Connection that went silent while asleep reconnects at once', () => {
+  onlineStore();
+  // A locked phone freezes the page's timers but not the clock.
+  mock.timers.setTime(Date.now() + 60_000);
+
+  becomeVisible();
+
+  assert.equal(FakeWebSocket.instances[0].readyState, FakeWebSocket.CLOSED);
+  assert.equal(FakeWebSocket.instances.length, 2);
+});
+
+test('nothing retries after 4001, not even going back online', () => {
+  const store = onlineStore();
+  socket().serverClose(4001);
+
+  events.dispatchEvent(new Event('online'));
+  becomeVisible();
+  mock.timers.tick(60_000);
+
+  assert.equal(FakeWebSocket.instances.length, 1);
+  assert.equal(store.state.connection, 'replaced');
+});
+
+test('the Board sends the snapshot unprompted: the page sends nothing on reconnect', () => {
+  onlineStore();
+  socket().serverClose(1006);
+  mock.timers.tick(1_000);
+
+  socket().open();
+
+  assert.deepEqual(socket().sent, []);
+});
+
+test('a reconnect drops what was pending before the drop and applies the fresh snapshot', () => {
+  const store = onlineStore();
+  socket().receive(withSeq(example('patch-current'), 1));
+  switchTo(store, 0);
+  socket().serverClose(1006);
+  mock.timers.tick(1_000);
+
+  socket().open();
+  socket().receive(example('snapshot'));
+
+  assert.equal(store.state.pending, null);
+  assert.deepEqual(store.state.current, JSON.parse(example('snapshot')).current);
+});
+
+test('close() stops reconnecting', () => {
+  const store = onlineStore();
+
+  store.close();
+  events.dispatchEvent(new Event('online'));
+  mock.timers.tick(60_000);
+
+  assert.equal(FakeWebSocket.instances.length, 1);
+});
+
+// --- what the page shows (#20) -----------------------------------------
+
+const status = (store) => connectionStatus(store.state).kind;
+
+test('the first attempt shows connecting, not unreachable', () => {
+  const store = makeStore();
+  assert.equal(status(store), 'connecting');
+  socket().open();
+  assert.equal(status(store), 'connecting', 'online but no snapshot yet');
+});
+
+test('a snapshot with the Link up shows connected', () => {
+  const store = onlineStore();
+  assert.equal(status(store), 'connected');
+  assert.equal(connectionStatus(store.state).label, 'Connected');
+});
+
+test('the Link down shows Quad Cortex disconnected', () => {
+  const store = onlineStore();
+  const linkDown = { ...JSON.parse(example('patch-link')), seq: 1, link: { qcConnected: false } };
+  socket().receive(JSON.stringify(linkDown));
+
+  assert.equal(store.state.link.qcConnected, false);
+  assert.equal(status(store), 'qcDisconnected');
+  assert.equal(connectionStatus(store.state).label, 'Quad Cortex disconnected');
+});
+
+test('a dropped Connection shows Board unreachable until a snapshot arrives again', () => {
+  const store = onlineStore();
+  socket().serverClose(1006);
+  assert.equal(status(store), 'unreachable');
+  assert.equal(connectionStatus(store.state).label, 'Board unreachable');
+
+  mock.timers.tick(1_000);
+  assert.equal(store.state.connection, 'connecting');
+  assert.equal(status(store), 'unreachable', 'no flicker back to connecting while retrying');
+  socket().open();
+  assert.equal(status(store), 'unreachable', 'open but no snapshot yet');
+
+  socket().receive(example('snapshot'));
+  assert.equal(status(store), 'connected');
+});
+
+test('a first attempt that fails shows Board unreachable', () => {
+  const store = makeStore();
+  socket().serverClose(1006);
+  assert.equal(status(store), 'unreachable');
+});
+
+test('4001 shows replaced', () => {
+  const store = onlineStore();
+  socket().serverClose(4001);
+  assert.equal(status(store), 'replaced');
+  assert.equal(connectionStatus(store.state).label, 'Opened on another device');
 });

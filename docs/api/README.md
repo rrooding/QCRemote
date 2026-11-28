@@ -185,6 +185,12 @@ replaces the other page. Two pages never fight over the socket on their own.
 | `4001` | Replaced by a newer page | No, only when the user takes over |
 | anything else | Dropped | Yes, with backoff (#20) |
 
+How the page reconnects is its own business, not the Board's: capped exponential backoff with
+jitter, an immediate retry on `online` and on the page becoming visible, and an attempt still
+not open after 5 s counts as failed (`web/ui/src/store.js`). The Board only has to send its
+`snapshot` unprompted on every new socket, as above. A reconnect is treated like a first
+connect: nothing from before the drop (a pending switch, the old `seq`) carries over.
+
 ## Extending the contract
 
 - Both sides **ignore message types and fields they don't know**. This is the extension point:

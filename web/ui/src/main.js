@@ -12,6 +12,8 @@ window.qcStore = new Store({
   WebSocket,
   location,
   sessionStorage,
+  events: window,
+  document,
 });
 
 await import('./qc-app.js');
