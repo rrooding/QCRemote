@@ -44,7 +44,7 @@ reloads once and then shows that it doesn't match the Board's firmware; that's e
 ## Test it
 
 ```sh
-node --test web/ui/test/
+node --test 'web/ui/test/*.test.js'
 ```
 
 Node's built-in test runner, no `npm install`; Node 22 or newer, for its built-in WebSocket

@@ -312,7 +312,7 @@ research artifact from that ADR — don't add to it.
   run by hand, never by CI or by `west build`). **Firmware CI must never gain a Node
   dependency** — the asset pipeline that actually ships the UI
   (`firmware/app/tools/embed_assets.py`) is Python standard library only. The page's own
-  tests (`node --test web/ui/test/`) run in the separate `api-contract` workflow.
+  tests (`node --test 'web/ui/test/*.test.js'`) run in the separate `api-contract` workflow.
 - **Assets are pre-gzipped at build time into a generated C++ header**, served from flash
   with `Content-Encoding: gzip` and `Cache-Control: no-cache` — costing flash, not RAM, per
   ADR 0011's own measurements.

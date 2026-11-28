@@ -46,4 +46,4 @@ jobs:
           node-version: "22"
 
       - name: Run the web UI tests
-        run: node --test web/ui/test/
+        run: node --test 'web/ui/test/*.test.js'

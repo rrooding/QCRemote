@@ -27,7 +27,7 @@ workflow file. It has two jobs:
   example, or the schema it is checked against, fails it. The checker verifies that every
   example validates (and every `examples/invalid/` one is rejected), that examples are compact,
   and that page → Board frames are at most 256 bytes.
-- **`web-ui-tests`** runs `node --test web/ui/test/` (Node 22): the page's Store and the dev
+- **`web-ui-tests`** runs `node --test 'web/ui/test/*.test.js'` (Node 22): the page's Store and the dev
   mock Board, both tested against these examples.
 
 Neither installs any of the firmware toolchain, so the workflow is independent of the
