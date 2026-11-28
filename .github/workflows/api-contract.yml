@@ -39,11 +39,12 @@ jobs:
       - name: Check out QCRemote
         uses: actions/checkout@v7
 
-      # 22 or later: the mock server's test uses the global WebSocket client.
+      # .node-version pins the oldest Node the page's tests must pass on (22: the mock
+      # server's test uses the global WebSocket client). Use the same one locally.
       - name: Install Node
         uses: actions/setup-node@v7.1.0
         with:
-          node-version: "22"
+          node-version-file: .node-version
 
       - name: Run the web UI tests
-        run: node --test 'web/ui/test/*.test.js'
+        run: npm test --prefix web/ui
