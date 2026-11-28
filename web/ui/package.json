@@ -1,0 +1,9 @@
+{
+  "name": "qcremote-web-ui",
+  "private": true,
+  "description": "No dependencies and no npm install: this file only holds the test command.",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test 'test/*.test.js'"
+  }
+}

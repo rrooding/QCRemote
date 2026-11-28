@@ -44,11 +44,13 @@ reloads once and then shows that it doesn't match the Board's firmware; that's e
 ## Test it
 
 ```sh
-node --test 'web/ui/test/*.test.js'
+npm test --prefix web/ui
 ```
 
-Node's built-in test runner, no `npm install`; Node 22 or newer, for its built-in WebSocket
-client. `test/store.test.js` drives the `Store`
+This is the one place the test command lives (`web/ui/package.json`); CI runs the same line.
+Node's built-in test runner, no `npm install`; the Node version in `.node-version` (22) or
+newer, for its built-in WebSocket client. Run it on that version before pushing: Node 22's
+`node --test` is stricter about its arguments than newer releases. `test/store.test.js` drives the `Store`
 through its public interface with a fake WebSocket, `location` and `sessionStorage`, feeding
 it the Board → page messages in `docs/api/examples/server/`. `test/mock-server.test.js` runs
 the mock on a free port and checks what it sends against the same examples, and every error
